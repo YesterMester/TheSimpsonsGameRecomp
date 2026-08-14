@@ -255,6 +255,7 @@ SETTINGS_SCHEMA = {
     # graphics backend: "" = automatic (Vulkan first, D3D12 fallback on
     # Windows), "vulkan" or "d3d12" to force one. Chosen at startup.
     "gpu": ("str", "", True),
+    "vulkan_device": ("str", "", True),
     # audio
     "audio_mute": ("bool", False, False),
     "audio_maxqframes": ("int", 32, True),

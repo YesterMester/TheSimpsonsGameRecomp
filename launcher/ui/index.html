@@ -304,6 +304,15 @@
           <div class="hint">Vulkan plays the intro videos and matches console colors. Pick Direct3D 12 only if Vulkan fails on your GPU. Restart needed.</div>
         </div>
         <div class="field">
+          <label>Vulkan Device (Multi-GPU / Laptop)</label>
+          <select id="s-vulkan_device">
+            <option value="">Automatic (Recommended)</option>
+            <option value="0">Device 0</option>
+            <option value="1">Device 1</option>
+          </select>
+          <div class="hint">Select the GPU device index to use when GPU backend is set to Vulkan. Leave on Automatic if unsure.</div>
+        </div>
+        <div class="field">
           <label class="switch"><input type="checkbox" id="s-vsync"> VSync</label>
         </div>
         <div class="field">
@@ -1053,6 +1062,7 @@ async function loadSettings(){
   $("#s-fullscreen").value = String(v.fullscreen);
   $("#s-resolution").value = v.resolution || "";
   $("#s-gpu").value = v.gpu || "";
+  $("#s-vulkan_device").value = v.vulkan_device || "";
   $("#s-vsync").checked = v.vsync;
   $("#s-present_letterbox").checked = v.present_letterbox;
   $("#s-resolution_scale").value = String(v.resolution_scale);
@@ -1075,6 +1085,7 @@ $("#savebtn").onclick = async () => {
     fullscreen: $("#s-fullscreen").value === "true",
     resolution: $("#s-resolution").value,
     gpu: $("#s-gpu").value,
+    vulkan_device: $("#s-vulkan_device").value,
     vsync: $("#s-vsync").checked,
     present_letterbox: $("#s-present_letterbox").checked,
     resolution_scale: Number($("#s-resolution_scale").value),

@@ -23936,7 +23936,9 @@ loc_827A5618:
 	ctx.r30.s64 = -2112487424;
 	// lfs f0,-28104(r30)
 	ctx.fpscr.disableFlushMode();
-	temp.u32 = REX_LOAD_U32(ctx.r30.u32 + -28104);
+	// >>> Change 1: Havok fix for 60 fps (0x82159238 = 0x3C88AB86 / 0.0166667f)
+	// temp.u32 = REX_LOAD_U32(ctx.r30.u32 + -28104); // Original (30 FPS)
+	temp.u32 = 0x3C88AB86; // Fix (60 FPS)
 	ctx.f0.f64 = double(temp.f32);
 	// fcmpu cr6,f31,f0
 	ctx.cr6.compare(ctx.f31.f64, ctx.f0.f64);
@@ -23957,7 +23959,9 @@ loc_827A5618:
 	ctx.r3.u64 = ctx.r31.u64;
 	// lfs f1,-28104(r30)
 	ctx.fpscr.disableFlushMode();
-	temp.u32 = REX_LOAD_U32(ctx.r30.u32 + -28104);
+	// >>> Change 2: Havok fix for 60 fps (0x82159238 = 0x3C88AB86 / 0.0166667f)
+	// temp.u32 = REX_LOAD_U32(ctx.r30.u32 + -28104); // Original (30 FPS)
+	temp.u32 = 0x3C88AB86; // Fix (60 FPS)
 	ctx.f1.f64 = double(temp.f32);
 	// bl 0x82aa2070
 	ctx.lr = 0x827A5668;

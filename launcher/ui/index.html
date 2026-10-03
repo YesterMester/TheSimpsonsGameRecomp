@@ -950,6 +950,7 @@ setInterval(() => {
 
 /* status polling */
 let lastStatus = null;
+let lastPatchSig = "";  /* last patch list drawn by refresh() */
 async function refresh(){
   try{
     const st = await api.get("/api/status");
@@ -1024,15 +1025,24 @@ async function refresh(){
     /* mods */
     $("#modtable").innerHTML = (st.mods||[]).map(m => `<tr><td>${m}</td><td class="muted">waiting for mod loader</td></tr>`).join("") ||
       "<tr><td class='muted'>No mod files found.</td></tr>";
-    /* patches */
-    $("#patchlist").innerHTML = (st.patches||[]).map(p => `
-      <div class="patchrow">
-        <div><b>${p.name}</b><div class="desc">${p.desc}</div></div>
-        ${p.available && (p.state === "on" || p.state === "off")
-          ? `<button class="bigbtn ${p.state==="on"?"alt":""}" onclick="togglePatch('${p.id}', ${p.state!=="on"})">
-               ${p.state==="on" ? "Enabled — click to disable" : "Enable"}</button>`
-          : `<span class="muted">${p.state}</span>`}
-      </div>`).join("");
+    /* patches (redrawn only when they change: a redraw would close an open dropdown) */
+    const patchSig = JSON.stringify(st.patches||[]);
+    if (patchSig !== lastPatchSig) {
+      lastPatchSig = patchSig;
+      $("#patchlist").innerHTML = (st.patches||[]).map(p => `
+        <div class="patchrow">
+          <div><b>${p.name}</b><div class="desc">${p.desc}</div></div>
+          ${p.available && p.options
+            ? `<div style="min-width:280px"><select onchange="setPatchOption('${p.id}', this.value)">
+                 ${p.options.map(o => `<option value="${o.id}" ${o.id===p.state?"selected":""}>${o.name}</option>`).join("")}
+               </select></div>`
+            : p.available && (p.state === "on" || p.state === "off")
+            ? `<button class="bigbtn ${p.state==="on"?"alt":""}" onclick="togglePatch('${p.id}', ${p.state!=="on"})">
+                 ${p.state==="on" ? "Enabled — click to disable" : "Enable"}</button>`
+            : `<span class="muted">${p.state}</span>`}
+        </div>`).join("");
+      enhanceSelects();
+    }
   }catch(e){ $("#playstatus").textContent = "launcher backend unreachable"; }
 }
 setInterval(refresh, 2000); refresh();
@@ -1184,6 +1194,15 @@ async function restoreSave(name){
 }
 
 /* patches */
+async function setPatchOption(id, value){
+  try {
+    const r = await api.post("/api/patch", {id, value});
+    if (!r.ok) alert("Patch failed: " + (r.msg || r.error || "unknown error"));
+  } catch (e) {
+    alert("Patch request failed: " + e);
+  }
+  refresh();
+}
 async function togglePatch(id, enable){
   try {
     const r = await api.post("/api/patch", {id, enable});

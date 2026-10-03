@@ -138,6 +138,37 @@ void AudioSystem::WorkerThreadMain() {
   constexpr auto kCallbackInterval = std::chrono::microseconds(5333 * 39 / 40);
   std::chrono::steady_clock::time_point next_callback[kMaximumClientCount] = {};
 
+#if REX_PLATFORM_WIN32
+  // On Windows, std::this_thread::sleep_until wakes on the system timer tick,
+  // 15.6 ms unless the process timer resolution is raised, and Windows does
+  // not always grant that (#36). The callbacks then came about 128 times a
+  // second instead of 187.5: the queue stayed at one or two frames and a
+  // third of the output was silence, choppy and slowed down. A
+  // high-resolution timer (Windows 10 1803 and newer) wakes within about
+  // 0.5 ms of a relative due time whatever the timer resolution.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+  HANDLE pacing_timer = CreateWaitableTimerExW(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif
+  auto pace_until = [&](std::chrono::steady_clock::time_point due) {
+#if REX_PLATFORM_WIN32
+    if (pacing_timer) {
+      LARGE_INTEGER relative;
+      relative.QuadPart = -std::chrono::duration_cast<rex::chrono::hundrednanoseconds>(
+                               due - std::chrono::steady_clock::now())
+                               .count();
+      if (relative.QuadPart < 0 &&
+          SetWaitableTimer(pacing_timer, &relative, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(pacing_timer, INFINITE);
+      }
+      return;
+    }
+#endif
+    std::this_thread::sleep_until(due);
+  };
+
   // Main run loop.
   uint32_t diag_pump_count = 0;
   while (worker_running_) {
@@ -181,7 +212,7 @@ void AudioSystem::WorkerThreadMain() {
         if (REXCVAR_GET(audio_callback_pacing)) {
           auto now = std::chrono::steady_clock::now();
           if (now < next_callback[index]) {
-            std::this_thread::sleep_until(next_callback[index]);
+            pace_until(next_callback[index]);
             now = next_callback[index];
           }
           next_callback[index] = now + kCallbackInterval;
@@ -215,6 +246,11 @@ void AudioSystem::WorkerThreadMain() {
     }
   }
   worker_running_ = false;
+#if REX_PLATFORM_WIN32
+  if (pacing_timer) {
+    CloseHandle(pacing_timer);
+  }
+#endif
 
   // TODO(benvanik): call module API to kill?
 }

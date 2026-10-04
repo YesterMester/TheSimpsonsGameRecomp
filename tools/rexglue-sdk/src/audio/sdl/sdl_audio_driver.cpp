@@ -26,6 +26,10 @@
 #include <rex/platform.h>
 #include <SDL3/SDL.h>
 
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
 // Diagnostics: every frame the game submits, raw (256 samples x 6 channels,
 // big-endian float, channel after channel), and in <file>.ts the
@@ -39,6 +43,34 @@ REXCVAR_DEFINE_BOOL(audio_log_underruns, false, "Audio",
 
 namespace rex::audio::sdl {
 
+namespace {
+
+#if REX_PLATFORM_WIN32
+// Asks again for the finest system timer resolution, as the app does at
+// startup (RequestHighResolutionTimer in windowed_app_main_win.cpp).
+void RequestFinestTimerResolution() {
+  using NtQueryTimerResolutionFn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
+  using NtSetTimerResolutionFn = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  if (!ntdll) {
+    return;
+  }
+  auto query = reinterpret_cast<NtQueryTimerResolutionFn>(
+      reinterpret_cast<void*>(GetProcAddress(ntdll, "NtQueryTimerResolution")));
+  auto set = reinterpret_cast<NtSetTimerResolutionFn>(
+      reinterpret_cast<void*>(GetProcAddress(ntdll, "NtSetTimerResolution")));
+  ULONG coarsest = 0, finest = 0, current = 0;
+  if (!query || !set || query(&coarsest, &finest, &current) < 0) {
+    return;
+  }
+  if (set(finest, TRUE, &current) >= 0) {
+    REXLOG_INFO("Timer resolution: {:.2f} ms again after SDL audio init", current / 10000.0);
+  }
+}
+#endif
+
+}  // namespace
+
 SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
     : AudioDriver(memory), semaphore_(semaphore) {}
 
@@ -50,6 +82,15 @@ SDLAudioDriver::~SDLAudioDriver() {
 bool SDLAudioDriver::Initialize() {
   // Prevent SDL from interfering with timer resolution (causes FPS drops)
   SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "0", SDL_HINT_OVERRIDE);
+#if REX_PLATFORM_WIN32
+  // SDL applies the hint by ending the 1 ms period it began when it started,
+  // and timeEndPeriod withdraws the process's timer resolution request as a
+  // whole, the one the app made at startup included. From here on every sleep
+  // and plain waitable timer of the process ran at the default 15.6 ms: the
+  // game's 10 ms timers 64 times a second instead of 100, Sleep(1) 15.5 ms,
+  // 30 fps vblanks 31 or 47 ms apart. Ask for it again.
+  RequestFinestTimerResolution();
+#endif
 
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");

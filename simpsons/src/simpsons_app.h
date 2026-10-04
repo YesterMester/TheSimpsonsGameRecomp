@@ -5,6 +5,14 @@
 #pragma once
 
 #include <rex/rex_app.h>
+#include <rex/runtime.h>
+
+namespace rex::memory {
+class Memory;
+}
+
+// ink_outlines.cpp: patches the ink outline constants into the loaded image.
+void ApplyInkOutlineOptions(rex::memory::Memory* memory);
 
 class SimpsonsApp : public rex::ReXApp {
  public:
@@ -15,6 +23,8 @@ class SimpsonsApp : public rex::ReXApp {
     return std::unique_ptr<SimpsonsApp>(new SimpsonsApp(ctx, "simpsons",
         PPCImageConfig));
   }
+
+  void OnPostLoadXexImage() override { ApplyInkOutlineOptions(runtime()->memory()); }
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}

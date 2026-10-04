@@ -25,6 +25,7 @@ set(SIMPSONS_SOURCES
     src/frame_pacing.cpp
     src/ring_wait.cpp
     src/subtitles.cpp
+    src/tick_count.cpp
 )
 
 if(WIN32)

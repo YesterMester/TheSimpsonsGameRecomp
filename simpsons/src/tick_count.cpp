@@ -17,7 +17,8 @@
 //
 // tick_count_precise answers GetTickCount from the runtime's clock at the
 // moment of the call, the same clock the timer copies, so the tick count no
-// longer depends on the system timer resolution.
+// longer depends on the system timer resolution. It is read once: switching
+// sources while the game runs could move the tick count backwards.
 
 #include <cstdint>
 
@@ -27,14 +28,16 @@
 
 REXCVAR_DEFINE_BOOL(tick_count_precise, true, "Clock",
                     "Read the game's millisecond tick count from the clock at every call instead "
-                    "of the kernel's copy, which a coarse system timer lets lag by up to 15 ms");
+                    "of the kernel's copy, which a coarse system timer lets lag by up to 15 ms")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // GetTickCount: r3 = KeTimeStampBundle.TickCount.
 REX_EXTERN(sub_824324A8);
 REX_EXTERN(__imp__sub_824324A8);
 
 REX_FUNC(sub_824324A8) {
-  if (!REXCVAR_GET(tick_count_precise)) {
+  static const bool precise = REXCVAR_GET(tick_count_precise);
+  if (!precise) {
     __imp__sub_824324A8(ctx, base);
     return;
   }

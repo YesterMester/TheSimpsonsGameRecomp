@@ -49,9 +49,9 @@ What it adds to the original project:
   off.
 - **Clean eyes:** no more speckled dark shadow on the characters' eye whites.
 - **Start episode (level select)** in the launcher: a new game can start in any of the 18 episodes.
-- **Fixes:** the game running 7.5% fast on Windows PCs with a coarse system timer, even physics
-  steps at 60 FPS, choppy, slowed-down sound on some Windows PCs, the menus' frame rate on
-  Windows, and the skip-intro patch on releases that are not in English.
+- **Fixes:** the game running 7.5% fast on Windows, the game's timers running at 64% of their
+  rate on Windows, even physics steps at 60 FPS, choppy, slowed-down sound on some Windows PCs,
+  the menus' frame rate on Windows, and the skip-intro patch on releases that are not in English.
 
 The changes were developed and checked on Windows 11. They build for Linux too but have not been
 tried there.
@@ -145,6 +145,13 @@ for byte. Starting this way has been tried with Springfield and The Day the Eart
   a high-resolution timer (Windows 10 version 1803 or newer), and the game opts out of Windows 11
   ignoring its timer resolution request to save power. Measured outside the game; not yet confirmed
   on one of the PCs that had the problem.
+- **Timer resolution on Windows.** The runtime asks Windows for its finest timer resolution at
+  startup, but the SDL audio driver withdrew that request a moment later: it tells SDL to leave the
+  timer resolution alone, SDL then ends the 1 ms period it had begun, and on Windows that cancels
+  the whole process's request. From then on every short sleep and timer of the game ran at the
+  default 15.6 ms: the game's own 10 ms timers fired 64 times a second instead of 100, and at
+  30 FPS the vblanks came 31 or 47 ms apart, which ran the game 7.5% fast. The driver now asks for
+  the resolution again; the game's timers fire 98 times a second and 30 FPS runs at real time.
 - **Menu frame rate on Windows.** The frame pacing addressed the game's memory 4 KB off on Windows,
   so the menus never got their 30 FPS cadence (`menu_frame_rate`), and each change between a menu
   and a level wrote into an unrelated game object. Linux was not affected.
@@ -170,7 +177,7 @@ original project's `main`:
 | [`ink-outline-options`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/ink-outline-options) | Ink outlines and their launcher settings |
 | [`eye-shading-fix`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/eye-shading-fix) | Characters' eyes |
 | [`launcher-level-select`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/launcher-level-select) | Start episode (level select) |
-| [`fix-windows-audio-pacing`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/fix-windows-audio-pacing) | Windows audio fix and audio diagnostics |
+| [`fix-windows-audio-pacing`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/fix-windows-audio-pacing) | Windows audio fix, timer resolution and audio diagnostics |
 | [`fix-windows-guest-addresses`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/fix-windows-guest-addresses) | Menu frame rate on Windows |
 | [`fix-skip-intro-languages`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/fix-skip-intro-languages) | Skip intro on releases that are not in English |
 | [`fix-game-tick-count`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/fix-game-tick-count) | Game speed on Windows |
@@ -295,12 +302,8 @@ controls under Input > Keybinds (press *Save to config* to keep changes made the
 - Random deaths were reported at 60 FPS in one section of "Lisa the Tree Hugger", the walkway
   with circular saws and conveyor belts
   ([#2](https://github.com/YesterMester/TheSimpsonsGameRecomp/issues/2)), on a build from before
-  any physics fix; switching to 30 helped then. Whether it still happens with this fork's physics
-  and game speed fixes has not been tested yet. If it does, switch to 30 for that section.
-- On Windows PCs where the system timer stays at 15.6 ms, the 30 FPS setting runs the game about
-  7.5% fast, with frames alternating between 31 and 47 ms: the runtime makes the 30 Hz vblanks
-  itself and paces them with 1 ms sleeps. At 60 FPS the frames follow the display's vsync and
-  were measured even.
+  any physics fix; switching to 30 helped then. Played through with this fork at 60 FPS, the
+  section showed no such deaths. If they happen to you, switch to 30 for that section.
 - If videos show a black screen on Windows, switch the graphics backend to Vulkan in the
   launcher's settings.
 

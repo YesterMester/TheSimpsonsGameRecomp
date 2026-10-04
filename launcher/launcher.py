@@ -262,6 +262,10 @@ SETTINGS_SCHEMA = {
     # FXAA works on every backend since 0.0.6.0 (it used to show a black
     # screen with Vulkan on the Steam Deck); new installs start with it.
     "swap_post_effect": ("str", "fxaa", True),     # none, fxaa, fxaa_extreme
+    # The characters' eyes (simpsons/src/eye_shading.cpp): "clean" reads the
+    # artists' no-rim-shadow flag with a tolerance, "original" keeps the
+    # speckled shadow of the Xbox 360 game. Patched when the game loads.
+    "eye_shading": ("str", "clean", True),
     # fps
     "video_mode_refresh_rate": ("float", 60.0, True),
     # input

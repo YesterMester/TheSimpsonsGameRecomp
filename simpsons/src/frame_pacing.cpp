@@ -28,6 +28,9 @@ REXCVAR_DEFINE_INT32(menu_frame_rate, 30, "GPU",
 
 // Steps the Havok world by f1 seconds of frame time. Runs every frame while a
 // level is live and never in the front end.
+// freecam.cpp: whether the photo mode has paused the level.
+bool FreecamWorldFrozen();
+
 REX_EXTERN(__imp__sub_827A55C0);
 REX_EXTERN(sub_827A55C0);
 
@@ -100,7 +103,9 @@ REX_FUNC(sub_82718710) {
       game_periods = std::max<uint32_t>(current, 1);
     }
     int64_t last_step = g_last_level_step_ns.load(std::memory_order_relaxed);
-    bool menu = !last_step || NowNs() - last_step > kMenuAfterNs;
+    // The photo mode pauses the level, which stops the physics step too; it is
+    // still a level and keeps the gameplay frame rate.
+    bool menu = (!last_step || NowNs() - last_step > kMenuAfterNs) && !FreecamWorldFrozen();
     uint32_t refresh_bits = LoadBE32(base, kSchedulerRefreshHz);
     float refresh_hz;
     std::memcpy(&refresh_hz, &refresh_bits, sizeof(refresh_hz));

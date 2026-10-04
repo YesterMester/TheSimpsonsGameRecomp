@@ -14,6 +14,14 @@ class Memory;
 // ink_outlines.cpp: patches the ink outline constants into the loaded image.
 void ApplyInkOutlineOptions(rex::memory::Memory* memory);
 
+namespace rex::ui {
+class Window;
+}
+
+// freecam.cpp: the free camera's key binds and keyboard listener.
+void InitFreecam(rex::ui::Window* window);
+void ShutdownFreecam(rex::ui::Window* window);
+
 // eye_shading.cpp: patches the characters' eye shading into the loaded image.
 void ApplyEyeShadingOptions(rex::memory::Memory* memory);
 
@@ -31,6 +39,8 @@ class SimpsonsApp : public rex::ReXApp {
     ApplyInkOutlineOptions(runtime()->memory());
     ApplyEyeShadingOptions(runtime()->memory());
   }
+  void OnPostSetup() override { InitFreecam(window()); }
+  void OnShutdown() override { ShutdownFreecam(window()); }
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}

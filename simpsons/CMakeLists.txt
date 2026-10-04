@@ -24,6 +24,7 @@ set(SIMPSONS_SOURCES
     src/draw_telemetry.cpp
     src/eye_shading.cpp
     src/frame_pacing.cpp
+    src/freecam.cpp
     src/ink_outlines.cpp
     src/ring_wait.cpp
     src/subtitles.cpp

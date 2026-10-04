@@ -3,7 +3,8 @@
 // The game shipped at 30 fps: its frame scheduler waits two vblanks per frame.
 // The 60 FPS patch (the "li r4,1" hand patch in sub_82867A48) makes that one
 // vblank everywhere. Gameplay copes, since its logic runs on real time and
-// physics has its own fix, but the front end runs its logic once per frame:
+// physics_step.cpp evens out the physics step, but the front end runs its
+// logic once per frame:
 // at 60 fps menus scroll and repeat inputs twice as fast as they were made
 // for, and the title screen, which costs a little more than one 60 Hz frame,
 // alternates 17 and 33 ms frames. While no level is simulating, this puts the
@@ -27,8 +28,9 @@ REXCVAR_DEFINE_INT32(menu_frame_rate, 30, "GPU",
 
 // Steps the Havok world by f1 seconds of frame time. Runs every frame while a
 // level is live and never in the front end.
-REX_EXTERN(__imp__sub_827A55C0);
 REX_EXTERN(sub_827A55C0);
+// physics_step.cpp: the step itself, through the shipped code.
+void HavokStep(PPCContext& ctx, uint8_t* base);
 
 // Returns the time until the frame scheduler's next deadline. r3 = the
 // scheduler, which holds the frame's start timebase at +136 and its periods
@@ -69,7 +71,7 @@ void StoreBE32(uint8_t* base, uint32_t address, uint32_t value) {
 
 REX_FUNC(sub_827A55C0) {
   g_last_level_step_ns.store(NowNs(), std::memory_order_relaxed);
-  __imp__sub_827A55C0(ctx, base);
+  HavokStep(ctx, base);
 }
 
 REX_FUNC(sub_82718710) {

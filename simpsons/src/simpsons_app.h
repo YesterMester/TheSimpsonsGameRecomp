@@ -5,6 +5,14 @@
 #pragma once
 
 #include <rex/rex_app.h>
+#include <rex/runtime.h>
+
+namespace rex::memory {
+class Memory;
+}
+
+// physics_step.cpp: sets the Havok step threshold in the loaded image.
+void ApplyPhysicsStepOptions(rex::memory::Memory* memory);
 
 class SimpsonsApp : public rex::ReXApp {
  public:
@@ -15,6 +23,8 @@ class SimpsonsApp : public rex::ReXApp {
     return std::unique_ptr<SimpsonsApp>(new SimpsonsApp(ctx, "simpsons",
         PPCImageConfig));
   }
+
+  void OnPostLoadXexImage() override { ApplyPhysicsStepOptions(runtime()->memory()); }
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}

@@ -441,27 +441,35 @@ def write_settings(new_values):
 
 # ------------------------------------------------------------------ patches
 
+def _logo_movie_files(enabled):
+    """The logo movies on disk, in every language folder under movies/ (en on
+    English discs, de, fr, ... on others), matched case-insensitively like
+    the guest filesystem: their .vp6 files, or the .vp6.disabled ones."""
+    movies = GAMEDATA / "movies"
+    if not movies.is_dir():
+        return []
+    suffix = ".vp6" if enabled else ".vp6.disabled"
+    names = {m + suffix for m in LOGO_MOVIES}
+    return [f for d in sorted(movies.iterdir()) if d.is_dir()
+            for f in sorted(d.iterdir()) if f.is_file() and f.name.lower() in names]
+
+
 def patch_skip_intro_state():
-    en = GAMEDATA / "movies" / "en"
-    if not en.is_dir():
+    present = _logo_movie_files(True)
+    disabled = _logo_movie_files(False)
+    if not present and not disabled:
         return "unavailable"
-    disabled = any((en / f"{m}.vp6.disabled").exists() for m in LOGO_MOVIES)
-    present = any((en / f"{m}.vp6").exists() for m in LOGO_MOVIES)
     return "on" if disabled and not present else "off"
 
 
 def patch_skip_intro(enable):
-    en = GAMEDATA / "movies" / "en"
-    if not en.is_dir():
+    if not (GAMEDATA / "movies").is_dir():
         return False, "game data not installed"
-    n = 0
-    for m in LOGO_MOVIES:
-        src = en / (f"{m}.vp6" if enable else f"{m}.vp6.disabled")
-        dst = en / (f"{m}.vp6.disabled" if enable else f"{m}.vp6")
-        if src.exists():
-            src.rename(dst)
-            n += 1
-    return True, f"{'skipped' if enable else 'restored'} {n} intro videos"
+    files = _logo_movie_files(enable)
+    for f in files:
+        f.rename(f.with_name(f.name + ".disabled") if enable
+                 else f.with_name(f.name[:-len(".disabled")]))
+    return True, f"{'skipped' if enable else 'restored'} {len(files)} intro videos"
 
 
 def _toml_flag(key, default="false"):

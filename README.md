@@ -49,8 +49,9 @@ What it adds to the original project:
   off.
 - **Clean eyes:** no more speckled dark shadow on the characters' eye whites.
 - **Start episode (level select)** in the launcher: a new game can start in any of the 18 episodes.
-- **Fixes:** choppy, slowed-down sound on some Windows PCs, the menus' frame rate on Windows, and
-  the skip-intro patch on releases that are not in English.
+- **Fixes:** the game running 7.5% fast on Windows PCs with a coarse system timer, even physics
+  steps at 60 FPS, choppy, slowed-down sound on some Windows PCs, the menus' frame rate on
+  Windows, and the skip-intro patch on releases that are not in English.
 
 The changes were developed and checked on Windows 11. They build for Linux too but have not been
 tried there.
@@ -120,6 +121,22 @@ for byte. Starting this way has been tried with Springfield and The Day the Eart
 
 ### Fixes
 
+- **Game speed on Windows.** The game measures every frame with a millisecond tick count, which
+  the runtime copies from its clock with a 1 ms timer. On Windows that timer only runs as often as
+  the system timer lets it; with the default 15.6 ms the tick count moved in 15.6 ms steps, the
+  game counted about 22 of every 300 frames twice, and everything ran 7.5% fast at 60 FPS: timers,
+  sequences, characters and physics. The game's tick count now comes straight from the clock
+  (`tick_count_precise`, on by default), and the game clock runs at real time.
+- **Physics at 60 FPS.** The game steps its Havok physics in steps made for 30 FPS. The earlier
+  60 FPS fix (tronuo's upstream pull request
+  [#24](https://github.com/YesterMester/TheSimpsonsGameRecomp/pull/24)) was meant to give one 16.7 ms step
+  per frame, but a rounding detail in the game's frame time smoothing made it take two 8.3 ms
+  steps instead, about 120 a second, a step size the console never used. Now each frame gets one
+  16.7 ms step per vblank it took: 60 steps of 16.7 ms a second at 60 and at 30 FPS, like the
+  console's usual mode, and physics time follows the game clock exactly. `physics_step` in
+  `simpsons.toml` chooses `steady` (default), `legacy` (the earlier fix) or `original` (the
+  console code, 30 Hz steps at 60 FPS); it needs a restart. The fix is now made when the game is
+  loaded, so `simpsons/generated` is again the recompiler's unchanged output.
 - **Choppy, slowed-down sound on Windows**
   ([#36](https://github.com/YesterMester/TheSimpsonsGameRecomp/issues/36),
   [#38](https://github.com/YesterMester/TheSimpsonsGameRecomp/issues/38)). The audio thread paced
@@ -138,7 +155,9 @@ for byte. Starting this way has been tried with Springfield and The Day the Eart
 For diagnosing audio problems, `audio_log_underruns` now also logs the audio pacing and the depth
 of the output queue every 5 seconds, `audio_dump_file` writes all audio the game submits to a raw
 file with timestamps, and the `REX_TIMER_STATS` environment variable also logs how often the game
-arms each of its timers.
+arms each of its timers. For timing and physics, `physics_log` logs every 5 seconds the game
+clock's rate, the real time between frames and the physics steps per frame, and for every second
+with hazard damage how many damage messages the game's touch and trigger hazards sent.
 
 ### Branches
 
@@ -154,6 +173,8 @@ original project's `main`:
 | [`fix-windows-audio-pacing`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/fix-windows-audio-pacing) | Windows audio fix and audio diagnostics |
 | [`fix-windows-guest-addresses`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/fix-windows-guest-addresses) | Menu frame rate on Windows |
 | [`fix-skip-intro-languages`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/fix-skip-intro-languages) | Skip intro on releases that are not in English |
+| [`fix-game-tick-count`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/fix-game-tick-count) | Game speed on Windows |
+| [`fix-havok-step`](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff/tree/fix-havok-step) | Physics at 60 FPS and `physics_log` |
 
 ## Status
 
@@ -271,9 +292,15 @@ controls under Input > Keybinds (press *Save to config* to keep changes made the
 
 ## Known issues
 
-- At 60 FPS some scripted sequences can misbehave, because the game was built for 30 FPS. A known
-  case is the dam in "Lisa the Tree Hugger", where random deaths can happen at 60; switch to 30
-  for that section if it happens.
+- Random deaths were reported at 60 FPS in one section of "Lisa the Tree Hugger", the walkway
+  with circular saws and conveyor belts
+  ([#2](https://github.com/YesterMester/TheSimpsonsGameRecomp/issues/2)), on a build from before
+  any physics fix; switching to 30 helped then. Whether it still happens with this fork's physics
+  and game speed fixes has not been tested yet. If it does, switch to 30 for that section.
+- On Windows PCs where the system timer stays at 15.6 ms, the 30 FPS setting runs the game about
+  7.5% fast, with frames alternating between 31 and 47 ms: the runtime makes the 30 Hz vblanks
+  itself and paces them with 1 ms sleeps. At 60 FPS the frames follow the display's vsync and
+  were measured even.
 - If videos show a black screen on Windows, switch the graphics backend to Vulkan in the
   launcher's settings.
 

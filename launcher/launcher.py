@@ -262,6 +262,12 @@ SETTINGS_SCHEMA = {
     # FXAA works on every backend since 0.0.6.0 (it used to show a black
     # screen with Vulkan on the Steam Deck); new installs start with it.
     "swap_post_effect": ("str", "fxaa", True),     # none, fxaa, fxaa_extreme
+    # The black ink outlines (simpsons/src/ink_outlines.cpp): original, soft or
+    # off; the soft lines' darkness; and their colour as RRGGBB (000000 =
+    # black, the original). Patched when the game loads, hence the restart.
+    "ink_outlines": ("str", "original", True),
+    "ink_outline_strength": ("float", 0.6, True),
+    "ink_outline_color": ("str", "000000", True),
     # fps
     "video_mode_refresh_rate": ("float", 60.0, True),
     # input

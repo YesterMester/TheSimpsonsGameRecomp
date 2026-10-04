@@ -15,6 +15,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/ring_progress.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/ppc.h>
 
 REXCVAR_DEFINE_BOOL(ring_wait_sleep, true, "GPU",
@@ -34,9 +35,20 @@ namespace {
 constexpr uint32_t kDeviceReadPointerAddress = 10896;
 constexpr uint32_t kWaitTimeoutUs = 1000;
 
+// Host address of guest memory as the generated code computes it
+// (REX_PHYS_HOST_OFFSET): on Windows the physical heaps from 0xE0000000,
+// where the game's heap objects live, sit 0x1000 further on in host memory.
+const uint8_t* GuestToHost(const uint8_t* base, uint32_t address) {
+#if REX_PLATFORM_WIN32
+  return base + address + (address >= 0xE0000000u ? 0x1000u : 0u);
+#else
+  return base + address;
+#endif
+}
+
 uint32_t LoadBE32(const uint8_t* base, uint32_t address) {
   uint32_t value;
-  std::memcpy(&value, base + address, sizeof(value));
+  std::memcpy(&value, GuestToHost(base, address), sizeof(value));
   return rex::byte_swap(value);
 }
 

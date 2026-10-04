@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
@@ -25,6 +27,12 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+// Diagnostics: every frame the game submits, raw (256 samples x 6 channels,
+// big-endian float, channel after channel), and in <file>.ts the
+// SDL_GetPerformanceCounter() of each, for measuring gaps without listening.
+REXCVAR_DEFINE_STRING(audio_dump_file, "", "Audio",
+                      "Append every submitted audio frame (raw 6 x 256 big-endian floats) to "
+                      "this file, and its timestamp to <file>.ts; empty = off");
 REXCVAR_DEFINE_BOOL(audio_log_underruns, false, "Audio",
                     "Log how many played frames were silence because no frame was queued, and how "
                     "many frames the game submitted were entirely silent (diagnostic)");
@@ -145,6 +153,27 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
 
+  {
+    static std::FILE* dump = nullptr;
+    static std::FILE* dump_ts = nullptr;
+    static bool dump_opened = false;
+    if (!dump_opened) {
+      dump_opened = true;
+      const std::string path = REXCVAR_GET(audio_dump_file);
+      if (!path.empty()) {
+        dump = std::fopen(path.c_str(), "wb");
+        dump_ts = std::fopen((path + ".ts").c_str(), "wb");
+      }
+    }
+    if (dump && dump_ts) {
+      const uint64_t now = SDL_GetPerformanceCounter();
+      std::fwrite(input_frame, sizeof(float), frame_samples_, dump);
+      std::fwrite(&now, sizeof(now), 1, dump_ts);
+      std::fflush(dump);
+      std::fflush(dump_ts);
+    }
+  }
+
   bool log_underruns = REXCVAR_GET(audio_log_underruns);
   bool silent_frame = false;
   if (log_underruns) {
@@ -165,14 +194,19 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
     if (log_underruns) {
       diag_silent_submitted_frames_ += uint32_t(silent_frame);
+      diag_queue_sum_ += frames_queued_.size();
+      diag_queue_min_ = std::min<uint32_t>(diag_queue_min_, uint32_t(frames_queued_.size()));
       // About every 5 seconds, logged from the submitting thread rather than
       // the realtime audio callback.
       if (++diag_submitted_frames_ >= 960) {
         REXAPU_INFO(
             "[audio-diag] played {} frames: {} silence (nothing queued); submitted {}: {} all "
-            "zero; queued now {}",
+            "zero; queued now {}, avg {:.1f}, min {}",
             diag_played_frames_, diag_underrun_frames_, diag_submitted_frames_,
-            diag_silent_submitted_frames_, frames_queued_.size());
+            diag_silent_submitted_frames_, frames_queued_.size(),
+            double(diag_queue_sum_) / diag_submitted_frames_, diag_queue_min_);
+        diag_queue_sum_ = 0;
+        diag_queue_min_ = UINT32_MAX;
         diag_played_frames_ = 0;
         diag_underrun_frames_ = 0;
         diag_submitted_frames_ = 0;

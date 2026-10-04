@@ -14,6 +14,9 @@ class Memory;
 // ink_outlines.cpp: patches the ink outline constants into the loaded image.
 void ApplyInkOutlineOptions(rex::memory::Memory* memory);
 
+// eye_shading.cpp: patches the characters' eye shading into the loaded image.
+void ApplyEyeShadingOptions(rex::memory::Memory* memory);
+
 class SimpsonsApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -24,7 +27,10 @@ class SimpsonsApp : public rex::ReXApp {
         PPCImageConfig));
   }
 
-  void OnPostLoadXexImage() override { ApplyInkOutlineOptions(runtime()->memory()); }
+  void OnPostLoadXexImage() override {
+    ApplyInkOutlineOptions(runtime()->memory());
+    ApplyEyeShadingOptions(runtime()->memory());
+  }
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}

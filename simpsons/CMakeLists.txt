@@ -22,6 +22,7 @@ include(generated/rexglue.cmake)
 set(SIMPSONS_SOURCES
     src/main.cpp
     src/draw_telemetry.cpp
+    src/eye_shading.cpp
     src/frame_pacing.cpp
     src/ink_outlines.cpp
     src/ring_wait.cpp

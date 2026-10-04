@@ -510,6 +510,14 @@
           </select>
         </div>
         <div class="field">
+          <label>Characters' eyes</label>
+          <select id="s-eye_shading">
+            <option value="clean">Clean (as the artists drew them)</option>
+            <option value="original">Original (speckled shadow)</option>
+          </select>
+          <div class="hint">The original game scatters dark dots over the eye whites. Restart needed.</div>
+        </div>
+        <div class="field">
           <label>Texture filtering (anisotropic)</label>
           <select id="s-anisotropic_override">
             <option value="0">Off</option>
@@ -1522,6 +1530,7 @@ async function loadSettings(){
   $("#s-ink_outline_strength").value = v.ink_outline_strength ?? 0.6;
   $("#s-ink_outline_color").value = (v.ink_outline_color || "000000").toUpperCase();
   updateInkFields(true);
+  $("#s-eye_shading").value = v.eye_shading || "clean";
   $("#s-present_effect").value = v.present_effect || "bilinear";
   $("#s-present_fsr_sharpness_reduction").value = String(Number(v.present_fsr_sharpness_reduction));
   $("#s-anisotropic_override").value = String(v.anisotropic_override);
@@ -1557,6 +1566,7 @@ function settingsValues(){
     ink_outlines: $("#s-ink_outlines").value,
     ink_outline_strength: Number($("#s-ink_outline_strength").value),
     ink_outline_color: inkColorValue(),
+    eye_shading: $("#s-eye_shading").value,
     present_effect: $("#s-present_effect").value,
     present_fsr_sharpness_reduction: Number($("#s-present_fsr_sharpness_reduction").value),
     anisotropic_override: Number($("#s-anisotropic_override").value),

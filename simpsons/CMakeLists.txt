@@ -26,6 +26,7 @@ set(SIMPSONS_SOURCES
     src/frame_pacing.cpp
     src/freecam.cpp
     src/ink_outlines.cpp
+    src/physics_step.cpp
     src/ring_wait.cpp
     src/subtitles.cpp
 )

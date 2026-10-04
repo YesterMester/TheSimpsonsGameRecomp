@@ -25,6 +25,9 @@ void ShutdownFreecam(rex::ui::Window* window);
 // eye_shading.cpp: patches the characters' eye shading into the loaded image.
 void ApplyEyeShadingOptions(rex::memory::Memory* memory);
 
+// physics_step.cpp: sets the Havok step threshold in the loaded image.
+void ApplyPhysicsStepOptions(rex::memory::Memory* memory);
+
 class SimpsonsApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -38,6 +41,7 @@ class SimpsonsApp : public rex::ReXApp {
   void OnPostLoadXexImage() override {
     ApplyInkOutlineOptions(runtime()->memory());
     ApplyEyeShadingOptions(runtime()->memory());
+    ApplyPhysicsStepOptions(runtime()->memory());
   }
   void OnPostSetup() override { InitFreecam(window()); }
   void OnShutdown() override { ShutdownFreecam(window()); }

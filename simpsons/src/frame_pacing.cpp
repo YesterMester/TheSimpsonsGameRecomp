@@ -18,6 +18,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/ppc.h>
 
 REXCVAR_DEFINE_INT32(menu_frame_rate, 30, "GPU",
@@ -54,15 +55,26 @@ int64_t NowNs() {
       .count();
 }
 
+// Host address of guest memory as the generated code computes it
+// (REX_PHYS_HOST_OFFSET): on Windows the physical heaps from 0xE0000000,
+// where the game's heap objects live, sit 0x1000 further on in host memory.
+const uint8_t* GuestToHost(const uint8_t* base, uint32_t address) {
+#if REX_PLATFORM_WIN32
+  return base + address + (address >= 0xE0000000u ? 0x1000u : 0u);
+#else
+  return base + address;
+#endif
+}
+
 uint32_t LoadBE32(const uint8_t* base, uint32_t address) {
   uint32_t value;
-  std::memcpy(&value, base + address, sizeof(value));
+  std::memcpy(&value, GuestToHost(base, address), sizeof(value));
   return rex::byte_swap(value);
 }
 
 void StoreBE32(uint8_t* base, uint32_t address, uint32_t value) {
   value = rex::byte_swap(value);
-  std::memcpy(base + address, &value, sizeof(value));
+  std::memcpy(const_cast<uint8_t*>(GuestToHost(base, address)), &value, sizeof(value));
 }
 
 }  // namespace

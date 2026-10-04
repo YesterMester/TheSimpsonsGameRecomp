@@ -306,6 +306,8 @@ SETTINGS_SCHEMA = {
         "bind_settings": "F4",
         "bind_debug_overlay": "F3",
         "bind_console": "Backtick",
+        "bind_freecam": "F6",
+        "bind_photo_mode": "F8",
     }.items()},
     # game
     "user_language": ("int", 1, True),

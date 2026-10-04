@@ -23,6 +23,7 @@ set(SIMPSONS_SOURCES
     src/main.cpp
     src/draw_telemetry.cpp
     src/frame_pacing.cpp
+    src/freecam.cpp
     src/ring_wait.cpp
     src/subtitles.cpp
 )

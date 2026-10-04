@@ -107,7 +107,8 @@ class InputInjector {
     buttons_ = 0;
     lx_ = ly_ = rx_ = ry_ = 0;
     lt_ = rt_ = 0;
-    std::string name(control);
+    // One control, or several joined by '+' and held together (e.g. LS+RS).
+    std::string controls(control);
     static const std::pair<const char*, uint16_t> kButtons[] = {
         {"A", X_INPUT_GAMEPAD_A},
         {"B", X_INPUT_GAMEPAD_B},
@@ -124,28 +125,41 @@ class InputInjector {
         {"LEFT", X_INPUT_GAMEPAD_DPAD_LEFT},
         {"RIGHT", X_INPUT_GAMEPAD_DPAD_RIGHT},
     };
-    bool known = false;
-    for (const auto& [button_name, mask] : kButtons) {
-      if (name == button_name) {
-        buttons_ = mask;
-        known = true;
+    constexpr int16_t kFull = 32767;
+    size_t start = 0;
+    while (start <= controls.size()) {
+      size_t end = controls.find('+', start);
+      if (end == std::string::npos) {
+        end = controls.size();
+      }
+      const std::string name = controls.substr(start, end - start);
+      start = end + 1;
+      bool known = false;
+      for (const auto& [button_name, mask] : kButtons) {
+        if (name == button_name) {
+          buttons_ |= mask;
+          known = true;
+        }
+      }
+      if (name == "LT") { lt_ = 0xFF; known = true; }
+      if (name == "RT") { rt_ = 0xFF; known = true; }
+      if (name == "L_UP") { ly_ = kFull; known = true; }
+      if (name == "L_DOWN") { ly_ = -kFull; known = true; }
+      if (name == "L_LEFT") { lx_ = -kFull; known = true; }
+      if (name == "L_RIGHT") { lx_ = kFull; known = true; }
+      if (name == "R_UP") { ry_ = kFull; known = true; }
+      if (name == "R_DOWN") { ry_ = -kFull; known = true; }
+      if (name == "R_LEFT") { rx_ = -kFull; known = true; }
+      if (name == "R_RIGHT") { rx_ = kFull; known = true; }
+      if (!known) {
+        REXLOG_WARN("input_inject_file: unknown control '{}'", name);
+        buttons_ = 0;
+        lx_ = ly_ = rx_ = ry_ = 0;
+        lt_ = rt_ = 0;
+        return;
       }
     }
-    constexpr int16_t kFull = 32767;
-    if (name == "LT") { lt_ = 0xFF; known = true; }
-    if (name == "RT") { rt_ = 0xFF; known = true; }
-    if (name == "L_UP") { ly_ = kFull; known = true; }
-    if (name == "L_DOWN") { ly_ = -kFull; known = true; }
-    if (name == "L_LEFT") { lx_ = -kFull; known = true; }
-    if (name == "L_RIGHT") { lx_ = kFull; known = true; }
-    if (name == "R_UP") { ry_ = kFull; known = true; }
-    if (name == "R_DOWN") { ry_ = -kFull; known = true; }
-    if (name == "R_LEFT") { rx_ = -kFull; known = true; }
-    if (name == "R_RIGHT") { rx_ = kFull; known = true; }
-    if (!known) {
-      REXLOG_WARN("input_inject_file: unknown control '{}'", name);
-      return;
-    }
+    const std::string& name = controls;
     release_at_ = now + std::chrono::microseconds(int64_t(hold * 1e6));
     REXLOG_INFO("input_inject_file: {} for {:.2f}s", name, hold);
   }

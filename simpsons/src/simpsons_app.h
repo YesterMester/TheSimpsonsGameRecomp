@@ -6,6 +6,14 @@
 
 #include <rex/rex_app.h>
 
+namespace rex::ui {
+class Window;
+}
+
+// freecam.cpp: the free camera's key binds and keyboard listener.
+void InitFreecam(rex::ui::Window* window);
+void ShutdownFreecam(rex::ui::Window* window);
+
 class SimpsonsApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -15,6 +23,9 @@ class SimpsonsApp : public rex::ReXApp {
     return std::unique_ptr<SimpsonsApp>(new SimpsonsApp(ctx, "simpsons",
         PPCImageConfig));
   }
+
+  void OnPostSetup() override { InitFreecam(window()); }
+  void OnShutdown() override { ShutdownFreecam(window()); }
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}

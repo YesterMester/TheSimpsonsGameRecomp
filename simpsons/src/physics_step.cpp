@@ -36,6 +36,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -60,10 +61,13 @@ REXCVAR_DEFINE_BOOL(physics_log, false, "GPU",
 
 REX_EXTERN(__imp__sub_827A55C0);
 // hkWorld::stepDeltaTime(world, f1 = step).
+REX_EXTERN(sub_82AA2070);
 REX_EXTERN(__imp__sub_82AA2070);
 // TouchDetectorHurt's touch callback: r3 = the component, r4 = what touched it.
+REX_EXTERN(sub_829ED8D8);
 REX_EXTERN(__imp__sub_829ED8D8);
 // TriggerHurt's message handler: r3 = the component, r4 = the message.
+REX_EXTERN(sub_8299EAB8);
 REX_EXTERN(__imp__sub_8299EAB8);
 
 namespace {
@@ -75,6 +79,9 @@ constexpr uint32_t kStepThresholdOriginal = 0x3D08AB86;
 constexpr uint32_t kVblankStep = 0x3C88AB86;
 // The game clock's frame time, whole vblanks times the time scale.
 constexpr uint32_t kFrameDt = 0x82CED748;
+// The same without the time scale.
+constexpr uint32_t kRawFrameDt = 0x82CED744;
+constexpr double kVblankSeconds = 1.0 / 59.94;
 // The smoothed frame time settles 2 to 3 ulps from the clock's value.
 constexpr int32_t kSettledUlps = 8;
 // iMsgTrigger's message id.
@@ -134,6 +141,10 @@ struct StepStats {
   uint32_t settled = 0;
   uint32_t steps_per_frame[4] = {};  // 0, 1, 2, 3 or more
   uint32_t steps = 0;
+  uint32_t vblanks_per_frame[4] = {};  // the game clock's frame time: 0, 1, 2, 3 or more
+  double game_seconds = 0.0;
+  // Real time between two steps: <12, 12-15.5, 15.5-18, 18-21, 21-30, >=30 ms.
+  uint32_t intervals[6] = {};
   float min_step = 0.0f;
   float max_step = 0.0f;
   uint32_t last_requested = 0;
@@ -154,11 +165,16 @@ void LogSteps(int64_t now) {
   StepStats& s = g_steps;
   const double seconds = double(now - s.since_ns) * 1e-9;
   REXLOG_INFO(
-      "[physics] {}: {:.1f} s, {} frames ({:.1f}/s), steps per frame 0:{} 1:{} 2:{} 3+:{}, "
-      "step {:.3f}-{:.3f} ms, frame time {:08X} -> {:08X}, settled {}/{}",
-      ModeName(), seconds, s.frames, s.frames / seconds, s.steps_per_frame[0],
-      s.steps_per_frame[1], s.steps_per_frame[2], s.steps_per_frame[3], s.min_step * 1000.0f,
-      s.max_step * 1000.0f, s.last_requested, s.last_used, s.settled, s.frames);
+      "[physics] {}: {:.1f} s, {} frames ({:.1f}/s), game clock {:.3f}x real time, vblanks per "
+      "frame 0:{} 1:{} 2:{} 3+:{}, steps per frame 0:{} 1:{} 2:{} 3+:{}, step {:.3f}-{:.3f} ms, "
+      "frame time {:08X} -> {:08X}, settled {}/{}, real frame interval <12:{} 12-15.5:{} "
+      "15.5-18:{} 18-21:{} 21-30:{} 30+:{} ms",
+      ModeName(), seconds, s.frames, s.frames / seconds, s.game_seconds / seconds,
+      s.vblanks_per_frame[0], s.vblanks_per_frame[1], s.vblanks_per_frame[2],
+      s.vblanks_per_frame[3], s.steps_per_frame[0], s.steps_per_frame[1], s.steps_per_frame[2],
+      s.steps_per_frame[3], s.min_step * 1000.0f, s.max_step * 1000.0f, s.last_requested,
+      s.last_used, s.settled, s.frames, s.intervals[0], s.intervals[1], s.intervals[2],
+      s.intervals[3], s.intervals[4], s.intervals[5]);
   s = StepStats{};
   s.since_ns = now;
 }
@@ -180,13 +196,22 @@ void LogHazards(int64_t now) {
   g_hazard_steps = 0;
 }
 
-void Record(uint32_t requested, uint32_t used, bool settled) {
+void Record(const uint8_t* base, uint32_t requested, uint32_t used, bool settled) {
   const int64_t now = NowNs();
   StepStats& s = g_steps;
   if (!s.since_ns) {
     s.since_ns = now;
     g_hazard_since_ns = now;
   }
+  static int64_t last_ns = 0;
+  if (last_ns) {
+    const double ms = double(now - last_ns) * 1e-6;
+    ++s.intervals[ms < 12.0 ? 0 : ms < 15.5 ? 1 : ms < 18.0 ? 2 : ms < 21.0 ? 3 : ms < 30.0 ? 4 : 5];
+  }
+  last_ns = now;
+  const double raw_dt = LoadBEFloat(base, kRawFrameDt);
+  s.game_seconds += raw_dt;
+  ++s.vblanks_per_frame[std::clamp<long>(std::lround(raw_dt / kVblankSeconds), 0, 3)];
   ++s.frames;
   s.settled += settled ? 1 : 0;
   ++s.steps_per_frame[std::min<uint32_t>(t_steps, 3)];
@@ -263,7 +288,7 @@ void HavokStep(PPCContext& ctx, uint8_t* base) {
   t_steps = 0;
   __imp__sub_827A55C0(ctx, base);
   t_in_step = false;
-  Record(requested, used, settled);
+  Record(base, requested, used, settled);
 }
 
 REX_FUNC(sub_82AA2070) {

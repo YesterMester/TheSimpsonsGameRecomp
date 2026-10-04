@@ -29,6 +29,7 @@ set(SIMPSONS_SOURCES
     src/physics_step.cpp
     src/ring_wait.cpp
     src/subtitles.cpp
+    src/tick_count.cpp
 )
 
 if(WIN32)

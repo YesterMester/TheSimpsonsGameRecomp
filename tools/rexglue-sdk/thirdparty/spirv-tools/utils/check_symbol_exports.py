@@ -53,7 +53,7 @@ def check_library(library):
     then return 0.  Otherwise emit a message and return 1."""
 
     # The pattern for an externally visible symbol record
-    symbol_pattern = re.compile(r'^[0-aA-Fa-f]+ +([wg]) *F \.text.*[0-9A-Fa-f]+ +(.*)')
+    symbol_pattern = re.compile(r'^[0-9A-Fa-f]+ +([wg]) *F \.text.*[0-9A-Fa-f]+ +(.*)')
 
     # Ok patterns are as follows, assuming Itanium name mangling:
     #   spv[A-Z]          :  extern "C" symbol starting with spv

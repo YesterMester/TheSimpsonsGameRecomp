@@ -1,36 +1,27 @@
 You need your own copy of The Simpsons Game for Xbox 360. No game content is included; the
 launcher installs the game from your own ISO.
 
-### Keyboard and mouse
+### Security
 
-- The game takes the mouse as soon as its window is active: no more clicking into the window, the cursor is hidden and stays inside, and switching to another window lets go of it. On Linux and the Steam Deck, mouse look reads the mouse's raw movement, so it is smooth at any speed and free of desktop pointer acceleration.
-- Every control can be rebound in the launcher (Settings, Keyboard & mouse): press Change, then a key, a mouse button or the wheel. An action can have more than one key, and the mouse wheel and side buttons can be bound. Mouse sensitivity and invert-Y are there too.
-- Press F1 in the game to see the controls: each controller button, the key it is on and what it does, so the game's button prompts make sense on a keyboard. A short reminder appears when the game starts.
-- Controls can also be changed while playing: F4 opens the settings, with the controls under Input > Keybinds. The mouse is released while the settings or the console are open, so they can be clicked.
-- New default layout: W A S D to move, the mouse to look around, Space to jump, left click to attack, right click for the special attack, E for actions, Shift to target, Ctrl to walk, 1 to 4 or the arrow keys to switch character, Tab for the to-do list and Esc to pause. Enter and Backspace confirm and go back in menus.
-- The camera can be turned with keys too: bind Look up, down, left and right in the launcher (#33).
-- The keys that open the in-game overlays (controls list F1, settings F4, FPS overlay F3, console `) can be changed in the launcher, and a key changed in the game's own settings now stays changed after a restart.
-- Quick key taps and clicks are no longer missed.
+GitHub's code scanning and Dependabot are now turned on for the project. This release fixes what they found in the launcher, the game's runtime and the tools that come with it.
 
-### Launcher
-
-- A new look with the show in mind, in a light theme (Springfield by day) and a dark theme (Springfield by night). The button at the top right switches between them; until you pick one, the launcher follows your system's setting.
-- Settings are saved the moment you change them. Before, a change was lost unless you pressed Save at the bottom of the page, which is why settings seemed to reset, fullscreen didn't stick and a higher render resolution never took effect (#34).
-- The sharpening setting only appears with FSR 1, the only filter that uses it (Bilinear never sharpens), and Render resolution says what it does: 3x draws a true 4K picture (#34).
-- Launcher artwork works again. With the ffmpeg bundled on Windows, every cutscene frame failed, which left the art folder empty; elsewhere the same pictures repeated. Every install makes its artwork again once (#7).
-- The launcher window no longer stops at "127.0.0.1 refused to connect" when its built-in server answers late: it retries, and if the server never answers it says what to try. It also writes `launcher.log` next to itself, for bug reports (#37).
-
-### Windows
-
-- The game now asks Windows for its finest timer resolution, as Xenia does. Without it, every short wait in the game, its frame pacing and the threads that feed the audio stretched to Windows' default 15.6 ms tick, the likely cause of choppy audio (#36) and uneven frame pacing on Windows.
+- The launcher's built-in server, which the launcher window talks to, now only answers requests addressed to 127.0.0.1 or localhost. Before, a web page that pointed its own domain name at your computer (DNS rebinding) could read the launcher's answers, including its folder listings. Every request to the launcher's API now also needs the launcher's token; the ISO browser's folder listings didn't before.
+- The ISO browser only opens folders inside its starting locations (your home folder, drives and media folders), checked after resolving `..` and links, and a folder like `/home/deck2` no longer counts as being inside `/home/deck`. Launcher artwork, fonts and save backups are only served or restored by their exact name in their own folder.
+- Game runtime: sizes and offsets for memory protection, index buffers and GPU buffer bindings are computed in 64 bits so they can't overflow first, and closing a window no longer goes through code that could call into a half-destroyed window. The Xbox 360 kernel's DES encryption functions are stubs now and the DES code is removed; the game never calls them.
+- extract-xiso, which installs the game from your ISO: its rewrite mode (`-r`, which the launcher doesn't use) can no longer replace a file that appears next to the image while it runs.
+- The Build check workflow's GitHub token can only read the repository.
+- Bundled third-party code: SPIRV-Tools' sva, a JavaScript tool that nothing here builds or runs, is removed along with the vulnerable npm packages it pinned (brace-expansion, braces, minimatch, js-yaml, nanoid, serialize-javascript and others), and Google Benchmark's Python requirements now ask for scipy 1.10.0 (CVE-2023-25399, CVE-2023-29824). Neither was part of the game or the launcher.
 
 ### Renderer
 
-- Springfield at 2x internal resolution now runs at about 59 FPS on the Steam Deck, up from about 50. The GPU needs about a third less time per frame there: memory the game rewrites every frame is uploaded only when it actually changed, buffers are no longer all uploaded again every frame, and textures the game renders to keep the GPU's color compression on AMD GPUs.
-- Every shader the game uses comes precompiled in the Linux and Steam Deck packages, so new areas no longer stop to translate shaders the first time they appear.
-- Render targets are the size of what the game draws instead of covering the Xbox 360's whole EDRAM, which saves about 95 MB of video memory at 2x.
-- Rendered images that no texture reads yet are written straight to memory, and shadow-map copies whose data is never used are skipped.
-- Every change gives the same image as 0.0.6.1 in replay tests at 1x and 2x.
+- Render target copies that full-screen passes overwrite anyway are skipped.
+- The game's clears are done as real GPU clears, which the GPU can fast-clear: about 0.45 ms less GPU time per frame at 2x.
+- The post-processing passes fetch their texture samples in batches so the waits overlap: about another 0.45 ms per frame at 2x.
+- Same images as 0.0.6.2 in captured scenes at 1x and 2x.
+
+### Launcher
+
+- The launcher no longer uses about a third of a CPU core while it is open. Its spinning donut and picture crossfade repainted the whole page every frame, which took frames from the game when the launcher stayed open behind it. The donut now only spins when clicked, and the pictures change every 15 seconds and not at all while the game runs or the launcher is hidden.
 
 ### Known issues
 

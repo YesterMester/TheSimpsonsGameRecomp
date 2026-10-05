@@ -1154,7 +1154,7 @@ bool VulkanCommandProcessor::SetupContext() {
     VkDescriptorBufferInfo& shared_memory_descriptor_buffer_info =
         shared_memory_descriptor_buffers_info[i];
     shared_memory_descriptor_buffer_info.buffer = shared_memory_->buffer();
-    shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
+    shared_memory_descriptor_buffer_info.offset = VkDeviceSize(shared_memory_binding_range) * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
   VkWriteDescriptorSet write_descriptor_sets[2];

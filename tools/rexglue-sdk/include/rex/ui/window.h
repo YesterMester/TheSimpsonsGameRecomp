@@ -429,7 +429,7 @@ class Window {
   void EnterDestructor() {
     phase_ = Phase::kDeleting;
     // Disconnect from the surface before destroying the window behind it.
-    OnSurfaceChanged(false);
+    DetachSurfaceFromPresenter();
   }
 
   // For an open window, the implementation should return the current DPI for
@@ -529,11 +529,12 @@ class Window {
 
   Presenter* presenter() const { return presenter_; }
   bool HasSurface() const { return presenter_surface_ != nullptr; }
-  // If new_surface_potentially_exists is false, creation of the new surface for
-  // the window won't be updated, and it may be called from the destructor (via
-  // EnterDestructor to destroy the surface before destroying what it depends
-  // on) as no virtual functions (including CreateSurface) will be called.
-  // This function is nonvirtual itself for this reason as well.
+  // Detaches the presenter from the current surface and destroys the surface.
+  // It calls no virtual functions, so the destructor (via EnterDestructor) can
+  // use it to destroy the surface before destroying what it depends on.
+  void DetachSurfaceFromPresenter();
+  // If new_surface_potentially_exists is false, the old surface is only
+  // detached and no new one is created.
   void OnSurfaceChanged(bool new_surface_potentially_exists);
   // Called only for an open window.
   virtual std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) = 0;

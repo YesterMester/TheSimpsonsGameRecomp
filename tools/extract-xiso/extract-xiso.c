@@ -640,7 +640,6 @@ static xoff_t							s_xbox_disc_lseek = 0;
 
 
 int main( int argc, char **argv ) {
-	struct stat		sb;
 	create_list	   *create = nil, *p, *q, **r;
 	int				i, fd, opt_char, err = 0, isos = 0;
 	bool			extract = true, rewrite = false, free_user = false, free_pass = false, x_seen = false, delete = false, optimized;
@@ -807,8 +806,27 @@ int main( int argc, char **argv ) {
 					if ( ! err && ( buf = (char *) malloc( strlen( argv[ i ] ) + 5 ) ) == nil ) mem_err();	// + 5 magic number is for ".old\0"
 					if ( ! err ) {
 						sprintf( buf, "%s.old", argv[ i ] );
-						if ( stat( buf, &sb ) != -1 ) misc_err( "%s already exists, cannot rewrite %s\n", buf, argv[ i ], 0 );
-						if ( ! err && rename( argv[ i ], buf ) == -1 ) misc_err( "cannot rename %s to %s\n", argv[ i ], buf, 0 );
+#if defined( _WIN32 )
+						// rename() never replaces an existing file on Windows, so a .old file that
+						// already exists (or appears meanwhile) makes it fail instead of being lost.
+						if ( rename( argv[ i ], buf ) == -1 ) misc_err( "cannot rename %s to %s: %s\n", argv[ i ], buf, strerror( errno ) );
+#else
+						// Claim the .old name with O_EXCL first, which fails if it exists, so the
+						// rename can't replace a file that appears between a check and the rename.
+						if ( ( fd = open( buf, O_WRONLY | O_CREAT | O_EXCL, 0600 ) ) == -1 ) {
+							if ( errno == EEXIST ) {
+								misc_err( "%s already exists, cannot rewrite %s\n", buf, argv[ i ], 0 );
+							} else {
+								misc_err( "cannot create %s: %s\n", buf, strerror( errno ), 0 );
+							}
+						} else {
+							close( fd );
+							if ( rename( argv[ i ], buf ) == -1 ) {
+								misc_err( "cannot rename %s to %s\n", argv[ i ], buf, 0 );
+								unlink( buf );
+							}
+						}
+#endif
 						
 						if ( err ) { err = 0; free( buf ); continue; }
 					}

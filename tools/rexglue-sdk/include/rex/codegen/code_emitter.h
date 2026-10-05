@@ -148,7 +148,7 @@ class StringEmitter : public CodeEmitter {
   std::string take() { return std::move(buffer_); }
 
  private:
-  void updateIndentString() { indentStr_ = std::string(indentLevel_ * indentWidth_, ' '); }
+  void updateIndentString() { indentStr_ = std::string(size_t(indentLevel_) * indentWidth_, ' '); }
 
   std::string buffer_;
   std::string indentStr_;

@@ -2283,7 +2283,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       index_buffer_info.guest_base = vgt_dma_base & ~(index_size_bytes - 1);
       index_buffer_info.endianness = vgt_dma_size.swap_mode;
       index_buffer_info.format = vgt_draw_initiator.index_size;
-      index_buffer_info.length = vgt_dma_size.num_words * index_size_bytes;
+      index_buffer_info.length = size_t(vgt_dma_size.num_words) * index_size_bytes;
       index_buffer_info.count = vgt_draw_initiator.num_indices;
     } break;
     case xenos::SourceSelect::kImmediate: {

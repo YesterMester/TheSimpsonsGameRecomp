@@ -1918,7 +1918,8 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
       if (protect_system_page_first != UINT32_MAX) {
         uint64_t protect_start_tick = rex::chrono::Clock::QueryHostTickCount();
         rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
-                             (i - protect_system_page_first) * system_page_size_, protect_access);
+                             size_t(i - protect_system_page_first) * system_page_size_,
+                             protect_access);
         g_watch_protect_calls.fetch_add(1, std::memory_order_relaxed);
         CountWatchProtect(physical_address, i - protect_system_page_first, heap_base_);
         g_watch_protect_ticks.fetch_add(
@@ -1930,9 +1931,10 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
   }
   if (protect_system_page_first != UINT32_MAX) {
     uint64_t protect_start_tick = rex::chrono::Clock::QueryHostTickCount();
-    rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
-                         (system_page_last + 1 - protect_system_page_first) * system_page_size_,
-                         protect_access);
+    rex::memory::Protect(
+        protect_base + protect_system_page_first * system_page_size_,
+        size_t(system_page_last + 1 - protect_system_page_first) * system_page_size_,
+        protect_access);
     g_watch_protect_calls.fetch_add(1, std::memory_order_relaxed);
     CountWatchProtect(physical_address, system_page_last + 1 - protect_system_page_first,
                       heap_base_);
@@ -2070,16 +2072,17 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
       } else {
         if (unprotect_system_page_first != UINT32_MAX) {
           rex::memory::Protect(protect_base + unprotect_system_page_first * system_page_size_,
-                               (i - unprotect_system_page_first) * system_page_size_,
+                               size_t(i - unprotect_system_page_first) * system_page_size_,
                                rex::memory::PageAccess::kReadWrite);
           unprotect_system_page_first = UINT32_MAX;
         }
       }
     }
     if (unprotect_system_page_first != UINT32_MAX) {
-      rex::memory::Protect(protect_base + unprotect_system_page_first * system_page_size_,
-                           (system_page_last + 1 - unprotect_system_page_first) * system_page_size_,
-                           rex::memory::PageAccess::kReadWrite);
+      rex::memory::Protect(
+          protect_base + unprotect_system_page_first * system_page_size_,
+          size_t(system_page_last + 1 - unprotect_system_page_first) * system_page_size_,
+          rex::memory::PageAccess::kReadWrite);
     }
   }
 

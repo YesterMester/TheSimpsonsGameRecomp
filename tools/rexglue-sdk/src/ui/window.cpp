@@ -430,16 +430,20 @@ void Window::SetPresenter(Presenter* presenter) {
   }
 }
 
+void Window::DetachSurfaceFromPresenter() {
+  if (presenter_ && presenter_surface_) {
+    presenter_->SetWindowSurfaceFromUIThread(this, nullptr);
+    presenter_surface_.reset();
+  }
+}
+
 void Window::OnSurfaceChanged(bool new_surface_potentially_exists) {
   if (!presenter_) {
     return;
   }
 
   // Detach the presenter from the old surface before attaching to the new one.
-  if (presenter_surface_) {
-    presenter_->SetWindowSurfaceFromUIThread(this, nullptr);
-    presenter_surface_.reset();
-  }
+  DetachSurfaceFromPresenter();
 
   if (!new_surface_potentially_exists) {
     return;

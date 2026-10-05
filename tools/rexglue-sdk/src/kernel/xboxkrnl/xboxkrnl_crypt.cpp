@@ -29,10 +29,6 @@
 #endif
 
 #include "crypto/TinySHA1.hpp"
-#include "crypto/des/des.cpp"
-#include "crypto/des/des.h"
-#include "crypto/des/des3.h"
-#include "crypto/des/descbc.h"
 #include "crypto/sha256.cpp"
 #include "crypto/sha256.h"
 
@@ -330,64 +326,6 @@ void XeCryptRandom_entry(mapped_void buf, u32 buf_size) {
   std::memset(buf, 0xFD, buf_size);
 }
 
-struct XECRYPT_DES_STATE {
-  uint32_t keytab[16][2];
-};
-
-// Sets bit 0 to make the parity odd
-void XeCryptDesParity_entry(mapped_void inp, u32 inp_size, mapped_void out_ptr) {
-  DES::set_parity(inp, inp_size, out_ptr);
-}
-
-struct XECRYPT_DES3_STATE {
-  XECRYPT_DES_STATE des_state[3];
-};
-
-void XeCryptDes3Key_entry(ppc_ptr_t<XECRYPT_DES3_STATE> state_ptr, mapped_u64 key) {
-  DES3 des3(key[0], key[1], key[2]);
-  DES* des = des3.getDES();
-
-  // Store our DES state into the state.
-  for (int i = 0; i < 3; i++) {
-    std::memcpy(state_ptr->des_state[i].keytab, des[i].get_sub_key(), 128);
-  }
-}
-
-void XeCryptDes3Ecb_entry(ppc_ptr_t<XECRYPT_DES3_STATE> state_ptr, mapped_u64 inp, mapped_u64 out,
-                          u32 encrypt) {
-  DES3 des3((ui64*)state_ptr->des_state[0].keytab, (ui64*)state_ptr->des_state[1].keytab,
-            (ui64*)state_ptr->des_state[2].keytab);
-
-  if (encrypt) {
-    *out = des3.encrypt(*inp);
-  } else {
-    *out = des3.decrypt(*inp);
-  }
-}
-
-void XeCryptDes3Cbc_entry(ppc_ptr_t<XECRYPT_DES3_STATE> state_ptr, mapped_u64 inp, u32 inp_size,
-                          mapped_u64 out, mapped_u64 feed, u32 encrypt) {
-  DES3 des3((ui64*)state_ptr->des_state[0].keytab, (ui64*)state_ptr->des_state[1].keytab,
-            (ui64*)state_ptr->des_state[2].keytab);
-
-  // DES can only do 8-byte chunks at a time!
-  assert_true(inp_size % 8 == 0);
-
-  uint64_t last_block = *feed;
-  for (uint32_t i = 0; i < inp_size / 8; i++) {
-    uint64_t block = inp[i];
-    if (encrypt) {
-      last_block = des3.encrypt(block ^ last_block);
-      out[i] = last_block;
-    } else {
-      out[i] = des3.decrypt(block) ^ last_block;
-      last_block = block;
-    }
-  }
-
-  *feed = last_block;
-}
-
 struct XECRYPT_AES_STATE {
   uint8_t keytabenc[11][4][4];  // 0x0
   uint8_t keytabdec[11][4][4];  // 0xB0
@@ -674,6 +612,10 @@ REX_EXPORT_STUB(__imp__XeCryptChainAndSumMac);
 REX_EXPORT_STUB(__imp__XeCryptDesKey);
 REX_EXPORT_STUB(__imp__XeCryptDesEcb);
 REX_EXPORT_STUB(__imp__XeCryptDesCbc);
+REX_EXPORT_STUB(__imp__XeCryptDesParity);
+REX_EXPORT_STUB(__imp__XeCryptDes3Key);
+REX_EXPORT_STUB(__imp__XeCryptDes3Ecb);
+REX_EXPORT_STUB(__imp__XeCryptDes3Cbc);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Init);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Update);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Final);
@@ -793,10 +735,6 @@ REX_EXPORT(__imp__XeCryptBnQw_SwapDwQwLeBe, rex::kernel::xboxkrnl::XeCryptBnQw_S
 REX_EXPORT(__imp__XeCryptBnQwNeRsaPubCrypt, rex::kernel::xboxkrnl::XeCryptBnQwNeRsaPubCrypt_entry)
 REX_EXPORT(__imp__XeCryptBnDwLePkcs1Verify, rex::kernel::xboxkrnl::XeCryptBnDwLePkcs1Verify_entry)
 REX_EXPORT(__imp__XeCryptRandom, rex::kernel::xboxkrnl::XeCryptRandom_entry)
-REX_EXPORT(__imp__XeCryptDesParity, rex::kernel::xboxkrnl::XeCryptDesParity_entry)
-REX_EXPORT(__imp__XeCryptDes3Key, rex::kernel::xboxkrnl::XeCryptDes3Key_entry)
-REX_EXPORT(__imp__XeCryptDes3Ecb, rex::kernel::xboxkrnl::XeCryptDes3Ecb_entry)
-REX_EXPORT(__imp__XeCryptDes3Cbc, rex::kernel::xboxkrnl::XeCryptDes3Cbc_entry)
 REX_EXPORT(__imp__XeCryptAesKey, rex::kernel::xboxkrnl::XeCryptAesKey_entry)
 REX_EXPORT(__imp__XeCryptAesEcb, rex::kernel::xboxkrnl::XeCryptAesEcb_entry)
 REX_EXPORT(__imp__XeCryptAesCbc, rex::kernel::xboxkrnl::XeCryptAesCbc_entry)

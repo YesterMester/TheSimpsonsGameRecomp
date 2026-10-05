@@ -609,16 +609,23 @@ def browse_roots():
 
 
 def browse(path_str):
-    entries = []
     roots = browse_roots()
     if not path_str:
-        for r in roots:
-            if r.is_dir():
-                entries.append({"name": str(r), "path": str(r), "dir": True})
+        entries = [{"name": str(r), "path": str(r), "dir": True} for r in roots if r.is_dir()]
         return {"path": "", "up": None, "entries": entries}
-    p = Path(path_str).resolve()
-    if not any(str(p).startswith(str(r)) for r in roots):
-        p = Path.home()
+    # Only folders inside one of the starting locations can be listed. realpath
+    # resolves ".." and symlinks before the check, and the trailing separator
+    # on both sides keeps /home/deck from also matching /home/deck2.
+    prefixes = tuple(os.path.join(os.path.realpath(r), "") for r in roots)
+    folder = os.path.join(os.path.realpath(path_str), "")
+    if folder.startswith(prefixes):
+        return _browse_folder(folder, prefixes)
+    return _browse_folder(os.path.join(os.path.realpath(Path.home()), ""), prefixes)
+
+
+def _browse_folder(folder, prefixes):
+    p = Path(folder)
+    entries = []
     try:
         for child in sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower())):
             if child.name.startswith("."):
@@ -628,10 +635,12 @@ def browse(path_str):
             elif child.suffix.lower() in (".iso", ".xiso", ".360", ".img"):
                 entries.append({"name": child.name, "path": str(child), "dir": False,
                                 "size_mb": child.stat().st_size // (1 << 20)})
-    except PermissionError:
+    except OSError:
         pass
-    up = str(p.parent) if p != p.parent else None
-    return {"path": str(p), "up": up, "entries": entries[:400]}
+    # ".." goes back to the starting locations once it would leave them.
+    parent = p.parent
+    inside = parent != p and os.path.join(str(parent), "").startswith(prefixes)
+    return {"path": str(p), "up": str(parent) if inside else "", "entries": entries[:400]}
 
 
 # -------------------------------------------------------------------- art
@@ -921,8 +930,10 @@ def backup_saves():
 
 
 def restore_saves(name):
-    src = (BACKUPS_DIR / os.path.basename(name)).resolve()
-    if not src.is_file() or src.parent != BACKUPS_DIR.resolve():
+    # Only a backup from the list the launcher shows can be restored: the name
+    # must match one of those files exactly, so it can't lead anywhere else.
+    src = next((p for p in BACKUPS_DIR.glob("saves-*.zip") if p.name == name), None)
+    if src is None or not src.is_file():
         return False, "backup not found"
     if game_running_pids():
         return False, "Stop the game before restoring saves"
@@ -1979,7 +1990,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _addressed_here(self):
+        # Other web pages can't read this server's answers, except one whose
+        # domain name has been pointed at 127.0.0.1 (DNS rebinding). Its
+        # requests still carry that domain in the Host header, so they're refused.
+        port = self.server.server_address[1]
+        return self.headers.get("Host", "").lower() in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+    def _token_ok(self):
+        return secrets.compare_digest(self.headers.get("X-Token", "").encode(), TOKEN.encode())
+
     def do_GET(self):
+        if not self._addressed_here():
+            return self._send(403, {"error": "forbidden"})
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path in ("/", "/index.html"):
@@ -1988,6 +2011,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, html.encode(), "text/html; charset=utf-8")
         if path == "/api/ping":
             return self._send(200, {"app": "simpsons-launcher", "version": VERSION})
+        # The rest of the API answers only the launcher's own page, which has
+        # the token. /api/browse lists folders on this computer.
+        if path.startswith("/api/") and not self._token_ok():
+            return self._send(403, {"error": "bad token"})
         if path == "/api/status":
             return self._send(200, status())
         if path == "/api/settings":
@@ -2001,22 +2028,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/browse":
             q = urllib.parse.parse_qs(parsed.query)
             return self._send(200, browse((q.get("path") or [""])[0]))
+        # Art and fonts are served by exact name from their folder's own
+        # listing, so a request can't name a file anywhere else.
         if path.startswith("/art/"):
-            f = (ART_DIR / os.path.basename(path)).resolve()
-            if f.is_file() and f.parent == ART_DIR.resolve():
-                return self._send(200, f.read_bytes(), "image/jpeg")
+            name = path[len("/art/"):]
+            for f in ART_DIR.glob("hero*.jpg"):
+                if f.name == name:
+                    return self._send(200, f.read_bytes(), "image/jpeg")
         if path == "/icon.png":
             f = LAUNCHER_DIR / "icon.png"
             if f.is_file():
                 return self._send(200, f.read_bytes(), "image/png")
         if path.startswith("/fonts/"):
-            f = (UI_DIR / "fonts" / os.path.basename(path)).resolve()
-            if f.is_file() and f.parent == (UI_DIR / "fonts").resolve() and f.suffix == ".ttf":
-                return self._send(200, f.read_bytes(), "font/ttf")
+            name = path[len("/fonts/"):]
+            for f in (UI_DIR / "fonts").glob("*.ttf"):
+                if f.name == name:
+                    return self._send(200, f.read_bytes(), "font/ttf")
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.headers.get("X-Token") != TOKEN:
+        if not self._addressed_here() or not self._token_ok():
             return self._send(403, {"error": "bad token"})
         path = urllib.parse.urlparse(self.path).path
         length = int(self.headers.get("Content-Length") or 0)

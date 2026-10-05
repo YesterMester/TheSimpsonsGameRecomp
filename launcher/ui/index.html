@@ -799,7 +799,7 @@
 const TOKEN = "__TOKEN__";
 const $ = s => document.querySelector(s);
 const api = {
-  get: p => fetch(p).then(r => r.json()),
+  get: p => fetch(p, {headers:{"X-Token":TOKEN}}).then(r => r.json()),
   post: (p, body) => fetch(p, {method:"POST", headers:{"X-Token":TOKEN,"Content-Type":"application/json"},
                               body: JSON.stringify(body||{})}).then(r => r.json()),
 };

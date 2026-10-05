@@ -11,6 +11,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Builds only read the repository.
+permissions:
+  contents: read
+
 env:
   LLVM_VERSION: "20.1.8"
 

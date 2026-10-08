@@ -2510,11 +2510,6 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   SCOPE_profile_cpu_f("gpu");
   rex::perf::ScopedCounterTimer swap_timer(rex::perf::CounterId::kCpSwapUs);
 
-  // The swap may read the texture of a held back resolve.
-  if (render_target_cache_) {
-    render_target_cache_->FlushPendingCopyFreeResolve();
-  }
-
   {
     // Rate-limited so the log sink's synchronous flush can't distort the very
     // frame times being measured.
@@ -2613,6 +2608,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
+  }
+
+  // The swap may read the texture of a held back resolve. Its copy is recorded
+  // only now that a submission is open: opening one resets the command buffer.
+  if (render_target_cache_) {
+    render_target_cache_->FlushPendingCopyFreeResolve();
   }
 
   if (shared_memory_) {

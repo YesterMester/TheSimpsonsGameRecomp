@@ -9758,6 +9758,12 @@ void VulkanRenderTargetCache::ProcessPendingCopyFreeResolve(
   if (!pending_copy_free_resolve_.active) {
     return;
   }
+  if (!command_processor_.submission_open()) {
+    // Commands recorded now would be dropped when the next submission opens
+    // and resets the command buffer. Whatever uses the texture next opens one
+    // and flushes this first.
+    return;
+  }
   pending_copy_free_resolve_.active = false;
   const NativeResolvePlan& plan = pending_copy_free_resolve_.plan;
   VulkanTextureCache& texture_cache = *pending_copy_free_resolve_.texture_cache;
@@ -9864,6 +9870,10 @@ bool VulkanRenderTargetCache::TryCopyFreeResolveExchange(
   retired.image = old_image;
   RetireFramebuffersOfRenderTarget(key);
   ++copy_free_resolve_count_;
+  if (copy_free_resolve_count_ <= 8 || !(copy_free_resolve_count_ & 4095)) {
+    REXGPU_INFO("[native-resolve-copy-free] {} resolves done by taking over render target images",
+                copy_free_resolve_count_);
+  }
   if (REXCVAR_GET(native_resolve_copy_free_debug_writeback)) {
     for (const PendingScaledResolveMemory& pending : pending_scaled_resolve_memory_) {
       if (pending.texture == texture) {

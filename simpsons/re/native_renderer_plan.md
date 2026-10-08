@@ -88,11 +88,16 @@ instead of building a separate renderer next to it. Stages, in order:
    overwrites the whole target, the texture takes over the target's image (and the target the
    texture's old one) instead of copying it. Every color resolve here swaps red and blue, so
    such a texture's views swap them back and its memory write-back too. The three resolves of
-   the post-processing chain are copy-free when enabled (about 0.65 ms at 2x); the front buffer
-   resolve, read by the swap, is still copied. It stays off by default: live 2x runs alternate
-   old and new frames in menus and gameplay. Turning off only `native_resolve_copy_free` fixes
-   it, with the rest of the native path enabled. Rebuilding texture bindings after an image
-   exchange does not fix it. Static frame replays alone do not catch this regression.
+   the post-processing chain are copy-free when enabled (about 0.57 ms at 2x); the front buffer
+   resolve, read by the swap, is still copied. Live 2x runs used to alternate old and new frames
+   with it on: the swap recorded the held back front buffer copy before opening its submission,
+   and opening one resets the command buffer, so whenever the frame's last submission had
+   already ended the copy was dropped and the swap showed the front buffer from two frames
+   before. Held back copies are now recorded only in an open submission. Live 2x recordings of
+   the title, Springfield and the pause menu have no frame reversals with it on (438, 32 and
+   388 before the fix), and replays of four captured scenes are bit-identical with and without
+   it. It is still off by default. Static frame replays alone do not catch this kind of
+   regression; check live recordings (frame order) too.
 4. **Geometry without emulation tricks** - in progress. Rectangle lists, quad lists and point
    sprites without geometry shaders are exact (`vulkan_geometry_shader_primitives = false`, used
    automatically on GPUs without them, such as Mali); quads are split like the geometry

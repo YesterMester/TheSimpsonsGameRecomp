@@ -28,6 +28,11 @@ option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter regi
 # alias mechanism (used by simpsons/generated/default's DEFINE_REX_FUNC)
 # survives ThinLTO correctly in an isolated repro before adding this.
 option(REXGLUE_ENABLE_LTO "Enable ThinLTO (needs lld)" OFF)
+# The default (small) x86-64 code model covers 2 GB of code and data, far more
+# than recompiled executables need (The Simpsons Game is under 60 MB). The
+# large model turns every call into an indirect call through a 64-bit GOT
+# offset, which recompiled code pays on every guest call.
+option(REXGLUE_LARGE_CODE_MODEL "Compile x86-64 code with -mcmodel=large" OFF)
 # Propagate profiling defines globally (compiled out in Release)
 if(REXGLUE_ENABLE_TRACY)
     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
@@ -104,8 +109,9 @@ set(CMAKE_RELWITHDEBINFO_POSTFIX rd)
 if(NOT WIN32)
     # Use appropriate code model based on architecture
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
-        # Large code model on x86_64 for linking with very large recompiled executables (35MB+)
-        add_compile_options(-mcmodel=large)
+        if(REXGLUE_LARGE_CODE_MODEL)
+            add_compile_options(-mcmodel=large)
+        endif()
         # Baseline SIMD level for the whole SDK: rexcore's byte-swap helpers use
         # _mm_shuffle_epi8 (SSSE3) unconditionally, and rexglue_helpers.cmake
         # already assumes -msse4.1 for app/module targets -- make it global so

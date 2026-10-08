@@ -19,10 +19,14 @@ function(rexglue_apply_target_settings target_name)
         pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
         target_include_directories(${target_name} PRIVATE ${GTK3_INCLUDE_DIRS})
         target_link_libraries(${target_name} PRIVATE ${GTK3_LIBRARIES})
-        # Large executable support
+        # Opt-in large code model (REXGLUE_LARGE_CODE_MODEL in the SDK's
+        # CMakeLists.txt); the default small model fits far larger executables
+        # than recompiled games produce.
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-            target_link_options(${target_name} PRIVATE -Wl,--no-relax)
-            target_compile_options(${target_name} PRIVATE -mcmodel=large)
+            if(REXGLUE_LARGE_CODE_MODEL)
+                target_link_options(${target_name} PRIVATE -Wl,--no-relax)
+                target_compile_options(${target_name} PRIVATE -mcmodel=large)
+            endif()
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
             target_compile_options(${target_name} PRIVATE -march=armv8-a)
         endif()

@@ -21,6 +21,14 @@ launcher installs the game from your own ISO.
 
 - Game time runs at the right speed. Every read of the game's clock rounded a little time away and took a lock, and the game reads it constantly, so its time ran about 0.5% slow, with frames and vblanks at 59.65 Hz instead of 59.94. The clock is now computed from a fixed base without rounding or locking. Windows and Linux keep the full integer result when scaling that clock.
 - A frame that finishes just after its vblank is shown right away instead of a whole frame later. The game held every late frame for the next vblank, because showing it immediately would tear on the console; the PC presents without tearing either way, so this removes a source of stutter.
+- `tick_count_precise` reads the native millisecond clock directly, so late background timer updates cannot distort the game's frame time. Steady Havok stepping uses that clock's frame time instead of its smoothed copy, avoiding extra 8.3 ms physics steps at 60 FPS. Both are enabled by default; `physics_step` also offers Legacy and Original for comparison.
+- Windows requests a high-resolution timer again after audio initialization and opts out of Windows 11 timer throttling. This addresses the fork's reported game-speed drift at 30 FPS. These changes preserve the game's timebase and do not unlock rendering above 60 FPS.
+
+### Camera and visual settings
+
+- Free camera and photo mode: press L3 + R3 or F6 to toggle the camera, then Y or F8 for photo mode. Move with the left stick or WASD, look with the right stick or arrow keys, move vertically with the triggers or Q/E and zoom with LB/RB or 1/3. Photo mode pauses the level and hides the HUD and subtitles. Leaving a level releases the camera and its input lock.
+- Ink outlines can be Hard (original), Soft or Off, with soft-line strength, colour presets and a custom `RRGGBB` colour. Characters' eyes can be Clean (the default) or Original. These settings require a restart. Clean eyes and coloured outlines change shader microcode and can cause a first-use shader compilation pause; black outlines retain the existing shader variants.
+- Image patches verify the expected game data before writing. An unsupported executable is left untouched, and a failed protection change cannot leave a partial patch.
 
 ### Direct3D 11 renderer (experimental, Windows)
 
@@ -31,6 +39,7 @@ launcher installs the game from your own ISO.
 - Before this release, the work per frame was cut by uploading only the vertex data each draw reads, keeping state between draws instead of resetting it, updating constants in place, copying register blocks in bulk, writing depth and stencil in one pass and using the same depth settings as the other renderers.
 - Scaled resolve views are retained with their GPU allocation instead of being created again for each read or write. The cache is bounded; growing an allocation creates fresh views while earlier draws keep their original data.
 - Draws that discard rasterization keep their vertex work running and leave pixels untouched. Their stream-output setup now uses an explicit declaration, with vertex execution and unchanged render targets checked together.
+- Multisample helpers declare the native sample count and initialize unused load coordinates. Volume uploads bind the whole mip before applying a slice offset, keeping writes inside their intended slices on Windows and Proton.
 
 ### Audio
 
@@ -42,7 +51,8 @@ launcher installs the game from your own ISO.
 - Cancelled or already completed decode work is checked again after taking its context lock, preventing an older worker from claiming the same voice later.
 - The audio worker, decoder and game's DAC mixer request native audio scheduling. On Linux, the desktop priority service can grant it without running the game as root. Non-audio RenderWare workers retain their usual scheduling.
 - Mixer status queries read their own context word instead of copying the whole audio context.
-- In the tested 2x Springfield scene with four competing CPU workers, the 16-frame queue went from 119 underruns and 16 silent mixer blocks to zero of both. The 8-frame queue also passes this load check. Normal play and pause/resume also pass. The minimum 4-frame queue can still underrun under this load. The Windows build was checked through Proton, as above, but not yet on Windows itself.
+- In the tested 2x Springfield scene with four competing CPU workers, the 16-frame queue went from 119 underruns and 16 silent mixer blocks to zero of both. Normal play and pause/resume also pass. The minimum 4-frame queue can still underrun under this load. The Windows build was checked through Proton, as above, but not yet on Windows itself.
+- Optional audio diagnostics now report callback rate, time spent in the callback, wait lateness and queue depth. `audio_dump_file` records submitted six-channel PCM frames and companion monotonic timestamps for debugging; it is off by default. Physics step and hazard-damage logging is also available with `physics_log`.
 
 ### Windows
 
@@ -53,6 +63,14 @@ launcher installs the game from your own ISO.
 - The graphics backend setting has a *Direct3D 11 (experimental)* choice on Windows.
 - New Linux runtime defaults also reach existing installs when the launcher writes their settings. Saved overrides, display settings and audio queue size are preserved.
 - Includes the launcher and runtime security fixes from 0.0.6.3.
+- The Patches tab can choose the starting episode for a new game from all 18 episodes. Existing saves keep their progress. The original gameflow script is backed up and restored byte for byte; external edits and ambiguous scripts are preserved instead of overwritten. Episode-specific progress requirements still need campaign testing.
+- Intro skipping supports the installed language folders and mixed-case movie names. Conflicting active and disabled copies are detected before renaming files.
+- Patch controls keep their selection while the launcher refreshes. Invalid custom outline colours keep the last valid saved colour. Free camera and photo mode keys can be rebound.
+- Failed game starts return the operating system's error to the Play tab and close their diagnostic output, instead of breaking the request with “Failed to fetch”. Save monitoring starts only after the game process starts.
+
+### Contributors
+
+- Thanks to [Frank Kitzing (frankyfife)](https://github.com/frankyfife) for the camera and photo mode, outline and eye controls, episode selection, multilingual intro skipping, Windows timing and guest-address fixes, Havok stepping and audio/physics diagnostics in [#43](https://github.com/YesterMester/TheSimpsonsGameRecomp/pull/43). His work is credited in the README and commit history.
 
 ### Known issues
 
@@ -62,7 +80,7 @@ launcher installs the game from your own ISO.
 - Under synthetic CPU saturation, the Windows build through Proton can still produce occasional silent mixer blocks despite having no output queue underruns. Native Windows audio needs further load testing.
 - Menus and the title screen run at 30 FPS, as the game's menus were made for. Rendering them at higher frame rates is planned.
 - Frame rate settings above 60 do not add frames, because the game's frame scheduler tops out at 60 FPS, and they make frame pacing less even. 60 is recommended. Proper 120 FPS and unlimited rendering remain future work.
-- At 60 FPS some scripted sequences can misbehave. If random deaths happen at the dam in "Lisa the Tree Hugger", switch to 30 for that section.
+- At 60 FPS some scripted sequences can misbehave. Frank reported completing the affected "Lisa the Tree Hugger" section with the timing fixes, but the whole campaign still needs testing. If random deaths happen, switch to 30 for that section.
 - In-game prompts still show controller buttons. Press F1 to see which key each one is on.
 - Keyboard and mouse has been tested much less on Windows than on Linux and the Steam Deck. The new native resource defaults are qualified on Linux/Vulkan; Windows validation remains separate.
 

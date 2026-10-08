@@ -333,6 +333,9 @@ open one, include:
 - The log. The launcher's **Play** tab shows the game's console output, and its diagnostics
   section can create a support bundle with the logs and settings.
 
+If the game cannot start, the Play tab reports the operating system's error. Include that
+message with your report as well.
+
 ## Project layout
 
 ```

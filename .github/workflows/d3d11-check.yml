@@ -11,6 +11,8 @@ on:
       - 'tools/bench/d3d11/**'
       - 'tools/bench/jump_context_check.cpp'
       - 'tools/bench/bytes_equal_check.cpp'
+      - 'tools/bench/clock_ratio_check.cpp'
+      - 'tools/rexglue-sdk/include/rex/chrono/clock_ratio.h'
       - 'tools/rexglue-sdk/include/rex/graphics/util/bytes_equal.h'
       - 'simpsons/generated/default/simpsons_init.h'
       - 'simpsons/src/guest_jump.h'
@@ -48,11 +50,13 @@ jobs:
       - name: Build native device and resource checks
         run: |
           cmake -S tools/bench/d3d11 -B tools/bench/d3d11/out -A x64
-          cmake --build tools/bench/d3d11/out --config Release
+          cmake --build tools/bench/d3d11/out --config Release --parallel 4
       - name: Check Windows software device
         run: tools/bench/d3d11/out/Release/d3d11_check.exe --warp --output d3d11-warp.json
       - name: Check native Windows jump context alignment and round trips
         run: tools/bench/d3d11/out/Release/jump_context_check.exe --output jump-context-windows.json
+      - name: Compare native clock ratios with independent integer division
+        run: tools/bench/d3d11/out/Release/clock_ratio_check.exe --output clock-ratios-windows.json
       - name: Check native buffer byte comparisons and protected boundaries
         run: tools/bench/d3d11/out/Release/bytes_equal_check.exe --output bytes-equal-windows.json
       - name: Check AVX2 native buffer byte comparisons and protected boundaries
@@ -92,6 +96,7 @@ jobs:
           path: |
             d3d11-warp.json
             jump-context-windows.json
+            clock-ratios-windows.json
             bytes-equal-windows.json
             bytes-equal-avx2-windows.json
             d3d11-shaders-warp.json

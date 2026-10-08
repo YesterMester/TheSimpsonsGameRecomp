@@ -444,12 +444,21 @@ ID3D11GeometryShader* DrawContext::DiscardShader(const ShaderProgram& source, st
   // there is no guest geometry shader. Disabling the rasterized stream keeps
   // vertex work and memexport running without sending invalid positions to
   // the scan converter.
-  // https://learn.microsoft.com/windows/win32/api/d3d11/nf-d3d11-id3d11device-creategeometryshaderwithstreamoutput
+  // A gap supplies a stream declaration without capturing any shader output.
+  // The Microsoft runtime needs that declaration for a passthrough shader;
+  // no stream-output buffers are bound, and rasterization stays disabled.
+  const D3D11_SO_DECLARATION_ENTRY discard_entry = {0, nullptr, 0, 0, 1, 0};
+  const UINT discard_stride = sizeof(uint32_t);
   HRESULT created = device_.device()->CreateGeometryShaderWithStreamOutput(
-      bytes.data(), bytes.size(), nullptr, 0, nullptr, 0, D3D11_SO_NO_RASTERIZED_STREAM, nullptr,
-      result.shader.GetAddressOf());
-  if (FAILED(created))
-    result.error = "Unable to create the native rasterization-discard shader";
+      bytes.data(), bytes.size(), &discard_entry, 1, &discard_stride, 1,
+      D3D11_SO_NO_RASTERIZED_STREAM, nullptr, result.shader.GetAddressOf());
+  if (FAILED(created)) {
+    char message[128];
+    std::snprintf(message, sizeof(message),
+                  "Unable to create the native rasterization-discard shader (0x%08X)",
+                  unsigned(created));
+    result.error = message;
+  }
   if (discard_shaders_.size() == 64)
     discard_shaders_.erase(discard_shaders_.begin());
   discard_shaders_.push_back(std::move(result));

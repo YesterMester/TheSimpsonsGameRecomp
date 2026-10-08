@@ -748,7 +748,12 @@ float4 main(uint id : SV_VertexID) : SV_Position {
  return float4(p,0.5,1);
 })",
                          "vs_5_1");
-  CheckAlternatingFrames(owner, shaders, buffers, context, results, vertex);
+  try {
+    CheckAlternatingFrames(owner, shaders, buffers, context, results, vertex);
+  } catch (...) {
+    CheckDebugMessages(owner);
+    throw;
+  }
   CheckSubresources(owner, shaders, context, results, vertex);
   CheckFixedFunction(owner, shaders, buffers, context, results);
   CheckFloat24Prepasses(owner, shaders, buffers, context, results);

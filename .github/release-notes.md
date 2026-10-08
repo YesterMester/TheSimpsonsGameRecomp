@@ -19,7 +19,7 @@ launcher installs the game from your own ISO.
 
 ### Frame timing
 
-- Game time runs at the right speed. Every read of the game's clock rounded a little time away and took a lock, and the game reads it constantly, so its time ran about 0.5% slow, with frames and vblanks at 59.65 Hz instead of 59.94. The clock is now computed from a fixed base without rounding or locking.
+- Game time runs at the right speed. Every read of the game's clock rounded a little time away and took a lock, and the game reads it constantly, so its time ran about 0.5% slow, with frames and vblanks at 59.65 Hz instead of 59.94. The clock is now computed from a fixed base without rounding or locking. Windows and Linux keep the full integer result when scaling that clock.
 - A frame that finishes just after its vblank is shown right away instead of a whole frame later. The game held every late frame for the next vblank, because showing it immediately would tear on the console; the PC presents without tearing either way, so this removes a source of stutter.
 
 ### Direct3D 11 renderer (experimental, Windows)
@@ -30,6 +30,7 @@ launcher installs the game from your own ISO.
 - Performance in the tested Springfield scene on the Deck: about 55 FPS at 1x and 22 FPS at 2x, where 2x started at 13 FPS. At 2x it is limited by the GPU, because resolves still go through the Xbox memory layout; Vulkan resolves directly into textures. The title screen holds its 30 FPS.
 - Before this release, the work per frame was cut by uploading only the vertex data each draw reads, keeping state between draws instead of resetting it, updating constants in place, copying register blocks in bulk, writing depth and stencil in one pass and using the same depth settings as the other renderers.
 - Scaled resolve views are retained with their GPU allocation instead of being created again for each read or write. The cache is bounded; growing an allocation creates fresh views while earlier draws keep their original data.
+- Draws that discard rasterization keep their vertex work running and leave pixels untouched. Their stream-output setup now uses an explicit declaration, with vertex execution and unchanged render targets checked together.
 
 ### Audio
 

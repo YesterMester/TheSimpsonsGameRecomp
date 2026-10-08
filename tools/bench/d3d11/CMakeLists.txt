@@ -26,6 +26,10 @@ endif()
 add_executable(jump_context_check ../jump_context_check.cpp)
 target_compile_features(jump_context_check PRIVATE cxx_std_23)
 
+add_executable(clock_ratio_check ../clock_ratio_check.cpp)
+target_compile_features(clock_ratio_check PRIVATE cxx_std_23)
+target_include_directories(clock_ratio_check PRIVATE ${REXGLUE_ROOT}/include)
+
 add_executable(d3d11_resolve_check
     ../d3d11_resolve_check.cpp
     ${REXGLUE_ROOT}/src/ui/d3d11/d3d11_device.cpp

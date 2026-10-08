@@ -14,6 +14,7 @@ python tools/bench/export_d3d11_helpers.py --output tools/bench/d3d11/out/helper
 tools/bench/d3d11/out/Release/dxbc_geometry.exe tools/bench/d3d11/out/geometry
 tools/bench/d3d11/out/Release/d3d11_check.exe --output d3d11-device.json
 tools/bench/d3d11/out/Release/jump_context_check.exe --output jump-context-windows.json
+tools/bench/d3d11/out/Release/clock_ratio_check.exe --output clock-ratios-windows.json
 tools/bench/d3d11/out/Release/bytes_equal_check.exe --output bytes-equal-windows.json
 tools/bench/d3d11/out/Release/bytes_equal_avx2_check.exe --output bytes-equal-avx2-windows.json
 tools/bench/d3d11/out/Release/d3d11_shader_check.exe --fl11-0 --geometry-directory tools/bench/d3d11/out/geometry --output d3d11-shaders.json
@@ -48,6 +49,10 @@ The jump context check exercises the game's native setjmp/longjmp storage over
 8,192 round trips on four threads, growing each thread's map and revisiting its
 earlier keys. Windows saves XMM registers into this storage with aligned stores;
 the buffer must remain 16-byte aligned inside its map node.
+
+The clock ratio check compares native integer scaling with an independent
+bit-at-a-time product and long division over 50,900 cases. It covers the
+Windows QPC and nanosecond clock ratios, wide products and counter wrap.
 
 The build also compiles the production shader preparation, guest texture cache,
 command processor, presenter and shared geometry/ownership-transfer generators.

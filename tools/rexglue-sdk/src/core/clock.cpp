@@ -15,6 +15,7 @@
 #include <mutex>
 
 #include <rex/chrono/clock.h>
+#include <rex/chrono/clock_ratio.h>
 #include <rex/cvar.h>
 #include <rex/math.h>
 
@@ -69,7 +70,7 @@ uint64_t GuestTickCountAt(uint64_t host_tick_count) {
     std::atomic_thread_fence(std::memory_order_acquire);
   } while ((sequence & 1) || sequence != guest_clock_sequence_.load(std::memory_order_relaxed));
   uint64_t host_tick_delta = host_tick_count > base_host ? host_tick_count - base_host : 0;
-  return base_guest + uint64_t((unsigned __int128)host_tick_delta * numerator / denominator);
+  return base_guest + ScaleTickDelta(host_tick_delta, numerator, denominator);
 }
 
 void RecomputeGuestTickScalar() {

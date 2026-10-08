@@ -16,6 +16,7 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 #include <spdlog/spdlog.h>
 
 #include <rex/assert.h>
+#include <rex/logging.h>
 #include <rex/chrono/chrono_steady_cast.h>
 
 #define LOG_LASTERROR() \
@@ -24,6 +25,50 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 typedef HANDLE (*SetThreadDescriptionFn)(HANDLE hThread, PCWSTR lpThreadDescription);
 
 namespace rex::thread {
+
+// Asks for the finest system timer resolution the kernel offers (usually
+// 0.5 ms). Without it, every short sleep and timed wait in the game, its
+// frame pacing and the threads feeding audio is rounded up to the default
+// 15.6 ms tick, which shows as choppy audio and uneven frames on Windows
+// (#36). Since Windows 10 2004 the resolution is per process, so other
+// programs raising it don't help. Xenia does the same at startup.
+void RequestHighResolutionTimer() {
+  // Windows 11 may ignore a process's timer resolution request to save power,
+  // for example while it counts as invisible. Opting out of that makes the
+  // request below hold for the whole session.
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+  PROCESS_POWER_THROTTLING_STATE throttling = {};
+  throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+  throttling.StateMask = 0;
+  SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling,
+                        sizeof(throttling));
+
+  using NtQueryTimerResolutionFn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
+  using NtSetTimerResolutionFn = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  if (!ntdll) {
+    return;
+  }
+  auto query = reinterpret_cast<NtQueryTimerResolutionFn>(
+      reinterpret_cast<void*>(GetProcAddress(ntdll, "NtQueryTimerResolution")));
+  auto set = reinterpret_cast<NtSetTimerResolutionFn>(
+      reinterpret_cast<void*>(GetProcAddress(ntdll, "NtSetTimerResolution")));
+  if (!query || !set) {
+    return;
+  }
+  // In 100 ns units; the "maximum" resolution is the finest one.
+  ULONG coarsest = 0, finest = 0, current = 0;
+  if (query(&coarsest, &finest, &current) < 0) {
+    return;
+  }
+  ULONG before = current;
+  if (set(finest, TRUE, &current) >= 0) {
+    REXLOG_INFO("Timer resolution: {:.2f} ms (was {:.2f} ms)", current / 10000.0, before / 10000.0);
+  }
+}
 
 void EnableAffinityConfiguration() {
   HANDLE process_handle = GetCurrentProcess();

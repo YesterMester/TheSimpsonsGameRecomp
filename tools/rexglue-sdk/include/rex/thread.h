@@ -35,6 +35,12 @@ namespace rex::thread {
 
 using namespace rex::literals;
 
+#if REX_PLATFORM_WIN32
+// SDL audio setup may withdraw the process timer request. This is also called
+// after changing SDL's timer hint, so short waits retain their resolution.
+void RequestHighResolutionTimer();
+#endif
+
 #if REX_PLATFORM_ANDROID
 void AndroidInitialize();
 void AndroidShutdown();

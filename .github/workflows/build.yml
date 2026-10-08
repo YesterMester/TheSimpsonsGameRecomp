@@ -24,6 +24,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Check launcher patches and saved settings
+        run: python3 tools/bench/launcher_patch_check.py
       - name: Install clang-20 + build deps
         run: |
           wget -q https://apt.llvm.org/llvm.sh
@@ -51,6 +53,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check launcher patches and saved settings
+        run: python tools/bench/launcher_patch_check.py
       - name: Install LLVM/Clang ${{ env.LLVM_VERSION }}
         shell: pwsh
         run: |

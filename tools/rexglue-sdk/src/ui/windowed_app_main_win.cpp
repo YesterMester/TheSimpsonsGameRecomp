@@ -18,6 +18,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/thread.h>
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_win.h>
 
@@ -43,37 +44,6 @@ std::vector<std::string> WideArgsToUtf8(int argc, wchar_t** wargv) {
   return args;
 }
 
-// Asks for the finest system timer resolution the kernel offers (usually
-// 0.5 ms). Without it, every short sleep and timed wait in the game, its
-// frame pacing and the threads feeding audio is rounded up to the default
-// 15.6 ms tick, which shows as choppy audio and uneven frames on Windows
-// (#36). Since Windows 10 2004 the resolution is per process, so other
-// programs raising it don't help. Xenia does the same at startup.
-void RequestHighResolutionTimer() {
-  using NtQueryTimerResolutionFn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
-  using NtSetTimerResolutionFn = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
-  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-  if (!ntdll) {
-    return;
-  }
-  auto query = reinterpret_cast<NtQueryTimerResolutionFn>(
-      reinterpret_cast<void*>(GetProcAddress(ntdll, "NtQueryTimerResolution")));
-  auto set = reinterpret_cast<NtSetTimerResolutionFn>(
-      reinterpret_cast<void*>(GetProcAddress(ntdll, "NtSetTimerResolution")));
-  if (!query || !set) {
-    return;
-  }
-  // In 100 ns units; the "maximum" resolution is the finest one.
-  ULONG coarsest = 0, finest = 0, current = 0;
-  if (query(&coarsest, &finest, &current) < 0) {
-    return;
-  }
-  ULONG before = current;
-  if (set(finest, TRUE, &current) >= 0) {
-    REXLOG_INFO("Timer resolution: {:.2f} ms (was {:.2f} ms)", current / 10000.0,
-                before / 10000.0);
-  }
-}
 
 }  // namespace
 
@@ -97,7 +67,7 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
   auto remaining = rex::cvar::Init(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
-  RequestHighResolutionTimer();
+  rex::thread::RequestHighResolutionTimer();
 
   int result;
 

@@ -41,6 +41,8 @@ REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
 
+REXCVAR_DECLARE(bool, audio_log_underruns);
+
 REXCVAR_DEFINE_BOOL(audio_callback_pacing, true, "Audio",
                     "Ask the game for audio frames at the hardware's steady rate instead of as "
                     "fast as queue space frees up (bursts make the game submit silent frames)");
@@ -154,6 +156,15 @@ void AudioSystem::WorkerThreadMain() {
   constexpr auto kCallbackInterval = std::chrono::microseconds(5333 * 39 / 40);
   std::chrono::steady_clock::time_point next_callback[kMaximumClientCount] = {};
 
+  // audio_log_underruns: callbacks per second, how long the game's callback
+  // runs and how late the paced wait wakes (a coarse timer shows here).
+  struct PacingDiag {
+    uint32_t callbacks = 0, waits = 0, unpaced = 0;
+    double callback_sum_us = 0, callback_max_us = 0, late_sum_us = 0, late_max_us = 0;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_callback = {};
+  } pacing_diag;
+
   // Main run loop.
   uint32_t diag_pump_count = 0;
   while (worker_running_) {
@@ -197,12 +208,21 @@ void AudioSystem::WorkerThreadMain() {
         if (REXCVAR_GET(audio_callback_pacing)) {
           auto now = std::chrono::steady_clock::now();
           if (now < next_callback[index]) {
-            // SDL uses a high-resolution timer on Windows, where a standard
-            // sleep rounds up to whole milliseconds or the system tick.
+            // SDL uses a high-resolution timer on Windows. Keep the existing
+            // schedule and measure the actual wake rather than the deadline.
             SDL_DelayNS(uint64_t(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(next_callback[index] - now)
                     .count()));
             now = std::chrono::steady_clock::now();
+            if (REXCVAR_GET(audio_log_underruns)) {
+              const double late =
+                  std::chrono::duration<double, std::micro>(now - next_callback[index]).count();
+              pacing_diag.late_sum_us += std::max(0.0, late);
+              pacing_diag.late_max_us = std::max(pacing_diag.late_max_us, late);
+              ++pacing_diag.waits;
+            }
+          } else if (REXCVAR_GET(audio_log_underruns)) {
+            ++pacing_diag.unpaced;
           }
           // Keep the schedule, so waking late cannot lower the average rate
           // below the hardware's, but never ask again within half a frame:
@@ -217,8 +237,39 @@ void AudioSystem::WorkerThreadMain() {
         }
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
         uint64_t args[] = {client_callback_arg};
+        const bool log_pacing = REXCVAR_GET(audio_log_underruns);
+        const auto callback_start =
+            log_pacing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));
+        if (log_pacing) {
+          auto end = std::chrono::steady_clock::now();
+          // Do not average a pause, loading gap or disabled diagnostic period
+          // into the callback rate reported for active playback.
+          if (pacing_diag.last_callback == std::chrono::steady_clock::time_point{} ||
+              callback_start - pacing_diag.last_callback > std::chrono::milliseconds(250)) {
+            pacing_diag = {};
+            pacing_diag.start = callback_start;
+          }
+          pacing_diag.last_callback = end;
+          double took = std::chrono::duration<double, std::micro>(end - callback_start).count();
+          pacing_diag.callback_sum_us += took;
+          pacing_diag.callback_max_us = std::max(pacing_diag.callback_max_us, took);
+          ++pacing_diag.callbacks;
+          double elapsed = std::chrono::duration<double>(end - pacing_diag.start).count();
+          if (elapsed >= 5.0) {
+            REXAPU_INFO(
+                "[audio-pacing] {:.1f} callbacks/s (hardware: 187.5), callback avg {:.0f} us "
+                "max {:.0f} us; paced wait woke late avg {:.0f} us max {:.0f} us over {} waits, "
+                "{} callbacks already late",
+                pacing_diag.callbacks / elapsed,
+                pacing_diag.callback_sum_us / pacing_diag.callbacks, pacing_diag.callback_max_us,
+                pacing_diag.waits ? pacing_diag.late_sum_us / pacing_diag.waits : 0.0,
+                pacing_diag.late_max_us, pacing_diag.waits, pacing_diag.unpaced);
+            pacing_diag = {};
+            pacing_diag.start = pacing_diag.last_callback = end;
+          }
+        }
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
         }

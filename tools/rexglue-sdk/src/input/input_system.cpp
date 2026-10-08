@@ -68,11 +68,16 @@ class InputInjector {
       lt = lt_;
       rt = rt_;
     }
-    if (buttons != last_buttons_ || lx != last_lx_ || ly != last_ly_) {
+    if (buttons != last_buttons_ || lx != last_lx_ || ly != last_ly_ || rx != last_rx_ ||
+        ry != last_ry_ || lt != last_lt_ || rt != last_rt_) {
       ++packet_;
       last_buttons_ = buttons;
       last_lx_ = lx;
       last_ly_ = ly;
+      last_rx_ = rx;
+      last_ry_ = ry;
+      last_lt_ = lt;
+      last_rt_ = rt;
     }
     state.packet_number = uint32_t(state.packet_number) + packet_;
     state.gamepad.buttons = uint16_t(state.gamepad.buttons) | buttons;
@@ -101,13 +106,14 @@ class InputInjector {
     int fields = std::fscanf(file, "%31s %lf", control, &hold);
     std::fclose(file);
     std::remove(path.c_str());
-    if (fields < 1) {
+    if (fields < 1 || !std::isfinite(hold) || hold < 0.0 || hold > 60.0) {
       return;
     }
     buttons_ = 0;
     lx_ = ly_ = rx_ = ry_ = 0;
     lt_ = rt_ = 0;
-    std::string name(control);
+    // One control, or several joined by '+' and held together (e.g. LS+RS).
+    std::string controls(control);
     static const std::pair<const char*, uint16_t> kButtons[] = {
         {"A", X_INPUT_GAMEPAD_A},
         {"B", X_INPUT_GAMEPAD_B},
@@ -124,28 +130,71 @@ class InputInjector {
         {"LEFT", X_INPUT_GAMEPAD_DPAD_LEFT},
         {"RIGHT", X_INPUT_GAMEPAD_DPAD_RIGHT},
     };
-    bool known = false;
-    for (const auto& [button_name, mask] : kButtons) {
-      if (name == button_name) {
-        buttons_ = mask;
+    constexpr int16_t kFull = 32767;
+    size_t start = 0;
+    while (start <= controls.size()) {
+      size_t end = controls.find('+', start);
+      if (end == std::string::npos) {
+        end = controls.size();
+      }
+      const std::string name = controls.substr(start, end - start);
+      start = end + 1;
+      bool known = false;
+      for (const auto& [button_name, mask] : kButtons) {
+        if (name == button_name) {
+          buttons_ |= mask;
+          known = true;
+        }
+      }
+      if (name == "LT") {
+        lt_ = 0xFF;
         known = true;
       }
+      if (name == "RT") {
+        rt_ = 0xFF;
+        known = true;
+      }
+      if (name == "L_UP") {
+        ly_ = kFull;
+        known = true;
+      }
+      if (name == "L_DOWN") {
+        ly_ = -kFull;
+        known = true;
+      }
+      if (name == "L_LEFT") {
+        lx_ = -kFull;
+        known = true;
+      }
+      if (name == "L_RIGHT") {
+        lx_ = kFull;
+        known = true;
+      }
+      if (name == "R_UP") {
+        ry_ = kFull;
+        known = true;
+      }
+      if (name == "R_DOWN") {
+        ry_ = -kFull;
+        known = true;
+      }
+      if (name == "R_LEFT") {
+        rx_ = -kFull;
+        known = true;
+      }
+      if (name == "R_RIGHT") {
+        rx_ = kFull;
+        known = true;
+      }
+      if (!known) {
+        REXLOG_WARN("input_inject_file: unknown control '{}'", name);
+        buttons_ = 0;
+        lx_ = ly_ = rx_ = ry_ = 0;
+        lt_ = rt_ = 0;
+        return;
+      }
     }
-    constexpr int16_t kFull = 32767;
-    if (name == "LT") { lt_ = 0xFF; known = true; }
-    if (name == "RT") { rt_ = 0xFF; known = true; }
-    if (name == "L_UP") { ly_ = kFull; known = true; }
-    if (name == "L_DOWN") { ly_ = -kFull; known = true; }
-    if (name == "L_LEFT") { lx_ = -kFull; known = true; }
-    if (name == "L_RIGHT") { lx_ = kFull; known = true; }
-    if (name == "R_UP") { ry_ = kFull; known = true; }
-    if (name == "R_DOWN") { ry_ = -kFull; known = true; }
-    if (name == "R_LEFT") { rx_ = -kFull; known = true; }
-    if (name == "R_RIGHT") { rx_ = kFull; known = true; }
-    if (!known) {
-      REXLOG_WARN("input_inject_file: unknown control '{}'", name);
-      return;
-    }
+    const std::string& name = controls;
     release_at_ = now + std::chrono::microseconds(int64_t(hold * 1e6));
     REXLOG_INFO("input_inject_file: {} for {:.2f}s", name, hold);
   }
@@ -157,7 +206,8 @@ class InputInjector {
   int16_t lx_ = 0, ly_ = 0, rx_ = 0, ry_ = 0;
   uint8_t lt_ = 0, rt_ = 0;
   uint16_t last_buttons_ = 0;
-  int16_t last_lx_ = 0, last_ly_ = 0;
+  int16_t last_lx_ = 0, last_ly_ = 0, last_rx_ = 0, last_ry_ = 0;
+  uint8_t last_lt_ = 0, last_rt_ = 0;
   uint32_t packet_ = 0;
 };
 

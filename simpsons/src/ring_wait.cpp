@@ -9,12 +9,15 @@
 // word waited on is a fence in the scratch register writeback area) or 1 ms
 // passes.
 
+#include "guest_memory.h"
+
 #include <cstdint>
 #include <cstring>
 
 #include <rex/cvar.h>
 #include <rex/graphics/ring_progress.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/ppc.h>
 
 REXCVAR_DEFINE_BOOL(ring_wait_sleep, true, "GPU",
@@ -34,11 +37,7 @@ namespace {
 constexpr uint32_t kDeviceReadPointerAddress = 10896;
 constexpr uint32_t kWaitTimeoutUs = 1000;
 
-uint32_t LoadBE32(const uint8_t* base, uint32_t address) {
-  uint32_t value;
-  std::memcpy(&value, base + address, sizeof(value));
-  return rex::byte_swap(value);
-}
+using simpsons::LoadGuestU32;
 
 bool SleepEnabled() {
   static const bool enabled = REXCVAR_GET(ring_wait_sleep);
@@ -55,11 +54,11 @@ REX_FUNC(sub_82452018) {
   static bool logged = false;
   if (!logged) {
     logged = true;
-    uint32_t device = LoadBE32(base, ctx.r3.u32);
+    uint32_t device = LoadGuestU32(base, ctx.r3.u32);
     REXLOG_INFO(
         "ring_wait_sleep: the game waits on the word at guest {:08X}; the command processor "
         "writes the read pointer back to physical {:08X}",
-        LoadBE32(base, device + kDeviceReadPointerAddress),
+        LoadGuestU32(base, device + kDeviceReadPointerAddress),
         rex::graphics::GetReadPointerWritebackAddress());
   }
   // Read before the check, so progress between the check and the wait still

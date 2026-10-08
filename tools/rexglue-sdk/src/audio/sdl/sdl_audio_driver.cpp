@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
@@ -24,7 +26,19 @@
 #include <rex/platform.h>
 #include <SDL3/SDL.h>
 
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+// Diagnostics: every frame the game submits, raw (256 samples x 6 channels,
+// big-endian float, channel after channel), and in <file>.ts the
+// monotonic nanosecond timestamp of each, for measuring gaps without listening.
+REXCVAR_DEFINE_STRING(
+    audio_dump_file, "", "Audio",
+    "Write every submitted audio frame (raw 6 x 256 big-endian floats) to this file, "
+    "and uint64 nanosecond timestamps to <file>.ts; empty = off")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(audio_log_underruns, false, "Audio",
                     "Log how many played frames were silence because no frame was queued, and how "
                     "many frames the game submitted were entirely silent (diagnostic)");
@@ -42,6 +56,15 @@ SDLAudioDriver::~SDLAudioDriver() {
 bool SDLAudioDriver::Initialize() {
   // Prevent SDL from interfering with timer resolution (causes FPS drops)
   SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "0", SDL_HINT_OVERRIDE);
+#if REX_PLATFORM_WIN32
+  // SDL applies the hint by ending the 1 ms period it began when it started,
+  // and timeEndPeriod withdraws the process's timer resolution request as a
+  // whole, the one the app made at startup included. From here on every sleep
+  // and plain waitable timer of the process ran at the default 15.6 ms: the
+  // game's 10 ms timers 64 times a second instead of 100, Sleep(1) 15.5 ms,
+  // 30 fps vblanks 31 or 47 ms apart. Ask for it again.
+  rex::thread::RequestHighResolutionTimer();
+#endif
 
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
@@ -127,6 +150,19 @@ bool SDLAudioDriver::Initialize() {
     return false;
   }
 
+  const std::string dump_path = REXCVAR_GET(audio_dump_file);
+  if (!dump_path.empty()) {
+    dump_ = std::fopen(dump_path.c_str(), "wb");
+    dump_timestamps_ = std::fopen((dump_path + ".ts").c_str(), "wb");
+    if (!dump_ || !dump_timestamps_) {
+      REXAPU_WARN("Could not open audio dump '{}'; dumping disabled", dump_path);
+      if (dump_)
+        std::fclose(dump_);
+      if (dump_timestamps_)
+        std::fclose(dump_timestamps_);
+      dump_ = dump_timestamps_ = nullptr;
+    }
+  }
   return true;
 }
 
@@ -145,6 +181,17 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
 
+  if (dump_ && dump_timestamps_) {
+    const uint64_t now = SDL_GetTicksNS();
+    if (std::fwrite(input_frame, sizeof(float), frame_samples_, dump_) != frame_samples_ ||
+        std::fwrite(&now, sizeof(now), 1, dump_timestamps_) != 1) {
+      REXAPU_WARN("Audio dump write failed; stopping the dump");
+      std::fclose(dump_);
+      std::fclose(dump_timestamps_);
+      dump_ = dump_timestamps_ = nullptr;
+    }
+  }
+
   bool log_underruns = REXCVAR_GET(audio_log_underruns);
   bool silent_frame = false;
   if (log_underruns) {
@@ -153,6 +200,8 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   }
 
   std::array<uint32_t, 5> diagnostic = {};
+  double queue_average = 0.0;
+  uint32_t queue_minimum = 0;
   bool report = false;
   size_t queued_count;
   {
@@ -162,11 +211,17 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(queued_count));
     if (log_underruns) {
       diag_silent_submitted_frames_ += uint32_t(silent_frame);
-      // About every 5 seconds. Snapshot under the lock, then log outside it
-      // so the realtime callback never waits for a file or terminal write.
+      diag_queue_sum_ += queued_count;
+      diag_queue_min_ = std::min<uint32_t>(diag_queue_min_, uint32_t(queued_count));
+      // Snapshot under the lock, then log outside it so the realtime
+      // callback never waits for a file or terminal write.
       if (++diag_submitted_frames_ >= 960) {
         diagnostic = {diag_played_frames_, diag_underrun_frames_, diag_submitted_frames_,
                       diag_silent_submitted_frames_, uint32_t(queued_count)};
+        queue_average = double(diag_queue_sum_) / diag_submitted_frames_;
+        queue_minimum = diag_queue_min_;
+        diag_queue_sum_ = 0;
+        diag_queue_min_ = UINT32_MAX;
         diag_played_frames_ = 0;
         diag_underrun_frames_ = 0;
         diag_submitted_frames_ = 0;
@@ -184,12 +239,18 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   if (report) {
     REXAPU_INFO(
         "[audio-diag] played {} frames: {} silence (nothing queued); submitted {}: {} all "
-        "zero; queued now {}",
-        diagnostic[0], diagnostic[1], diagnostic[2], diagnostic[3], diagnostic[4]);
+        "zero; queued now {}, avg {:.1f}, min {}",
+        diagnostic[0], diagnostic[1], diagnostic[2], diagnostic[3], diagnostic[4], queue_average,
+        queue_minimum);
   }
 }
 
 void SDLAudioDriver::Shutdown() {
+  if (dump_)
+    std::fclose(dump_);
+  if (dump_timestamps_)
+    std::fclose(dump_timestamps_);
+  dump_ = dump_timestamps_ = nullptr;
   if (sdl_stream_) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;

@@ -56,6 +56,11 @@ The game boots, plays its videos, saves and loads, and runs its levels. See
 - 60 FPS gameplay, with menus, the title screen and loading screens kept at the original 30 FPS so
   they run at the speed they were made for.
 - Render resolution scaling (supersampling), anisotropic filtering and FXAA.
+- Free camera and photo mode, with controller and keyboard controls, zoom and HUD hiding.
+- Original, soft or disabled ink outlines, custom outline colours and cleaner character eyes.
+- Start episode selection for new games, and intro logo skipping across language folders.
+- Precise game-clock reads and even Havok steps at 60 FPS, with optional timing and audio
+  diagnostics for investigating slowdowns.
 - A launcher that installs the game from your ISO, manages settings, patches and save backups,
   adds the game to Steam, and updates itself.
 - Controller support, and keyboard and mouse controls with rebindable keys and an in-game list of
@@ -166,11 +171,62 @@ too. In the
 game, F4 opens the settings, with the controls under Input > Keybinds (press *Save to config* to
 keep changes made there).
 
+**Free camera and photo mode.** The free camera uses the game's developer camera. Characters
+receive idle controller input while it is active; photo mode also pauses the level and hides the
+HUD and subtitles. These controls work while a level camera is running:
+
+| Action | Controller | Keyboard |
+|---|---|---|
+| Free camera on/off | L3 + R3 | F6 |
+| Photo mode on/off | Y with the free camera active | F8 |
+| Move | Left stick | W A S D |
+| Look around | Right stick | Arrow keys |
+| Down, up | Left trigger, right trigger | Q, E |
+| Zoom out, in | LB, RB | 1, 3 |
+| Reset zoom | Tap R3 | 2 |
+| Faster, slower | Hold A, X | Hold Shift, Ctrl |
+
+F6 and F8 can be rebound in the launcher's **Keyboard & mouse** section. In `simpsons.toml`,
+`freecam_speed` sets movement speed (5 by default), `freecam_hide_hud` controls HUD hiding in photo
+mode, and `freecam_game_follows` lets the game stream and cull from the free camera. Leaving a
+level releases the camera and its input lock.
+
+**Outlines and eyes.** The **Ink outlines** settings offer Hard (original), Soft and Off, a soft
+line strength slider, colour presets and a custom `RRGGBB` colour. **Characters' eyes** offers
+Clean (the default) and Original. Clean reads the artists' no-rim-shadow flag with a tolerance
+to remove speckled shadows on eye whites. The settings are `ink_outlines`, `ink_outline_strength`,
+`ink_outline_color` and `eye_shading`; changing them requires a restart. Each image patch checks
+the expected game data first and leaves an unsupported image untouched. Clean eyes and coloured
+outlines change shader microcode, so those variants are translated at runtime and can cause a
+first-use shader compilation pause. Black outlines retain the existing shader variants.
+
+**Start episode.** The launcher's **Patches** tab can start a new game in any of the 18 episodes.
+Existing saves keep their progress. The launcher keeps `simpsons_gameflow.lua.original` beside
+the modified gameflow script; choosing Land of Chocolate restores it exactly. If another tool
+edits the script while this patch is active, the launcher keeps both files and refuses to
+replace the external edits. Individual episodes may depend on progress from earlier levels;
+starting every episode this way has not been checked through a full play-through.
+
+**Game timing.** `physics_step` selects Steady (the default), Legacy (the previous 60 FPS fix)
+or Original (the console code). Steady uses the game clock's frame time instead of its smoothed
+copy, avoiding the extra 8.3 ms Havok steps at 60 FPS. `tick_count_precise` reads the millisecond
+clock directly so delayed background timer updates cannot distort the game's frame time.
+Both settings require a restart. These fixes do not unlock rendering above 60 FPS.
+
+**Diagnostics.** `audio_log_underruns` also reports callback rate, callback time, wait lateness
+and queue depth. `audio_dump_file` writes submitted six-channel, 256-sample big-endian float
+frames and a companion `.ts` file with one host `uint64` monotonic nanosecond timestamp per frame;
+it is off by default and requires a restart. Recording to a slow disk can affect audio timing.
+`physics_log` reports physics steps and hazard damage messages. `REX_TIMER_STATS` adds per-timer
+arming rates and intervals to the existing timer diagnostics.
+
 ## Known issues
 
-- At 60 FPS some scripted sequences can misbehave, because the game was built for 30 FPS. A known
-  case is the dam in "Lisa the Tree Hugger", where random deaths can happen at 60; switch to 30
-  for that section if it happens.
+- At 60 FPS some scripted sequences can misbehave, because the game was built for 30 FPS.
+  Random deaths in "Lisa the Tree Hugger" were reported in
+  [#2](https://github.com/YesterMester/TheSimpsonsGameRecomp/issues/2). The fork's author reported
+  completing the affected section at 60 FPS with the timing fixes, but the whole campaign still
+  needs testing; switch to 30 if it happens.
 - If videos show a black screen on Windows, switch the graphics backend to Vulkan in the
   launcher's settings.
 - The Direct3D 11 renderer is experimental. It has been tested through Proton on a Steam Deck,
@@ -366,6 +422,12 @@ under the BSD 3-Clause License, as is the Xenia code it derives from. XenonRecom
 - The ReXGlue SDK by Tom Clay, the recompilation runtime this port uses.
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) by hedge-dev and contributors.
 - tronuo, for the 60 FPS patch and the Havok physics fix.
+- [Frank Kitzing (frankyfife)](https://github.com/frankyfife), for the free camera and photo mode,
+  ink outline controls, clean eye shading, start episode selection, multilingual intro skipping,
+  Windows timing and guest-address fixes, Havok step changes and audio/physics diagnostics.
+  These contributions were developed in [his fork](https://github.com/frankyfife/TheSimpsonsGameRecomp_ff)
+  on 3–4 October 2026 and brought together in
+  [#43](https://github.com/YesterMester/TheSimpsonsGameRecomp/pull/43).
 - Everyone who has contributed code: Gabry179, awemancba, tronuo0 and anasalialamgir.
 - The libraries the runtime is built with: SDL3, Dear ImGui, glslang, SPIRV-Tools, FFmpeg, spdlog,
   fmt and Tracy.

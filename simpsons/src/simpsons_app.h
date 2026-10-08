@@ -5,6 +5,28 @@
 #pragma once
 
 #include <rex/rex_app.h>
+#include <rex/runtime.h>
+
+namespace rex::memory {
+class Memory;
+}
+
+// ink_outlines.cpp: patches the ink outline constants into the loaded image.
+void ApplyInkOutlineOptions(rex::memory::Memory* memory);
+
+namespace rex::ui {
+class Window;
+}
+
+// freecam.cpp: the free camera's key binds and keyboard listener.
+void InitFreecam(rex::ui::Window* window);
+void ShutdownFreecam(rex::ui::Window* window);
+
+// eye_shading.cpp: patches the characters' eye shading into the loaded image.
+void ApplyEyeShadingOptions(rex::memory::Memory* memory);
+
+// physics_step.cpp: sets the Havok step threshold in the loaded image.
+void ApplyPhysicsStepOptions(rex::memory::Memory* memory);
 
 class SimpsonsApp : public rex::ReXApp {
  public:
@@ -15,6 +37,14 @@ class SimpsonsApp : public rex::ReXApp {
     return std::unique_ptr<SimpsonsApp>(new SimpsonsApp(ctx, "simpsons",
         PPCImageConfig));
   }
+
+  void OnPostLoadXexImage() override {
+    ApplyInkOutlineOptions(runtime()->memory());
+    ApplyEyeShadingOptions(runtime()->memory());
+    ApplyPhysicsStepOptions(runtime()->memory());
+  }
+  void OnPostSetup() override { InitFreecam(window()); }
+  void OnShutdown() override { ShutdownFreecam(window()); }
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}

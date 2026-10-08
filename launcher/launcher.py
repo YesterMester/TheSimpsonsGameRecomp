@@ -27,6 +27,7 @@ import struct
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -262,6 +263,16 @@ SETTINGS_SCHEMA = {
     # FXAA works on every backend since 0.0.6.0 (it used to show a black
     # screen with Vulkan on the Steam Deck); new installs start with it.
     "swap_post_effect": ("str", "fxaa", True),     # none, fxaa, fxaa_extreme
+    # The black ink outlines (simpsons/src/ink_outlines.cpp): original, soft or
+    # off; the soft lines' darkness; and their colour as RRGGBB (000000 =
+    # black, the original). Patched when the game loads, hence the restart.
+    "ink_outlines": ("str", "original", True),
+    "ink_outline_strength": ("float", 0.6, True),
+    "ink_outline_color": ("str", "000000", True),
+    # The characters' eyes (simpsons/src/eye_shading.cpp): "clean" reads the
+    # artists' no-rim-shadow flag with a tolerance, "original" keeps the
+    # speckled shadow of the Xbox 360 game. Patched when the game loads.
+    "eye_shading": ("str", "clean", True),
     # fps
     "video_mode_refresh_rate": ("float", 60.0, True),
     # input
@@ -306,6 +317,8 @@ SETTINGS_SCHEMA = {
         "bind_settings": "F4",
         "bind_debug_overlay": "F3",
         "bind_console": "Backtick",
+        "bind_freecam": "F6",
+        "bind_photo_mode": "F8",
     }.items()},
     # game
     "user_language": ("int", 1, True),
@@ -485,27 +498,198 @@ def write_settings(new_values):
 
 # ------------------------------------------------------------------ patches
 
+patch_lock = threading.Lock()
+
+def _logo_movie_files(enabled):
+    """The logo movies on disk, in every language folder under movies/ (en on
+    English discs, de, fr, ... on others), matched case-insensitively like
+    the guest filesystem: their .vp6 files, or the .vp6.disabled ones."""
+    movies = _find_ci(GAMEDATA, "movies", folder=True)
+    if movies is None or not movies.is_dir():
+        return []
+    suffix = ".vp6" if enabled else ".vp6.disabled"
+    names = {m + suffix for m in LOGO_MOVIES}
+    return [f for d in sorted(movies.iterdir()) if d.is_dir()
+            for f in sorted(d.iterdir()) if f.is_file() and f.name.lower() in names]
+
+
 def patch_skip_intro_state():
-    en = GAMEDATA / "movies" / "en"
-    if not en.is_dir():
+    present = _logo_movie_files(True)
+    disabled = _logo_movie_files(False)
+    if not present and not disabled:
         return "unavailable"
-    disabled = any((en / f"{m}.vp6.disabled").exists() for m in LOGO_MOVIES)
-    present = any((en / f"{m}.vp6").exists() for m in LOGO_MOVIES)
     return "on" if disabled and not present else "off"
 
 
 def patch_skip_intro(enable):
-    en = GAMEDATA / "movies" / "en"
-    if not en.is_dir():
-        return False, "game data not installed"
-    n = 0
-    for m in LOGO_MOVIES:
-        src = en / (f"{m}.vp6" if enable else f"{m}.vp6.disabled")
-        dst = en / (f"{m}.vp6.disabled" if enable else f"{m}.vp6")
-        if src.exists():
-            src.rename(dst)
-            n += 1
-    return True, f"{'skipped' if enable else 'restored'} {n} intro videos"
+    with patch_lock:
+        files = _logo_movie_files(enable)
+        if not files and not _logo_movie_files(not enable):
+            return False, "logo movies not installed"
+        moves = [(f, f.with_name(f.name + ".disabled") if enable
+                     else f.with_name(f.name[:-len(".disabled")])) for f in files]
+        # Never replace another copy when both forms exist, including on
+        # case-sensitive Linux filesystems with case-insensitive game paths.
+        for src, dst in moves:
+            if _find_ci(dst.parent, dst.name) is not None:
+                return False, f"both enabled and disabled copies of {src.name} exist"
+        completed = []
+        try:
+            for src, dst in moves:
+                src.rename(dst)
+                completed.append((src, dst))
+        except OSError as e:
+            for src, dst in reversed(completed):
+                dst.rename(src)
+            return False, str(e)
+        return True, f"{'skipped' if enable else 'restored'} {len(files)} intro videos"
+
+
+# Start episode (level select): the game starts a new game in the episode whose
+# block in gamedata/simpsons_gameflow.lua calls episode:SetDefault() (Land of
+# Chocolate). Moving that call makes new games start elsewhere; games in
+# progress keep their own progress. The untouched file is kept beside it as
+# simpsons_gameflow.lua.original while another episode is chosen.
+GAMEFLOW_LUA = "simpsons_gameflow.lua"
+EPISODE_NAMES = {
+    "SPR_HUB": "Springfield (hub)",
+    "LAND_OF_CHOCOLATE": "Land of Chocolate (original start)",
+    "BARTMAN_BEGINS": "Bartman Begins",
+    "EIGHTY_BITES": "Around the World in 80 Bites",
+    "TREEHUGGER": "Lisa the Tree Hugger",
+    "MOB_RULES": "Mob Rules",
+    "CHEATER": "Enter the Cheatrix",
+    "DOLPHINS": "Day of the Dolphins",
+    "COLOSSAL_DONUT": "The Colossal Donut",
+    "SPRINGFIELD_STOOD_STILL": "The Day the Earth Stood Stupid",
+    "BARGAIN_BIN": "Bargain Bin",
+    "GAME_HUB": "Video game world (hub)",
+    "NEVERQUEST": "NeverQuest",
+    "GRAND_THEFT_SCRATCHY": "Grand Theft Scratchy",
+    "MEDAL_OF_HOMER": "Medal of Homer",
+    "BIG_SUPER": "Big Super Happy Fun Fun Game",
+    "RHYMES_WITH_COMPLAINING": "Rhymes with Complaining",
+    "MEET_THY_PLAYER": "Meet Thy Player",
+}
+_EPISODE_RE = re.compile(r'^([ \t]*)episode\s*=\s*NewEpisode\(\s*game\s*,\s*"([A-Za-z0-9_]+)"', re.M)
+_SET_DEFAULT_RE = re.compile(r'^[ \t]*episode:SetDefault\(\)[^\r\n]*', re.M)
+
+
+def _gameflow_files():
+    """(the gameflow file, its .original backup) or (None, None)."""
+    lua = _find_ci(GAMEDATA, GAMEFLOW_LUA)
+    if lua is None:
+        return None, None
+    return lua, lua.with_name(lua.name + ".original")
+
+
+def _read_lua(path):
+    with open(path, "r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+        return f.read()
+
+
+def _episodes(text):
+    """[(episode id, offset of its block, end of its block)] in file order."""
+    found = list(_EPISODE_RE.finditer(text))
+    return [(m.group(2), m.start(), found[i + 1].start() if i + 1 < len(found) else len(text))
+            for i, m in enumerate(found)]
+
+
+def _start_episode_of(text):
+    """The episode whose block calls episode:SetDefault(), or None."""
+    for episode_id, start, end in _episodes(text):
+        if _SET_DEFAULT_RE.search(text, start, end):
+            return episode_id
+    return None
+
+
+def start_episode_state():
+    lua, _ = _gameflow_files()
+    if lua is None:
+        return "unavailable"
+    return _start_episode_of(_read_lua(lua)) or "unavailable"
+
+
+def start_episode_options():
+    lua, backup = _gameflow_files()
+    if lua is None:
+        return []
+    text = _read_lua(backup if backup.is_file() else lua)
+    return [{"id": e, "name": EPISODE_NAMES.get(e, e.replace("_", " ").title())}
+            for e, _, _ in _episodes(text)]
+
+
+def _episode_text(original, episode_id):
+    """Move the default call, preserving the untouched file's bytes and newlines."""
+    if episode_id == _start_episode_of(original):
+        return original
+    newline = "\r\n" if "\r\n" in original else "\n"
+    text = _SET_DEFAULT_RE.sub(
+        lambda m: m.group(0).replace("episode:SetDefault()", "-- episode:SetDefault()", 1)
+        + "  -- start episode moved by the launcher", original, count=1)
+    match = next(m for m in _EPISODE_RE.finditer(text) if m.group(2) == episode_id)
+    line_end = text.find("\n", match.end())
+    if line_end < 0:
+        text += newline
+        line_end = len(text)
+    else:
+        line_end += 1
+    text = (text[:line_end] + f"{match.group(1)}episode:SetDefault()  -- start episode chosen in the launcher"
+            + newline + text[line_end:])
+    if _start_episode_of(text) != episode_id or len(_SET_DEFAULT_RE.findall(text)) != 1:
+        raise ValueError("could not move the start episode")
+    return text
+
+
+def _write_lua(path, text):
+    # A unique temporary file also keeps a failed write from truncating game data.
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(text.encode("utf-8", errors="surrogateescape"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def set_start_episode(episode_id):
+    with patch_lock:
+        lua, backup = _gameflow_files()
+        if lua is None:
+            return False, "game data not installed"
+        try:
+            original = _read_lua(backup if backup.is_file() else lua)
+            found = _episodes(original)
+            episodes = {e for e, _, _ in found}
+            original_start = _start_episode_of(original)
+            if episode_id not in episodes or original_start is None:
+                return False, f"unknown episode {episode_id!r}"
+            if len(episodes) != len(found) or len(_SET_DEFAULT_RE.findall(original)) != 1:
+                return False, "unexpected simpsons_gameflow.lua (expected unique episodes and one default)"
+            if backup.is_file():
+                current = _read_lua(lua)
+                selected = _start_episode_of(current)
+                if selected not in episodes or current != _episode_text(original, selected):
+                    return False, "gameflow was edited outside the launcher; original backup kept"
+            text = _episode_text(original, episode_id)
+            if episode_id == original_start:
+                if backup.is_file():
+                    _write_lua(lua, original)
+                    backup.unlink()
+            else:
+                if not backup.is_file():
+                    # Do not overwrite another tool's backup.
+                    with open(backup, "xb") as f:
+                        f.write(original.encode("utf-8", errors="surrogateescape"))
+                        f.flush()
+                        os.fsync(f.fileno())
+                _write_lua(lua, text)
+        except (OSError, ValueError) as e:
+            return False, str(e)
+        name = EPISODE_NAMES.get(episode_id, episode_id)
+        return True, f"new games start in {name}"
 
 
 def _toml_flag(key, default="false"):
@@ -537,6 +721,12 @@ def patches_list():
         {"id": "skip_intro", "name": "Skip intro logo videos",
          "desc": "Boots straight past the EA / Fox / Gracie logo movies.",
          "state": patch_skip_intro_state(), "available": patch_skip_intro_state() != "unavailable"},
+        {"id": "start_episode", "name": "Start episode (level select)",
+         "desc": "New games start in the chosen episode, skipping the ones before it. Games "
+                 "already in progress keep their progress. Takes effect the next time the game "
+                 "starts; choose Land of Chocolate to go back to the original game.",
+         "state": start_episode_state(), "available": start_episode_state() != "unavailable",
+         "options": start_episode_options()},
         {"id": "fps_unlock", "name": "60 FPS mode",
          "desc": "Runs the game at 60 Hz instead of the original 30. Set it in "
                  "Settings → FRAMERATE. Experimental: cutscenes/physics may misbehave.",
@@ -555,20 +745,21 @@ def game_running_pids():
         return []
 
 
-def _find_ci(directory, name):
-    """Locate a file case-insensitively, the way the guest filesystem does.
+def _find_ci(directory, name, *, folder=False):
+    """Locate a file or folder case-insensitively, like the guest filesystem.
 
     extract-xiso preserves whatever case the disc used, so a Linux install can
     end up with DEFAULT.XEX while everything looks for default.xex.
     """
     if not directory.is_dir():
         return None
+    matches_kind = Path.is_dir if folder else Path.is_file
     exact = directory / name
-    if exact.is_file():
+    if matches_kind(exact):
         return exact
     lowered = name.lower()
     for entry in directory.iterdir():
-        if entry.is_file() and entry.name.lower() == lowered:
+        if matches_kind(entry) and entry.name.lower() == lowered:
             return entry
     return None
 
@@ -1880,7 +2071,6 @@ def launch_game():
                            "2015 on). Open the About tab and check for updates to install "
                            "the build for older CPUs, or download the NoAVX2 package from "
                            "the Releases page.")
-        start_save_guard()
         repaired = repair_saves()
         if repaired:
             install_state["log"].append("Save self-heal: " + ", ".join(repaired))
@@ -1955,12 +2145,21 @@ def launch_game():
             out = diag.game_output_handle()
         else:
             out = subprocess.DEVNULL
-        game_proc = subprocess.Popen(cmd, cwd=str(BUILD_DIR), env=env,
-                                     stdout=out, stderr=subprocess.STDOUT
-                                     if out is not subprocess.DEVNULL else subprocess.DEVNULL,
-                                     **POPEN_NO_WINDOW)
-        if out is not subprocess.DEVNULL:
-            out.close()  # the child holds its own duplicate of the fd
+        try:
+            game_proc = subprocess.Popen(cmd, cwd=str(BUILD_DIR), env=env,
+                                         stdout=out, stderr=subprocess.STDOUT
+                                         if out is not subprocess.DEVNULL else subprocess.DEVNULL,
+                                         **POPEN_NO_WINDOW)
+        except OSError as exc:
+            message = f"Could not start the game: {exc}"
+            install_state["log"].append(message)
+            if diag:
+                diag.finalize(None, [message])
+            return False, message
+        finally:
+            if out is not subprocess.DEVNULL:
+                out.close()  # the child holds its own duplicate of the fd
+        start_save_guard()
         # HAND PATCH: level-load memory spikes were getting the game SIGKILLed
         # by systemd-oomd. This used to be handled by wrapping the launch in
         # `systemd-run --user --scope`, which hands the process off into a
@@ -2131,6 +2330,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/patch":
             if body.get("id") == "skip_intro":
                 ok, msg = patch_skip_intro(bool(body.get("enable")))
+                return self._send(200, {"ok": ok, "msg": msg})
+            if body.get("id") == "start_episode":
+                ok, msg = set_start_episode(str(body.get("value", "")))
                 return self._send(200, {"ok": ok, "msg": msg})
             return self._send(404, {"ok": False, "msg": "unknown patch"})
         if path == "/api/diagnostics":

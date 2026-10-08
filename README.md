@@ -48,7 +48,8 @@ The game boots, plays its videos, saves and loads, and runs its levels. See
 - Vulkan renderer that draws with the GPU's own render targets, plus an accurate fallback path
   that emulates the Xbox 360's EDRAM in the pixel shader.
 - Native vertex and index buffers, texture uploads and render target copies for supported
-  resources. Changed data gets its own copy so later frames cannot overwrite an earlier draw.
+  resources, with the Vulkan renderer on Linux and Windows. Changed data gets its own copy so
+  later frames cannot overwrite an earlier draw.
 - Experimental Direct3D 11 renderer for Windows 10/11, for GPUs without good Vulkan or
   Direct3D 12 support. Choose it in the launcher's settings.
 - Audio fixes for late mixer wakeups and concurrent decoder updates, with native audio thread
@@ -242,7 +243,8 @@ arming rates and intervals to the existing timer diagnostics.
   not yet on Windows drivers, and it is slower than Vulkan at higher render scales: in the tested
   Springfield scene on the Deck, about 55 FPS at 1x and 22 FPS at 2x.
 - Native rendering is still being completed. Unsupported resources and resolves use the
-  existing fallback, and the new native resource paths have been tested most on Linux/Vulkan.
+  existing fallback. On Windows, the native resource paths have been tested with the Windows
+  build through Proton on a Steam Deck, not yet on Windows drivers.
 - The minimum 4-frame audio queue can still underrun under heavy CPU load. Windows audio has
   been checked under load with the Windows build through Proton, not yet on Windows itself.
 

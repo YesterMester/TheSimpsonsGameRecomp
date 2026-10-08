@@ -80,6 +80,8 @@ targets, constants, retained 16/32-bit indices, independent mips and array slice
 scissors, depth, stencil, read-only depth alongside stencil writes, color write
 masks, blending, texture address modes, rasterization discard and graphics UAV output. Conflicting
 resource use and invalid index/output ranges are rejected before submission.
+Discard checks alternate vertex-only and geometry pipelines, checking vertex
+and geometry execution counters while every render target pixel stays unchanged.
 Cached reads are explicitly unbound when they become outputs, so later reuse of
 the same view cannot silently miss a binding that the runtime removed.
 

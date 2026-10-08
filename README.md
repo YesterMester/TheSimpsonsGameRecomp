@@ -134,9 +134,10 @@ performance varies through the game.
 **Audio.** The launcher's *Audio buffer* setting chooses how many 5.3 ms audio frames are queued:
 Small (16), Normal (32, the default) or Large (64). Without a launcher setting the game uses 8.
 Values from 4 to 64 can be set with `audio_maxqframes` in `simpsons.toml`. On the Steam Deck,
-8 and 16 frames play without underruns under a heavy CPU load check, on Linux and with the
-Windows build; the minimum of 4 can still underrun under heavy load. Updating keeps your saved
-setting.
+the Linux build passes the heavy CPU load check at 8 and 16 frames. The Windows build, tested
+through Proton, has no queue underruns at 16 and 32 frames, but can still produce occasional
+silent mixer blocks under that synthetic load. The minimum of 4 can still underrun under heavy
+load. Updating keeps your saved setting.
 
 **Keyboard and mouse.** Turn on *Play with keyboard & mouse* in the launcher's Settings tab. The
 game then takes the mouse whenever its window is active, and lets go of it when you switch to

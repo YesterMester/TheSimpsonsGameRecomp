@@ -118,12 +118,13 @@ copy) and decoding the resolved textures again (about 8 ms). The Vulkan path
 resolves directly into textures and buffers; porting that is the next DX11
 performance step.
 
-## Checks (2026-10-07)
+## Checks (2026-10-08)
 
 These hardware checks run Windows D3D11 executables through Proton/DXVK on the
 Steam Deck. They check API and GPU behavior, not native Windows driver performance
-or complete game rendering. The Windows WARP workflow is prepared separately and
-has not run yet.
+or complete game rendering. Windows CI runs the component checks with Microsoft's
+WARP software device; native Windows hardware and full-game qualification remain
+separate.
 
 - 379 shaders extracted from the owner's executable compile at 1x and 2x: 758
   variants, with no failed translations or native vertex/pixel shader creations
@@ -203,7 +204,7 @@ has not run yet.
 
 ## Remaining work
 
-1. Run on native Windows drivers and the Windows WARP workflow, and qualify
+1. Run the full game on native Windows hardware drivers, and qualify
    in-engine cutscenes and more of the campaign.
 2. Resolve directly into native textures and buffers, as the Vulkan path does,
    to remove the EDRAM encode/decode round trip that limits 2x.

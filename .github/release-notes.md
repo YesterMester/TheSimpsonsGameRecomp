@@ -59,6 +59,7 @@ launcher installs the game from your own ISO.
 - Native GPU coverage is incomplete. Unsupported resource, shader and resolve cases still use the existing fallback.
 - At 2x, frame drops remain in busy areas. Further CPU and GPU performance work is needed.
 - The Direct3D 11 renderer is experimental: it is slower than Vulkan at higher render scales, has not been tested on Windows drivers, and in-engine cutscenes and most of the campaign have not been checked with it.
+- Under synthetic CPU saturation, the Windows build through Proton can still produce occasional silent mixer blocks despite having no output queue underruns. Native Windows audio needs further load testing.
 - Menus and the title screen run at 30 FPS, as the game's menus were made for. Rendering them at higher frame rates is planned.
 - Frame rate settings above 60 do not add frames, because the game's frame scheduler tops out at 60 FPS, and they make frame pacing less even. 60 is recommended. Proper 120 FPS and unlimited rendering remain future work.
 - At 60 FPS some scripted sequences can misbehave. If random deaths happen at the dam in "Lisa the Tree Hugger", switch to 30 for that section.

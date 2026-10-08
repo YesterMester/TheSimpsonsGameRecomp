@@ -2,7 +2,10 @@
 
 #include <rex/graphics/d3d11/profile.h>
 
+#include <d3d11shader.h>
+
 #include <algorithm>
+#include <bit>
 #include <cstdio>
 #include <cstring>
 
@@ -444,20 +447,45 @@ ID3D11GeometryShader* DrawContext::DiscardShader(const ShaderProgram& source, st
   // there is no guest geometry shader. Disabling the rasterized stream keeps
   // vertex work and memexport running without sending invalid positions to
   // the scan converter.
-  // A gap supplies a stream declaration without capturing any shader output.
-  // The Microsoft runtime needs that declaration for a passthrough shader;
-  // no stream-output buffers are bound, and rasterization stays disabled.
-  const D3D11_SO_DECLARATION_ENTRY discard_entry = {0, nullptr, 0, 0, 1, 0};
-  const UINT discard_stride = sizeof(uint32_t);
-  HRESULT created = device_.device()->CreateGeometryShaderWithStreamOutput(
-      bytes.data(), bytes.size(), &discard_entry, 1, &discard_stride, 1,
-      D3D11_SO_NO_RASTERIZED_STREAM, nullptr, result.shader.GetAddressOf());
-  if (FAILED(created)) {
-    char message[128];
-    std::snprintf(message, sizeof(message),
-                  "Unable to create the native rasterization-discard shader (0x%08X)",
-                  unsigned(created));
-    result.error = message;
+  // A passthrough shader needs a real output in its stream declaration, even
+  // with no buffers bound. Reflect one existing component so this works with
+  // vertex, domain and geometry signatures without inventing a semantic.
+  ComPtr<ID3D11ShaderReflection> reflection;
+  HRESULT reflected = D3DReflect(bytes.data(), bytes.size(), IID_ID3D11ShaderReflection,
+                                 reinterpret_cast<void**>(reflection.GetAddressOf()));
+  D3D11_SHADER_DESC description = {};
+  D3D11_SIGNATURE_PARAMETER_DESC output = {};
+  bool found_output = false;
+  if (SUCCEEDED(reflected) && SUCCEEDED(reflection->GetDesc(&description))) {
+    for (UINT i = 0; i < description.OutputParameters; ++i) {
+      if (SUCCEEDED(reflection->GetOutputParameterDesc(i, &output)) && output.SemanticName &&
+          (output.Mask & 15)) {
+        found_output = true;
+        break;
+      }
+    }
+  }
+  if (!found_output) {
+    result.error = "The native rasterization-discard shader has no output signature";
+  } else {
+    const D3D11_SO_DECLARATION_ENTRY discard_entry = {
+        output.Stream,
+        output.SemanticName,
+        output.SemanticIndex,
+        BYTE(std::countr_zero(unsigned(output.Mask & 15))),
+        1,
+        0};
+    const UINT discard_stride = sizeof(uint32_t);
+    HRESULT created = device_.device()->CreateGeometryShaderWithStreamOutput(
+        bytes.data(), bytes.size(), &discard_entry, 1, &discard_stride, 1,
+        D3D11_SO_NO_RASTERIZED_STREAM, nullptr, result.shader.GetAddressOf());
+    if (FAILED(created)) {
+      char message[128];
+      std::snprintf(message, sizeof(message),
+                    "Unable to create the native rasterization-discard shader (0x%08X)",
+                    unsigned(created));
+      result.error = message;
+    }
   }
   if (discard_shaders_.size() == 64)
     discard_shaders_.erase(discard_shaders_.begin());

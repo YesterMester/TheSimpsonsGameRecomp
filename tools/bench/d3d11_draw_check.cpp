@@ -19,7 +19,8 @@ namespace shaders {
 #include "../rexglue-sdk/src/graphics/shaders/bytecode/d3d12_5_1/float24_round_ps.h"
 #include "../rexglue-sdk/src/graphics/shaders/bytecode/d3d12_5_1/float24_truncate_ps.h"
 }  // namespace shaders
-constexpr size_t kVertex = size_t(DrawStage::kVertex), kPixel = size_t(DrawStage::kPixel);
+constexpr size_t kVertex = size_t(DrawStage::kVertex), kGeometry = size_t(DrawStage::kGeometry),
+                 kPixel = size_t(DrawStage::kPixel);
 void Require(bool condition, const char* message) {
   if (!condition)
     throw std::runtime_error(message);
@@ -124,6 +125,7 @@ struct Results {
   uint64_t words = 0;
   uint32_t sampler_draws = 0;
   uint64_t discard_vertex_invocations = 0;
+  uint64_t discard_geometry_invocations = 0;
 };
 
 void CheckAlternatingFrames(D3D11Device& owner, ShaderCache& shaders, BufferCache& buffers,
@@ -148,6 +150,13 @@ uint4 main(float4 p : SV_Position) : SV_Target {
          uint4(uint(p.x)*17u, uint(p.y)*23u, uint(p.x)+uint(p.y), 0x71305Au);
 })",
                         "ps_5_1");
+  auto* geometry = Program(shaders, R"(
+struct Vertex { float4 position : SV_Position; };
+[maxvertexcount(3)]
+void main(triangle Vertex vertices[3], inout TriangleStream<Vertex> output) {
+  for (uint i = 0; i < 3; ++i) output.Append(vertices[i]);
+})",
+                           "gs_5_1");
   DrawCommand command;
   command.programs[kVertex] = vertex;
   command.programs[kPixel] = pixel;
@@ -157,6 +166,7 @@ uint4 main(float4 p : SV_Position) : SV_Target {
   auto* input = &a;
   auto* output = &b;
   for (uint32_t frame = 0; frame < frames; ++frame) {
+    command.programs[kGeometry] = (frame & 1) ? geometry : nullptr;
     std::array<uint32_t, 4> increment = {frame + 5, frame * 3, frame * 7 + 1, frame * 11};
     auto constants = Buffer(buffers, increment.data(), sizeof(increment), BufferKind::kConstant);
     std::array<ID3D11Buffer*, 1> cb = {constants->buffer()};
@@ -200,6 +210,11 @@ uint4 main(float4 p : SV_Position) : SV_Target {
     Require(discard_statistics.VSInvocations >= command.count && !discard_statistics.PSInvocations,
             "Rasterization discard must execute vertices without pixel invocations");
     results.discard_vertex_invocations += discard_statistics.VSInvocations;
+    if (command.programs[kGeometry]) {
+      Require(discard_statistics.GSInvocations > 0,
+              "Rasterization discard must execute the original geometry shader");
+      results.discard_geometry_invocations += discard_statistics.GSInvocations;
+    }
     results.pixels += width * height;
     command.discard_rasterization = false;
     command.bindings[kPixel].constants = cb;
@@ -807,6 +822,8 @@ int main(int argc, char** argv) {
     report +=
         "  \"discard_vertex_invocations\": " + std::to_string(result.discard_vertex_invocations) +
         ",\n";
+    report += "  \"discard_geometry_invocations\": " +
+              std::to_string(result.discard_geometry_invocations) + ",\n";
     report += "  \"draws\": " + std::to_string(statistics.draws) + ",\n";
     report +=
         "  \"explicit_resource_unbinds\": " + std::to_string(statistics.explicit_resource_unbinds) +

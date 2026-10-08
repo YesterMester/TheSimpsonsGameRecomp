@@ -139,26 +139,65 @@ struct VulkanCommandProcessor::NativeVertexCache {
   struct Entry {
     std::vector<NativeVertexRange> ranges;
     std::vector<uint8_t> bytes;
+    // XXH3 of each range's bytes: checking a range hashes the guest memory
+    // alone instead of comparing it against the copy, half the memory reads.
+    std::vector<uint64_t> range_hashes;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     std::unique_ptr<NativeBufferWatch> watch;
     size_t first_check_range = 0;
     std::vector<uint8_t> refreshed_bytes;
+    std::vector<uint64_t> refreshed_range_hashes;
     uint64_t refreshed_frame = 0;
     VkDescriptorSet refreshed_descriptor = VK_NULL_HANDLE;
   };
+  // At most this many entries; the cache is then retired.
+  static constexpr uint32_t kMaxEntries = 4096;
   explicit NativeVertexCache(const ui::vulkan::VulkanDevice* device) : device(device) {
     pool = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
         device, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, size_t(2) << 20);
+    entries.reserve(kMaxEntries);
+    slots.resize(kSlotCount);
   }
   ~NativeVertexCache() {
     if (descriptor_pool != VK_NULL_HANDLE) {
       device->functions().vkDestroyDescriptorPool(device->device(), descriptor_pool, nullptr);
     }
   }
+  // Calls fn(entry) for the entries under key until it returns true.
+  template <typename Fn>
+  Entry* Find(uint64_t key, Fn&& fn) {
+    for (uint32_t i = uint32_t(key) & (kSlotCount - 1);; i = (i + 1) & (kSlotCount - 1)) {
+      const Slot& slot = slots[i];
+      if (slot.index == kEmpty) {
+        return nullptr;
+      }
+      if (slot.key == key && fn(entries[slot.index])) {
+        return &entries[slot.index];
+      }
+    }
+  }
+  void Add(uint64_t key, Entry&& entry) {
+    uint32_t i = uint32_t(key) & (kSlotCount - 1);
+    while (slots[i].index != kEmpty) {
+      i = (i + 1) & (kSlotCount - 1);
+    }
+    slots[i] = {key, uint32_t(entries.size())};
+    entries.push_back(std::move(entry));
+  }
   const ui::vulkan::VulkanDevice* device;
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> pool;
   VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
-  std::unordered_multimap<uint64_t, Entry> entries;
+  // Entries in a flat array, found through an open-addressing table of their
+  // keys (linear probing, at most half full) that stays in the CPU caches; a
+  // node-based multimap cost several dependent cache misses per draw.
+  struct Slot {
+    uint64_t key = 0;
+    uint32_t index = kEmpty;
+  };
+  static constexpr uint32_t kEmpty = UINT32_MAX;
+  static constexpr uint32_t kSlotCount = kMaxEntries * 2;
+  std::vector<Entry> entries;
+  std::vector<Slot> slots;
   uint64_t bytes = 0;
 };
 
@@ -3940,23 +3979,23 @@ VkDescriptorSet VulkanCommandProcessor::TryCachedNativeVertexStreams(
   static_assert(sizeof(NativeVertexRange) == 12);
   uint64_t key = XXH3_64bits(ranges, range_count * sizeof(NativeVertexRange));
   if (native_vertex_cache_) {
-    auto matches = native_vertex_cache_->entries.equal_range(key);
-    for (auto it = matches.first; it != matches.second; ++it) {
-      NativeVertexCache::Entry& entry = it->second;
-      if (entry.ranges.size() != range_count || entry.bytes.size() != snapshot_size ||
-          (range_count && !draw_util::BytesEqual(entry.ranges.data(), ranges,
-                                                 range_count * sizeof(NativeVertexRange)))) {
-        continue;
-      }
+    NativeVertexCache::Entry* found =
+        native_vertex_cache_->Find(key, [&](const NativeVertexCache::Entry& entry) {
+          return entry.ranges.size() == range_count && entry.bytes.size() == snapshot_size &&
+                 (!range_count ||
+                  draw_util::BytesEqual(entry.ranges.data(), ranges,
+                                        range_count * sizeof(NativeVertexRange)));
+        });
+    if (found) {
+      NativeVertexCache::Entry& entry = *found;
       bool refresh = REXCVAR_GET(native_vertex_cache_refresh);
       if (refresh && entry.refreshed_descriptor != VK_NULL_HANDLE &&
           entry.refreshed_frame == frame_current_) {
         bool current = true;
         for (size_t i = 0; i < range_count; ++i) {
           const NativeVertexRange& range = ranges[i];
-          if (!draw_util::BytesEqual(entry.refreshed_bytes.data() + range.offset,
-                                     memory_->TranslatePhysical<const void*>(range.address),
-                                     range.size)) {
+          if (XXH3_64bits(memory_->TranslatePhysical<const void*>(range.address), range.size) !=
+              entry.refreshed_range_hashes[i]) {
             current = false;
             break;
           }
@@ -3977,9 +4016,8 @@ VkDescriptorSet VulkanCommandProcessor::TryCachedNativeVertexStreams(
           // first next time; successful reuse still compares every range.
           size_t i = check == 0 ? first : check <= first ? check - 1 : check;
           const NativeVertexRange& range = ranges[i];
-          if (!draw_util::BytesEqual(entry.bytes.data() + range.offset,
-                                     memory_->TranslatePhysical<const void*>(range.address),
-                                     range.size)) {
+          if (XXH3_64bits(memory_->TranslatePhysical<const void*>(range.address), range.size) !=
+              entry.range_hashes[i]) {
             entry.first_check_range = i;
             if (!refresh) {
               return VK_NULL_HANDLE;
@@ -3989,10 +4027,13 @@ VkDescriptorSet VulkanCommandProcessor::TryCachedNativeVertexStreams(
             // Invalidate it before changing its bytes, including on failure.
             entry.refreshed_descriptor = VK_NULL_HANDLE;
             entry.refreshed_bytes.resize(snapshot_size);
+            entry.refreshed_range_hashes.resize(range_count);
             for (size_t j = 0; j < range_count; ++j) {
               const NativeVertexRange& source = ranges[j];
               std::memcpy(entry.refreshed_bytes.data() + source.offset,
                           memory_->TranslatePhysical<const void*>(source.address), source.size);
+              entry.refreshed_range_hashes[j] =
+                  XXH3_64bits(entry.refreshed_bytes.data() + source.offset, source.size);
               trace_writer_.WriteMemoryRead(source.address, source.size,
                                             entry.refreshed_bytes.data() + source.offset);
             }
@@ -4047,7 +4088,7 @@ VkDescriptorSet VulkanCommandProcessor::TryCachedNativeVertexStreams(
     size_t byte_limit = size_t(std::clamp(REXCVAR_GET(native_vertex_buffer_cache_mb), 1, 256))
                         << 20;
     if (native_vertex_cache_->bytes + snapshot_size > byte_limit ||
-        native_vertex_cache_->entries.size() >= 4096) {
+        native_vertex_cache_->entries.size() >= NativeVertexCache::kMaxEntries) {
       native_vertex_cache_->pool->FlushWrites();
       native_vertex_caches_retired_.emplace_back(frame_current_, std::move(native_vertex_cache_));
     }
@@ -4072,10 +4113,12 @@ VkDescriptorSet VulkanCommandProcessor::TryCachedNativeVertexStreams(
   NativeVertexCache::Entry entry;
   entry.ranges.assign(ranges, ranges + range_count);
   entry.bytes.resize(snapshot_size);
+  entry.range_hashes.resize(range_count);
   for (size_t i = 0; i < range_count; ++i) {
     const NativeVertexRange& range = ranges[i];
     std::memcpy(entry.bytes.data() + range.offset,
                 memory_->TranslatePhysical<const void*>(range.address), range.size);
+    entry.range_hashes[i] = XXH3_64bits(entry.bytes.data() + range.offset, range.size);
     trace_writer_.WriteMemoryRead(range.address, range.size, entry.bytes.data() + range.offset);
   }
   VkDescriptorBufferInfo buffer_info;
@@ -4118,7 +4161,7 @@ VkDescriptorSet VulkanCommandProcessor::TryCachedNativeVertexStreams(
                             memory_->TranslatePhysical<const void*>(range.address));
     }
   }
-  native_vertex_cache_->entries.emplace(key, std::move(entry));
+  native_vertex_cache_->Add(key, std::move(entry));
   return result;
 }
 

@@ -22,7 +22,7 @@
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
 #include <rex/graphics/util/native_buffer_watch.h>
-#include <rex/graphics/util/bytes_equal.h>
+#include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -64,6 +64,9 @@ namespace rex::graphics::vulkan {
 struct VulkanPrimitiveProcessor::NativeIndexCache {
   struct Entry {
     std::vector<uint8_t> bytes;
+    // XXH3 of the bytes: a check hashes the guest indices alone instead of
+    // comparing them against the copy.
+    uint64_t hash = 0;
     std::pair<VkBuffer, VkDeviceSize> buffer;
     std::unique_ptr<NativeBufferWatch> watch;
     std::array<uint32_t, 5> bounds_key{};
@@ -349,7 +352,7 @@ bool VulkanPrimitiveProcessor::TryRetainedNativeIndexBuffer(uint32_t address, ui
     if (found != native_index_cache_->entries.end()) {
       const NativeIndexCache::Entry& entry = found->second;
       if ((!entry.watch || !entry.watch->IsCurrent()) &&
-          !draw_util::BytesEqual(entry.bytes.data(), source, length)) {
+          XXH3_64bits(source, length) != entry.hash) {
         // Keep the old GPU version immutable while earlier draws use it.
         return false;
       }
@@ -376,6 +379,7 @@ bool VulkanPrimitiveProcessor::TryRetainedNativeIndexBuffer(uint32_t address, ui
   NativeIndexCache::Entry entry;
   entry.bytes.resize(length);
   std::memcpy(entry.bytes.data(), source, length);
+  entry.hash = XXH3_64bits(entry.bytes.data(), length);
   uint8_t* mapping =
       native_index_cache_->pool.Request(command_processor_.GetCurrentFrame(), length,
                                         sizeof(uint32_t), entry.buffer.first, entry.buffer.second);

@@ -239,6 +239,7 @@ jobs:
           cmake --preset linux-amd64-relwithdebinfo \
             -DREXSDK_DIR="$GITHUB_WORKSPACE/tools/rexglue-sdk" \
             -DSDL_DBUS=ON \
+            -DREXGLUE_ENABLE_LTO=ON \
             -DSIMPSONS_X86_MARCH=${{ matrix.march }} \
             "-DCMAKE_C_FLAGS=-march=${{ matrix.march }}" "-DCMAKE_CXX_FLAGS=-march=${{ matrix.march }}"
 

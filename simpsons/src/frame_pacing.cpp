@@ -3,7 +3,8 @@
 // The game shipped at 30 fps: its frame scheduler waits two vblanks per frame.
 // The 60 FPS patch (the "li r4,1" hand patch in sub_82867A48) makes that one
 // vblank everywhere. Gameplay copes, since its logic runs on real time and
-// physics has its own fix, but the front end runs its logic once per frame:
+// physics_step.cpp evens out the physics step, but the front end runs its
+// logic once per frame:
 // at 60 fps menus scroll and repeat inputs twice as fast as they were made
 // for, and the title screen, which costs a little more than one 60 Hz frame,
 // alternates 17 and 33 ms frames. While no level is simulating, this puts the
@@ -18,6 +19,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/ppc.h>
 
 REXCVAR_DEFINE_INT32(menu_frame_rate, 30, "GPU",
@@ -25,10 +27,14 @@ REXCVAR_DEFINE_INT32(menu_frame_rate, 30, "GPU",
                      "runs its logic once per frame and was made for 30 fps (0 = same as gameplay)")
     .range(0, 240);
 
+// freecam.cpp: whether the photo mode has paused the level.
+bool FreecamWorldFrozen();
+
 // Steps the Havok world by f1 seconds of frame time. Runs every frame while a
 // level is live and never in the front end.
-REX_EXTERN(__imp__sub_827A55C0);
 REX_EXTERN(sub_827A55C0);
+// physics_step.cpp: the step itself, through the shipped code.
+void HavokStep(PPCContext& ctx, uint8_t* base);
 
 // Returns the time until the frame scheduler's next deadline. r3 = the
 // scheduler, which holds the frame's start timebase at +136 and its periods
@@ -54,22 +60,33 @@ int64_t NowNs() {
       .count();
 }
 
+// Host address of guest memory as the generated code computes it
+// (REX_PHYS_HOST_OFFSET): on Windows the physical heaps from 0xE0000000,
+// where the game's heap objects live, sit 0x1000 further on in host memory.
+const uint8_t* GuestToHost(const uint8_t* base, uint32_t address) {
+#if REX_PLATFORM_WIN32
+  return base + address + (address >= 0xE0000000u ? 0x1000u : 0u);
+#else
+  return base + address;
+#endif
+}
+
 uint32_t LoadBE32(const uint8_t* base, uint32_t address) {
   uint32_t value;
-  std::memcpy(&value, base + address, sizeof(value));
+  std::memcpy(&value, GuestToHost(base, address), sizeof(value));
   return rex::byte_swap(value);
 }
 
 void StoreBE32(uint8_t* base, uint32_t address, uint32_t value) {
   value = rex::byte_swap(value);
-  std::memcpy(base + address, &value, sizeof(value));
+  std::memcpy(const_cast<uint8_t*>(GuestToHost(base, address)), &value, sizeof(value));
 }
 
 }  // namespace
 
 REX_FUNC(sub_827A55C0) {
   g_last_level_step_ns.store(NowNs(), std::memory_order_relaxed);
-  __imp__sub_827A55C0(ctx, base);
+  HavokStep(ctx, base);
 }
 
 REX_FUNC(sub_82718710) {
@@ -88,7 +105,9 @@ REX_FUNC(sub_82718710) {
       game_periods = std::max<uint32_t>(current, 1);
     }
     int64_t last_step = g_last_level_step_ns.load(std::memory_order_relaxed);
-    bool menu = !last_step || NowNs() - last_step > kMenuAfterNs;
+    // The photo mode pauses the level, which stops the physics step too; it is
+    // still a level and keeps the gameplay frame rate.
+    bool menu = (!last_step || NowNs() - last_step > kMenuAfterNs) && !FreecamWorldFrozen();
     uint32_t refresh_bits = LoadBE32(base, kSchedulerRefreshHz);
     float refresh_hz;
     std::memcpy(&refresh_hz, &refresh_bits, sizeof(refresh_hz));

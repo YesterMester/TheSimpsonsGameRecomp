@@ -55,6 +55,9 @@ class SDLAudioDriver : public AudioDriver {
   uint32_t diag_underrun_frames_ = 0;
   uint32_t diag_submitted_frames_ = 0;
   uint32_t diag_silent_submitted_frames_ = 0;
+  // Queue depth after each submission (sum and minimum).
+  uint64_t diag_queue_sum_ = 0;
+  uint32_t diag_queue_min_ = UINT32_MAX;
 };
 
 }  // namespace rex::audio::sdl

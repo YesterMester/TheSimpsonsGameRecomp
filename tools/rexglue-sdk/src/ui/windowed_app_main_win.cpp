@@ -50,6 +50,19 @@ std::vector<std::string> WideArgsToUtf8(int argc, wchar_t** wargv) {
 // (#36). Since Windows 10 2004 the resolution is per process, so other
 // programs raising it don't help. Xenia does the same at startup.
 void RequestHighResolutionTimer() {
+  // Windows 11 may ignore a process's timer resolution request to save power,
+  // for example while it counts as invisible. Opting out of that makes the
+  // request below hold for the whole session.
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+  PROCESS_POWER_THROTTLING_STATE throttling = {};
+  throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+  throttling.StateMask = 0;
+  SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling,
+                        sizeof(throttling));
+
   using NtQueryTimerResolutionFn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
   using NtSetTimerResolutionFn = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
   HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");

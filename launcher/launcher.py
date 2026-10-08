@@ -262,6 +262,16 @@ SETTINGS_SCHEMA = {
     # FXAA works on every backend since 0.0.6.0 (it used to show a black
     # screen with Vulkan on the Steam Deck); new installs start with it.
     "swap_post_effect": ("str", "fxaa", True),     # none, fxaa, fxaa_extreme
+    # The black ink outlines (simpsons/src/ink_outlines.cpp): original, soft or
+    # off; the soft lines' darkness; and their colour as RRGGBB (000000 =
+    # black, the original). Patched when the game loads, hence the restart.
+    "ink_outlines": ("str", "original", True),
+    "ink_outline_strength": ("float", 0.6, True),
+    "ink_outline_color": ("str", "000000", True),
+    # The characters' eyes (simpsons/src/eye_shading.cpp): "clean" reads the
+    # artists' no-rim-shadow flag with a tolerance, "original" keeps the
+    # speckled shadow of the Xbox 360 game. Patched when the game loads.
+    "eye_shading": ("str", "clean", True),
     # fps
     "video_mode_refresh_rate": ("float", 60.0, True),
     # input
@@ -306,6 +316,8 @@ SETTINGS_SCHEMA = {
         "bind_settings": "F4",
         "bind_debug_overlay": "F3",
         "bind_console": "Backtick",
+        "bind_freecam": "F6",
+        "bind_photo_mode": "F8",
     }.items()},
     # game
     "user_language": ("int", 1, True),
@@ -441,27 +453,148 @@ def write_settings(new_values):
 
 # ------------------------------------------------------------------ patches
 
+def _logo_movie_files(enabled):
+    """The logo movies on disk, in every language folder under movies/ (en on
+    English discs, de, fr, ... on others), matched case-insensitively like
+    the guest filesystem: their .vp6 files, or the .vp6.disabled ones."""
+    movies = GAMEDATA / "movies"
+    if not movies.is_dir():
+        return []
+    suffix = ".vp6" if enabled else ".vp6.disabled"
+    names = {m + suffix for m in LOGO_MOVIES}
+    return [f for d in sorted(movies.iterdir()) if d.is_dir()
+            for f in sorted(d.iterdir()) if f.is_file() and f.name.lower() in names]
+
+
 def patch_skip_intro_state():
-    en = GAMEDATA / "movies" / "en"
-    if not en.is_dir():
+    present = _logo_movie_files(True)
+    disabled = _logo_movie_files(False)
+    if not present and not disabled:
         return "unavailable"
-    disabled = any((en / f"{m}.vp6.disabled").exists() for m in LOGO_MOVIES)
-    present = any((en / f"{m}.vp6").exists() for m in LOGO_MOVIES)
     return "on" if disabled and not present else "off"
 
 
 def patch_skip_intro(enable):
-    en = GAMEDATA / "movies" / "en"
-    if not en.is_dir():
+    if not (GAMEDATA / "movies").is_dir():
         return False, "game data not installed"
-    n = 0
-    for m in LOGO_MOVIES:
-        src = en / (f"{m}.vp6" if enable else f"{m}.vp6.disabled")
-        dst = en / (f"{m}.vp6.disabled" if enable else f"{m}.vp6")
-        if src.exists():
-            src.rename(dst)
-            n += 1
-    return True, f"{'skipped' if enable else 'restored'} {n} intro videos"
+    files = _logo_movie_files(enable)
+    for f in files:
+        f.rename(f.with_name(f.name + ".disabled") if enable
+                 else f.with_name(f.name[:-len(".disabled")]))
+    return True, f"{'skipped' if enable else 'restored'} {len(files)} intro videos"
+
+
+# Start episode (level select): the game starts a new game in the episode whose
+# block in gamedata/simpsons_gameflow.lua calls episode:SetDefault() (Land of
+# Chocolate). Moving that call makes new games start elsewhere; games in
+# progress keep their own progress. The untouched file is kept beside it as
+# simpsons_gameflow.lua.original while another episode is chosen.
+GAMEFLOW_LUA = "simpsons_gameflow.lua"
+EPISODE_NAMES = {
+    "SPR_HUB": "Springfield (hub)",
+    "LAND_OF_CHOCOLATE": "Land of Chocolate (original start)",
+    "BARTMAN_BEGINS": "Bartman Begins",
+    "EIGHTY_BITES": "Around the World in 80 Bites",
+    "TREEHUGGER": "Lisa the Tree Hugger",
+    "MOB_RULES": "Mob Rules",
+    "CHEATER": "Enter the Cheatrix",
+    "DOLPHINS": "Day of the Dolphins",
+    "COLOSSAL_DONUT": "The Colossal Donut",
+    "SPRINGFIELD_STOOD_STILL": "The Day the Earth Stood Stupid",
+    "BARGAIN_BIN": "Bargain Bin",
+    "GAME_HUB": "Video game world (hub)",
+    "NEVERQUEST": "NeverQuest",
+    "GRAND_THEFT_SCRATCHY": "Grand Theft Scratchy",
+    "MEDAL_OF_HOMER": "Medal of Homer",
+    "BIG_SUPER": "Big Super Happy Fun Fun Game",
+    "RHYMES_WITH_COMPLAINING": "Rhymes with Complaining",
+    "MEET_THY_PLAYER": "Meet Thy Player",
+}
+_EPISODE_RE = re.compile(r'^([ \t]*)episode\s*=\s*NewEpisode\(\s*game\s*,\s*"([A-Za-z0-9_]+)"', re.M)
+_SET_DEFAULT_RE = re.compile(r'^[ \t]*episode:SetDefault\(\)[^\r\n]*', re.M)
+
+
+def _gameflow_files():
+    """(the gameflow file, its .original backup) or (None, None)."""
+    lua = _find_ci(GAMEDATA, GAMEFLOW_LUA)
+    if lua is None:
+        return None, None
+    return lua, lua.with_name(lua.name + ".original")
+
+
+def _read_lua(path):
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        return f.read()
+
+
+def _episodes(text):
+    """[(episode id, offset of its block, end of its block)] in file order."""
+    found = list(_EPISODE_RE.finditer(text))
+    return [(m.group(2), m.start(), found[i + 1].start() if i + 1 < len(found) else len(text))
+            for i, m in enumerate(found)]
+
+
+def _start_episode_of(text):
+    """The episode whose block calls episode:SetDefault(), or None."""
+    for episode_id, start, end in _episodes(text):
+        if _SET_DEFAULT_RE.search(text, start, end):
+            return episode_id
+    return None
+
+
+def start_episode_state():
+    lua, _ = _gameflow_files()
+    if lua is None:
+        return "unavailable"
+    return _start_episode_of(_read_lua(lua)) or "unavailable"
+
+
+def start_episode_options():
+    lua, backup = _gameflow_files()
+    if lua is None:
+        return []
+    text = _read_lua(backup if backup.is_file() else lua)
+    return [{"id": e, "name": EPISODE_NAMES.get(e, e.replace("_", " ").title())}
+            for e, _, _ in _episodes(text)]
+
+
+def set_start_episode(episode_id):
+    lua, backup = _gameflow_files()
+    if lua is None:
+        return False, "game data not installed"
+    original = _read_lua(backup if backup.is_file() else lua)
+    episodes = {e: (start, end) for e, start, end in _episodes(original)}
+    original_start = _start_episode_of(original)
+    if episode_id not in episodes or original_start is None:
+        return False, f"unknown episode {episode_id!r}"
+    if len(_SET_DEFAULT_RE.findall(original)) != 1:
+        return False, "unexpected simpsons_gameflow.lua (expected one episode:SetDefault())"
+    name = EPISODE_NAMES.get(episode_id, episode_id)
+    if episode_id == original_start:
+        if backup.is_file():
+            tmp = lua.with_name(lua.name + ".tmp")
+            tmp.write_text(original, encoding="utf-8", newline="")
+            os.replace(tmp, lua)
+            backup.unlink()
+        return True, f"new games start in {name}"
+    newline = "\r\n" if "\r\n" in original else "\n"
+    # Comment out the original call, then add one to the chosen episode's
+    # block, right after its NewEpisode(...) line.
+    text = _SET_DEFAULT_RE.sub(
+        lambda m: m.group(0).replace("episode:SetDefault()", "-- episode:SetDefault()", 1)
+        + "  -- start episode moved by the launcher", original, count=1)
+    match = next(m for m in _EPISODE_RE.finditer(text) if m.group(2) == episode_id)
+    line_end = text.index(newline, match.end()) + len(newline)
+    text = (text[:line_end] + f"{match.group(1)}episode:SetDefault()  -- start episode chosen in the launcher"
+            + newline + text[line_end:])
+    if _start_episode_of(text) != episode_id or len(_SET_DEFAULT_RE.findall(text)) != 1:
+        return False, "could not move the start episode"
+    if not backup.is_file():
+        backup.write_text(original, encoding="utf-8", newline="")
+    tmp = lua.with_name(lua.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8", newline="")
+    os.replace(tmp, lua)
+    return True, f"new games start in {name}"
 
 
 def _toml_flag(key, default="false"):
@@ -493,6 +626,12 @@ def patches_list():
         {"id": "skip_intro", "name": "Skip intro logo videos",
          "desc": "Boots straight past the EA / Fox / Gracie logo movies.",
          "state": patch_skip_intro_state(), "available": patch_skip_intro_state() != "unavailable"},
+        {"id": "start_episode", "name": "Start episode (level select)",
+         "desc": "New games start in the chosen episode, skipping the ones before it. Games "
+                 "already in progress keep their progress. Takes effect the next time the game "
+                 "starts; choose Land of Chocolate to go back to the original game.",
+         "state": start_episode_state(), "available": start_episode_state() != "unavailable",
+         "options": start_episode_options()},
         {"id": "fps_unlock", "name": "60 FPS mode",
          "desc": "Runs the game at 60 Hz instead of the original 30. Set it in "
                  "Settings → FRAMERATE. Experimental: cutscenes/physics may misbehave.",
@@ -2056,6 +2195,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/patch":
             if body.get("id") == "skip_intro":
                 ok, msg = patch_skip_intro(bool(body.get("enable")))
+                return self._send(200, {"ok": ok, "msg": msg})
+            if body.get("id") == "start_episode":
+                ok, msg = set_start_episode(str(body.get("value", "")))
                 return self._send(200, {"ok": ok, "msg": msg})
             return self._send(404, {"ok": False, "msg": "unknown patch"})
         if path == "/api/diagnostics":

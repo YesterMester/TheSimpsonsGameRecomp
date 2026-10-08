@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
@@ -24,12 +26,50 @@
 #include <rex/platform.h>
 #include <SDL3/SDL.h>
 
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+// Diagnostics: every frame the game submits, raw (256 samples x 6 channels,
+// big-endian float, channel after channel), and in <file>.ts the
+// SDL_GetPerformanceCounter() of each, for measuring gaps without listening.
+REXCVAR_DEFINE_STRING(audio_dump_file, "", "Audio",
+                      "Append every submitted audio frame (raw 6 x 256 big-endian floats) to "
+                      "this file, and its timestamp to <file>.ts; empty = off");
 REXCVAR_DEFINE_BOOL(audio_log_underruns, false, "Audio",
                     "Log how many played frames were silence because no frame was queued, and how "
                     "many frames the game submitted were entirely silent (diagnostic)");
 
 namespace rex::audio::sdl {
+
+namespace {
+
+#if REX_PLATFORM_WIN32
+// Asks again for the finest system timer resolution, as the app does at
+// startup (RequestHighResolutionTimer in windowed_app_main_win.cpp).
+void RequestFinestTimerResolution() {
+  using NtQueryTimerResolutionFn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
+  using NtSetTimerResolutionFn = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  if (!ntdll) {
+    return;
+  }
+  auto query = reinterpret_cast<NtQueryTimerResolutionFn>(
+      reinterpret_cast<void*>(GetProcAddress(ntdll, "NtQueryTimerResolution")));
+  auto set = reinterpret_cast<NtSetTimerResolutionFn>(
+      reinterpret_cast<void*>(GetProcAddress(ntdll, "NtSetTimerResolution")));
+  ULONG coarsest = 0, finest = 0, current = 0;
+  if (!query || !set || query(&coarsest, &finest, &current) < 0) {
+    return;
+  }
+  if (set(finest, TRUE, &current) >= 0) {
+    REXLOG_INFO("Timer resolution: {:.2f} ms again after SDL audio init", current / 10000.0);
+  }
+}
+#endif
+
+}  // namespace
 
 SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
     : AudioDriver(memory), semaphore_(semaphore) {}
@@ -42,6 +82,15 @@ SDLAudioDriver::~SDLAudioDriver() {
 bool SDLAudioDriver::Initialize() {
   // Prevent SDL from interfering with timer resolution (causes FPS drops)
   SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "0", SDL_HINT_OVERRIDE);
+#if REX_PLATFORM_WIN32
+  // SDL applies the hint by ending the 1 ms period it began when it started,
+  // and timeEndPeriod withdraws the process's timer resolution request as a
+  // whole, the one the app made at startup included. From here on every sleep
+  // and plain waitable timer of the process ran at the default 15.6 ms: the
+  // game's 10 ms timers 64 times a second instead of 100, Sleep(1) 15.5 ms,
+  // 30 fps vblanks 31 or 47 ms apart. Ask for it again.
+  RequestFinestTimerResolution();
+#endif
 
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
@@ -145,6 +194,27 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
 
+  {
+    static std::FILE* dump = nullptr;
+    static std::FILE* dump_ts = nullptr;
+    static bool dump_opened = false;
+    if (!dump_opened) {
+      dump_opened = true;
+      const std::string path = REXCVAR_GET(audio_dump_file);
+      if (!path.empty()) {
+        dump = std::fopen(path.c_str(), "wb");
+        dump_ts = std::fopen((path + ".ts").c_str(), "wb");
+      }
+    }
+    if (dump && dump_ts) {
+      const uint64_t now = SDL_GetPerformanceCounter();
+      std::fwrite(input_frame, sizeof(float), frame_samples_, dump);
+      std::fwrite(&now, sizeof(now), 1, dump_ts);
+      std::fflush(dump);
+      std::fflush(dump_ts);
+    }
+  }
+
   bool log_underruns = REXCVAR_GET(audio_log_underruns);
   bool silent_frame = false;
   if (log_underruns) {
@@ -165,14 +235,19 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
     if (log_underruns) {
       diag_silent_submitted_frames_ += uint32_t(silent_frame);
+      diag_queue_sum_ += frames_queued_.size();
+      diag_queue_min_ = std::min<uint32_t>(diag_queue_min_, uint32_t(frames_queued_.size()));
       // About every 5 seconds, logged from the submitting thread rather than
       // the realtime audio callback.
       if (++diag_submitted_frames_ >= 960) {
         REXAPU_INFO(
             "[audio-diag] played {} frames: {} silence (nothing queued); submitted {}: {} all "
-            "zero; queued now {}",
+            "zero; queued now {}, avg {:.1f}, min {}",
             diag_played_frames_, diag_underrun_frames_, diag_submitted_frames_,
-            diag_silent_submitted_frames_, frames_queued_.size());
+            diag_silent_submitted_frames_, frames_queued_.size(),
+            double(diag_queue_sum_) / diag_submitted_frames_, diag_queue_min_);
+        diag_queue_sum_ = 0;
+        diag_queue_min_ = UINT32_MAX;
         diag_played_frames_ = 0;
         diag_underrun_frames_ = 0;
         diag_submitted_frames_ = 0;

@@ -9,7 +9,9 @@
 // which queries the global FunctionDispatcher across every loaded module.
 //=============================================================================
 
-#ifdef REXGLUE_ENABLE_PROFILING
+// Counting every indirect call costs an atomic increment on each one (about
+// 1% of a busy guest thread), so it is opt-in even in profiling builds.
+#if defined(REXGLUE_ENABLE_PROFILING) && defined(REXGLUE_PROFILE_INDIRECT_CALLS)
 #include <rex/perf/counter.h>
 #define REX_PROFILE_INDIRECT_DISPATCH() PROFILE_FUNCTION_DISPATCHED()
 #else

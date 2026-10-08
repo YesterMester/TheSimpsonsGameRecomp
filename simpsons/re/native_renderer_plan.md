@@ -360,3 +360,21 @@ instead of building a separate renderer next to it. Stages, in order:
 - The remaining campaign, unsupported GPU-written geometry, resolve formats,
   memory mirror and EDRAM fallbacks, Windows/D3D12 and proper 120 FPS/unlimited
   timing remain unfinished.
+
+### Campaign census (2026-10-08)
+
+- Every episode was started from a new game (the launcher's start-episode patch, applied to
+  a hard-linked copy of the game data) and played for about three minutes at 2x, logging
+  every resolve, render target transfer and vertex stream that leaves the native paths.
+  13 of the 18 episodes reached gameplay; Bartman Begins, Enter the Cheatrix, Bargain Bin,
+  Rhymes with Complaining and Meet Thy Player were still in their intro videos.
+- Every draw in every episode used native vertex streams. The only fallbacks were in The
+  Day the Earth Stood Stupid, once: a depth target with a different format (D24S8 instead
+  of D24FS8) appeared at EDRAM base 0, so the color target there took its data through
+  the EDRAM transfer, and the two front buffer resolves of that frame went through the
+  EDRAM emulation. No other episode used the EDRAM paths at all.
+- The census also showed that the shipped translated shader set had not been served since
+  the 2026-10-08 translator changes: its translator hash no longer matched, so about 95%
+  of the shaders were translated during play again (`aot_shaders=4 hit / 84 translated`).
+  The set is rebuilt from the union of every shader storage (the executable's shaders, the
+  player's cache and the census runs: 380 shaders, 508 recorded pipeline states).

@@ -54,8 +54,16 @@ if [ "$failed" -ne 0 ]; then
   exit 1
 fi
 
+# ThinLTO builds leave LLVM bitcode in the static libraries, which only lld
+# links: use the one next to the compiler or the repository's toolchain.
+LLD=$(dirname "$CXX")/ld.lld
+[ -x "$LLD" ] || LLD=$ROOT/tools/clang20/bin/ld.lld
+LD_PATH=""
+[ -x "$LLD" ] && LD_PATH="--ld-path=$LLD"
+
 # Let LD_LIBRARY_PATH select the runtime for A/B runs.
 LD_LIBRARY_PATH=$HOME/simpsons-build-shim${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
-  "$CXX" -o "$OUT" "$OBJ"/*.o -L"$SDK/out/linux-amd64" -lrexruntimerd "$SDK/out/linux-amd64/libsnappyrd.a" \
+  "$CXX" $LD_PATH -o "$OUT" "$OBJ"/*.o -L"$SDK/out/linux-amd64" -lrexruntimerd \
+  "$SDK/out/linux-amd64/libsnappyrd.a" \
   -Wl,-rpath,"$RPATH" -Wl,--enable-new-dtags -Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2
 echo "built $OUT (rpath $RPATH)"

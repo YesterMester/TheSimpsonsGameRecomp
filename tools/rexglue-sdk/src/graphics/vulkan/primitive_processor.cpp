@@ -22,6 +22,7 @@
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
 #include <rex/graphics/util/native_buffer_watch.h>
+#include <rex/graphics/util/bytes_equal.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -348,7 +349,7 @@ bool VulkanPrimitiveProcessor::TryRetainedNativeIndexBuffer(uint32_t address, ui
     if (found != native_index_cache_->entries.end()) {
       const NativeIndexCache::Entry& entry = found->second;
       if ((!entry.watch || !entry.watch->IsCurrent()) &&
-          std::memcmp(entry.bytes.data(), source, length)) {
+          !draw_util::BytesEqual(entry.bytes.data(), source, length)) {
         // Keep the old GPU version immutable while earlier draws use it.
         return false;
       }

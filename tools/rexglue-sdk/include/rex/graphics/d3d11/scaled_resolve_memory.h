@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <unordered_map>
 #include <rex/graphics/d3d11/draw_context.h>
 
 namespace rex::graphics::d3d11 {
@@ -26,6 +27,10 @@ class ScaledResolveMemory {
   struct Region {
     uint32_t end;
     Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;
+    // Views cover the remainder of this immutable allocation. Extending or
+    // merging storage starts a new cache; retained old views keep their data.
+    std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> read_views;
+    std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>> write_views;
   };
   Region* Find(uint32_t start, uint32_t length, uint32_t& first_byte, std::string& error);
   ui::d3d11::D3D11Device& device_;

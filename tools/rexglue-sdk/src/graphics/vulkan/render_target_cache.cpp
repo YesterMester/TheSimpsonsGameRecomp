@@ -5927,7 +5927,9 @@ bool VulkanRenderTargetCache::TryNativeSurfaceCopies(
         for (const auto& region : surface_regions) {
           VkImageCopy image_copy = {};
           image_copy.srcSubresource = {
-              dest_key.is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+              VkImageAspectFlags(dest_key.is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                   : VK_IMAGE_ASPECT_COLOR_BIT),
+              0, 0, 1};
           image_copy.dstSubresource = image_copy.srcSubresource;
           image_copy.srcOffset = {int32_t(region.source_x * scale_x),
                                   int32_t(region.source_y * scale_y), 0};

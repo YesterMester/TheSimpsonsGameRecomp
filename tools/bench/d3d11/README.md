@@ -14,6 +14,7 @@ python tools/bench/export_d3d11_helpers.py --output tools/bench/d3d11/out/helper
 tools/bench/d3d11/out/Release/dxbc_geometry.exe tools/bench/d3d11/out/geometry
 tools/bench/d3d11/out/Release/d3d11_check.exe --output d3d11-device.json
 tools/bench/d3d11/out/Release/jump_context_check.exe --output jump-context-windows.json
+tools/bench/d3d11/out/Release/bytes_equal_check.exe --output bytes-equal-windows.json
 tools/bench/d3d11/out/Release/d3d11_shader_check.exe --fl11-0 --geometry-directory tools/bench/d3d11/out/geometry --output d3d11-shaders.json
 tools/bench/d3d11/out/Release/d3d11_kernel_check.exe --fl11-0 --kernel-directory tools/bench/d3d11/out/helpers --output d3d11-helpers.json
 tools/bench/d3d11/out/Release/d3d11_kernel_check.exe --fl11-0 --kernel-directory tools/bench/d3d11/out/geometry --output d3d11-geometry.json
@@ -57,6 +58,15 @@ also queues immutable GPU-to-GPU copies before rewriting their source,
 forces a small cache budget, revisits pinned versions after eviction, and clears
 the cache before completion. Every output word is compared with its original CPU
 snapshot. Cache ownership and frame ownership are checked separately.
+Scaled resolve checks also retain read/write views, expand their allocations,
+evict cached views and verify that queued GPU versions remain independent.
+
+The byte comparison check needs no GPU. It compares an independent scalar
+reference with native buffer checks across aligned and unaligned ranges,
+mutations and protected page boundaries. Linux AVX2 and NoAVX2 builds each run
+774,242 comparisons. Compile `tools/bench/bytes_equal_check.cpp` with the SDK's
+`include` and `thirdparty/simde` include paths and `-march=x86-64-v3` or
+`-march=x86-64-v2` to check either path outside the Windows fixture project.
 
 The draw check executes the production draw context with alternating render
 targets, constants, retained 16/32-bit indices, independent mips and array slices,

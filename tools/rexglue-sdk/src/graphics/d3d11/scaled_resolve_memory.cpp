@@ -110,6 +110,9 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> ScaledResolveMemory::Read(
   auto* region = Find(start, length, first_byte, error);
   if (!region)
     return {};
+  uint32_t key = first_byte | (element_size_log2 - 2);
+  if (auto cached = region->read_views.find(key); cached != region->read_views.end())
+    return cached->second;
   D3D11_SHADER_RESOURCE_VIEW_DESC desc = {};
   desc.Format = kFormats[element_size_log2 - 2];
   desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
@@ -120,6 +123,9 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> ScaledResolveMemory::Read(
                                                         view.GetAddressOf()),
              "Native scaled resolve read view", error))
     return {};
+  if (region->read_views.size() >= 64)
+    region->read_views.clear();
+  region->read_views.emplace(key, view);
   return view;
 }
 
@@ -135,6 +141,9 @@ Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> ScaledResolveMemory::Write(
   auto* region = Find(start, length, first_byte, error);
   if (!region)
     return {};
+  uint32_t key = first_byte | (element_size_log2 - 2);
+  if (auto cached = region->write_views.find(key); cached != region->write_views.end())
+    return cached->second;
   D3D11_UNORDERED_ACCESS_VIEW_DESC desc = {};
   desc.Format = kFormats[element_size_log2 - 2];
   desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
@@ -145,6 +154,9 @@ Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> ScaledResolveMemory::Write(
                                                          view.GetAddressOf()),
              "Native scaled resolve write view", error))
     return {};
+  if (region->write_views.size() >= 64)
+    region->write_views.clear();
+  region->write_views.emplace(key, view);
   return view;
 }
 

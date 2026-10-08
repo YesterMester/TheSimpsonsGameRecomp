@@ -6,6 +6,7 @@ launcher installs the game from your own ISO.
 - Vertex and index data can use native GPU buffers instead of scanning and uploading the Xbox memory mirror for every draw. Unchanged buffers are retained; changed data gets a fresh immutable copy, and old copies stay alive until the GPU finishes with them.
 - Changing vertex data can reuse its latest immutable copy within a frame. Every reuse still checks the source bytes. This reduced vertex upload traffic by about 55% in the tested 2x Springfield scene.
 - Verified index bounds are retained with their exact buffer version instead of scanning the same indices again. Native texture uploads also bypass the full memory mirror for supported CPU textures.
+- Native buffer reuse checks compare bytes in batches on Windows and Linux, using wider AVX2 batches for larger ranges in the regular package. NoAVX2 builds keep their compatible path. Every source byte still has to match before a GPU buffer is reused.
 - The title and menus recover their 30 FPS target in the tested 2x scene. Renderer CPU time there fell from 45.4 ms to 17.7 ms after removing the vertex/index residency scans. This is a menu measurement; it does not establish the same gain throughout gameplay.
 - Matching render target transfers use GPU image copies. Native resolves can keep their results in their own GPU buffers, let texture reads use them directly, and update the memory mirror when something actually needs it. A partial CPU write preserves the untouched GPU-written pages.
 - Matching full color resolves copy into separate texture images. Image ownership stays stable across frames. Partial updates and forced memory reloads preserve channel order, including 10-bit color.
@@ -28,6 +29,7 @@ launcher installs the game from your own ISO.
 - Tested on a Steam Deck through Proton: the intro videos, menus, saves and Springfield at 1x and 2x, with movement, camera, pause and all presentation effects. It has not been tested on Windows drivers yet.
 - Performance in the tested Springfield scene on the Deck: about 55 FPS at 1x and 22 FPS at 2x, where 2x started at 13 FPS. At 2x it is limited by the GPU, because resolves still go through the Xbox memory layout; Vulkan resolves directly into textures. The title screen holds its 30 FPS.
 - Before this release, the work per frame was cut by uploading only the vertex data each draw reads, keeping state between draws instead of resetting it, updating constants in place, copying register blocks in bulk, writing depth and stencil in one pass and using the same depth settings as the other renderers.
+- Scaled resolve views are retained with their GPU allocation instead of being created again for each read or write. The cache is bounded; growing an allocation creates fresh views while earlier draws keep their original data.
 
 ### Audio
 

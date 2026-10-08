@@ -38,6 +38,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/vertex_index_bounds.h>
 #include <rex/graphics/util/native_buffer_watch.h>
+#include <rex/graphics/util/bytes_equal.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -3943,8 +3944,8 @@ VkDescriptorSet VulkanCommandProcessor::TryCachedNativeVertexStreams(
     for (auto it = matches.first; it != matches.second; ++it) {
       NativeVertexCache::Entry& entry = it->second;
       if (entry.ranges.size() != range_count || entry.bytes.size() != snapshot_size ||
-          (range_count &&
-           std::memcmp(entry.ranges.data(), ranges, range_count * sizeof(NativeVertexRange)))) {
+          (range_count && !draw_util::BytesEqual(entry.ranges.data(), ranges,
+                                                 range_count * sizeof(NativeVertexRange)))) {
         continue;
       }
       bool refresh = REXCVAR_GET(native_vertex_cache_refresh);
@@ -3953,8 +3954,9 @@ VkDescriptorSet VulkanCommandProcessor::TryCachedNativeVertexStreams(
         bool current = true;
         for (size_t i = 0; i < range_count; ++i) {
           const NativeVertexRange& range = ranges[i];
-          if (std::memcmp(entry.refreshed_bytes.data() + range.offset,
-                          memory_->TranslatePhysical<const void*>(range.address), range.size)) {
+          if (!draw_util::BytesEqual(entry.refreshed_bytes.data() + range.offset,
+                                     memory_->TranslatePhysical<const void*>(range.address),
+                                     range.size)) {
             current = false;
             break;
           }
@@ -3975,8 +3977,9 @@ VkDescriptorSet VulkanCommandProcessor::TryCachedNativeVertexStreams(
           // first next time; successful reuse still compares every range.
           size_t i = check == 0 ? first : check <= first ? check - 1 : check;
           const NativeVertexRange& range = ranges[i];
-          if (std::memcmp(entry.bytes.data() + range.offset,
-                          memory_->TranslatePhysical<const void*>(range.address), range.size)) {
+          if (!draw_util::BytesEqual(entry.bytes.data() + range.offset,
+                                     memory_->TranslatePhysical<const void*>(range.address),
+                                     range.size)) {
             entry.first_check_range = i;
             if (!refresh) {
               return VK_NULL_HANDLE;

@@ -1,9 +1,17 @@
 cmake_minimum_required(VERSION 3.25)
 project(d3d11_check LANGUAGES CXX)
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
 if(NOT WIN32)
     message(FATAL_ERROR "This check uses the native Windows Direct3D 11 runtime")
 endif()
 get_filename_component(REXGLUE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../rexglue-sdk" ABSOLUTE)
+
+add_executable(bytes_equal_check ../bytes_equal_check.cpp)
+target_compile_features(bytes_equal_check PRIVATE cxx_std_23)
+target_include_directories(bytes_equal_check PRIVATE
+    ${REXGLUE_ROOT}/include ${REXGLUE_ROOT}/thirdparty/simde)
 
 add_executable(jump_context_check ../jump_context_check.cpp)
 target_compile_features(jump_context_check PRIVATE cxx_std_23)

@@ -82,6 +82,8 @@ uint64_t CheckScaledStorage(D3D11Device& device) {
     std::string error;
     auto first = storage.Write(base + 0x3100, 0x1000, 2, error);
     Require(bool(first), error.c_str());
+    Require(storage.Write(base + 0x3100, 0x100, 2, error).Get() == first.Get(),
+            "An unchanged scaled write view was recreated");
     auto second = storage.Write(base + 0x7000, 0x2000, 2, error);
     Require(bool(second), error.c_str());
     const uint32_t a[4] = {0x1937FA21, 0x1937FA21, 0x1937FA21, 0x1937FA21};
@@ -99,6 +101,19 @@ uint64_t CheckScaledStorage(D3D11Device& device) {
             "Intersecting scaled ranges did not share preserved storage");
     auto inside = storage.Read(base + 0x3100, 0x1000, 4, error);
     Require(bool(inside), error.c_str());
+    Require(storage.Read(base + 0x3100, 0x100, 4, error).Get() == inside.Get(),
+            "An unchanged scaled read view was recreated");
+    auto replacement = storage.Write(base + 0x3100, 0x1000, 2, error);
+    Require(bool(replacement), error.c_str());
+    ComPtr<ID3D11Resource> replacement_resource;
+    replacement->GetResource(replacement_resource.GetAddressOf());
+    Require(replacement_resource.Get() != old_first.Get(),
+            "An expanded scaled allocation reused a stale cached view");
+    for (uint32_t i = 0; i < 80; ++i) {
+      Require(bool(storage.Read(base + 0x2000 + i * 16, 16, 2, error)), error.c_str());
+      Require(bool(storage.Write(base + 0x2000 + i * 16, 16, 2, error)), error.c_str());
+    }
+    // Evicting cached views must not invalidate retained views or GPU storage.
     D3D11_SHADER_RESOURCE_VIEW_DESC inside_desc = {};
     inside->GetDesc(&inside_desc);
     Require(inside_desc.Buffer.FirstElement == (0x1100 * scale_area) / 16,

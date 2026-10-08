@@ -297,30 +297,12 @@ renderer, as the release builds do. Without PySide6 the launcher opens in your w
 
 ## Contributing
 
-Contributions are welcome, from bug reports to fixes and new features.
+Contributions are welcome, from bug reports and testing to fixes and new features. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) for setup, coding guidelines, checks and pull requests, and
+please follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-**Before you start**
-
-- For anything larger than a small fix, open an issue first to discuss the approach.
-- Check the open issues and pull requests so work is not duplicated.
-
-**Pull requests**
-
-- Branch from `main` and open the pull request against `main`.
-- Keep each pull request to one change. Describe what it fixes or adds and how you tested it:
-  platform, GPU, and what you played.
-- The Build check workflow must pass. It builds the game on Linux and Windows for every pull
-  request.
-- Follow the style of the code around your change. The SDK includes a `.clang-format`.
-- To change how the game behaves, prefer overriding a recompiled function from `simpsons/src` over
-  editing files in `simpsons/generated`, which the recompiler produces.
-  `simpsons/src/frame_pacing.cpp` and `simpsons/src/subtitles.cpp` show how.
-- Launcher settings are stored in `simpsons.toml`. If you change a default, add an entry to
-  `SETTINGS_DEFAULT_MIGRATIONS` in `launcher/launcher.py` so existing configurations pick it up.
-- Never include game files, ISOs, extracted assets, or anything else derived from the game's data.
-
-By submitting a pull request, you agree that your contribution is licensed under the license of
-the part of the project it changes (see [License](#license)).
+See [Accessibility](ACCESSIBILITY.md) for current options, known barriers and how to report them.
+For security issues, follow the short [security policy](SECURITY.md) and report them privately.
 
 ## Reporting bugs
 

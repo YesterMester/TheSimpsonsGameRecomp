@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security issue privately
+    url: https://github.com/YesterMester/TheSimpsonsGameRecomp/security/advisories/new
+    about: Use GitHub private vulnerability reporting for security issues.
+  - name: Installation, controls and known issues
+    url: https://github.com/YesterMester/TheSimpsonsGameRecomp/blob/main/README.md
+    about: Read the setup instructions and known issues before opening a report.

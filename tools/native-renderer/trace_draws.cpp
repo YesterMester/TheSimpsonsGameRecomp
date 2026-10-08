@@ -139,6 +139,12 @@ int main(int argc, char** argv) {
       {reg::RB_DEPTH_INFO::register_index, "rb_depth_info"},
       {reg::PA_SU_SC_MODE_CNTL::register_index, "pa_su_sc_mode_cntl"},
       {reg::VGT_DRAW_INITIATOR::register_index, "vgt_draw_initiator"},
+      {0x2318, "rb_copy_control"},
+      {0x2319, "rb_copy_dest_base"},
+      {0x231A, "rb_copy_dest_pitch"},
+      {0x231B, "rb_copy_dest_info"},
+      {0x4908 + 16, "loop16"},
+      {0x4908 + 31, "loop31"},
   };
 
   // Memory pre-pass: a packet's memory reads are recorded after the packet
@@ -268,6 +274,22 @@ int main(int argc, char** argv) {
               std::snprintf(buf, sizeof(buf), ",\"%s\":\"%08X\"", r.name, regs[r.index]);
               draws_out << buf;
             }
+            // Texture fetch constants (type 2): slot and base address, to match
+            // resolve destinations against the textures later draws read.
+            draws_out << ",\"tex\":[";
+            bool first_tex = true;
+            for (uint32_t slot = 0; slot < 32; ++slot) {
+              uint32_t dword0 = regs[0x4800 + slot * 6];
+              uint32_t dword1 = regs[0x4800 + slot * 6 + 1];
+              if ((dword0 & 3) != 2) {
+                continue;
+              }
+              std::snprintf(buf, sizeof(buf), "%s[%u,\"%08X\",\"%08X\"]", first_tex ? "" : ",",
+                            slot, dword1 & 0xFFFFF000u, regs[0x4800 + slot * 6 + 2]);
+              draws_out << buf;
+              first_tex = false;
+            }
+            draws_out << "]";
             // The draw's own VGT_DRAW_INITIATOR (primitive type, index count)
             // travels in the packet: DRAW_INDX has the viz query dword first,
             // DRAW_INDX_2 starts with it.

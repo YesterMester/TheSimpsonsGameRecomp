@@ -305,9 +305,18 @@ void CheckFloat24Prepasses(D3D11Device& owner, ShaderCache& shaders, BufferCache
   auto readback = CreateTexture(owner, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
   auto* vertex = Program(shaders, R"(
 cbuffer values : register(b0) {float raster_depth; float stored_depth;};
-float4 main(uint id : SV_VertexID) : SV_Position {
+// Match the translated vertex signature required by the stock depth helper,
+// including its unused interpolators. The Windows debug layer checks them.
+struct Vertex {
+  float4 interpolators[16] : TEXCOORD0;
+  float3 point_parameters : TEXCOORD16;
+  float4 position : SV_Position;
+};
+Vertex main(uint id : SV_VertexID) {
   float2 p = id==0 ? float2(-1,-1) : id==1 ? float2(-1,3) : float2(3,-1);
-  return float4(p,raster_depth,1);
+  Vertex result = (Vertex)0;
+  result.position = float4(p,raster_depth,1);
+  return result;
 })",
                          "vs_5_1");
   auto* pixel = Program(shaders, R"(

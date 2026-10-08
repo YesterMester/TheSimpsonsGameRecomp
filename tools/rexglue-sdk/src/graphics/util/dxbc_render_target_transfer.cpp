@@ -736,6 +736,11 @@ bool DxbcRenderTargetTransferShader::Create(TransferShaderKey key, const Options
                       kTransferCBVRegisterHostDepthAddress, kTransferCBVRegisterHostDepthAddress),
         1);
   }
+  auto sample_count = [&](xenos::MsaaSamples samples) -> uint32_t {
+    return samples == xenos::MsaaSamples::k1X
+               ? 0
+               : (samples == xenos::MsaaSamples::k2X && options.msaa_2x_supported ? 2 : 4);
+  };
   if (srv_index_color != UINT32_MAX) {
     a.OpDclResource(
         key.source_msaa_samples != xenos::MsaaSamples::k1X ? dxbc::ResourceDimension::kTexture2DMS
@@ -743,7 +748,8 @@ bool DxbcRenderTargetTransferShader::Create(TransferShaderKey key, const Options
         dxbc::ResourceReturnTypeX4Token(source_color_is_uint ? dxbc::ResourceReturnType::kUInt
                                                              : dxbc::ResourceReturnType::kFloat),
         dxbc::Src::T(dxbc::Src::Dcl, srv_index_color, kTransferSRVRegisterColor,
-                     kTransferSRVRegisterColor));
+                     kTransferSRVRegisterColor),
+        0, sample_count(key.source_msaa_samples));
   }
   if (srv_index_depth != UINT32_MAX) {
     a.OpDclResource(key.source_msaa_samples != xenos::MsaaSamples::k1X
@@ -751,7 +757,8 @@ bool DxbcRenderTargetTransferShader::Create(TransferShaderKey key, const Options
                         : dxbc::ResourceDimension::kTexture2D,
                     dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kFloat),
                     dxbc::Src::T(dxbc::Src::Dcl, srv_index_depth, kTransferSRVRegisterDepth,
-                                 kTransferSRVRegisterDepth));
+                                 kTransferSRVRegisterDepth),
+                    0, sample_count(key.source_msaa_samples));
   }
   if (srv_index_stencil != UINT32_MAX) {
     a.OpDclResource(key.source_msaa_samples != xenos::MsaaSamples::k1X
@@ -759,17 +766,20 @@ bool DxbcRenderTargetTransferShader::Create(TransferShaderKey key, const Options
                         : dxbc::ResourceDimension::kTexture2D,
                     dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
                     dxbc::Src::T(dxbc::Src::Dcl, srv_index_stencil, kTransferSRVRegisterStencil,
-                                 kTransferSRVRegisterStencil));
+                                 kTransferSRVRegisterStencil),
+                    0, sample_count(key.source_msaa_samples));
   }
   if (srv_index_host_depth != UINT32_MAX) {
-    a.OpDclResource(key.host_depth_source_is_copy
-                        ? dxbc::ResourceDimension::kBuffer
-                        : (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X
-                               ? dxbc::ResourceDimension::kTexture2DMS
-                               : dxbc::ResourceDimension::kTexture2D),
-                    dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kFloat),
-                    dxbc::Src::T(dxbc::Src::Dcl, srv_index_host_depth,
-                                 kTransferSRVRegisterHostDepth, kTransferSRVRegisterHostDepth));
+    a.OpDclResource(
+        key.host_depth_source_is_copy
+            ? dxbc::ResourceDimension::kBuffer
+            : (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X
+                   ? dxbc::ResourceDimension::kTexture2DMS
+                   : dxbc::ResourceDimension::kTexture2D),
+        dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kFloat),
+        dxbc::Src::T(dxbc::Src::Dcl, srv_index_host_depth, kTransferSRVRegisterHostDepth,
+                     kTransferSRVRegisterHostDepth),
+        0, key.host_depth_source_is_copy ? 0 : sample_count(key.host_depth_source_msaa_samples));
   }
   a.OpDclInputPSSIV(dxbc::InterpolationMode::kLinearNoPerspective,
                     dxbc::Dest::V1D(kInputRegisterPosition, 0b0011), dxbc::Name::kPosition);

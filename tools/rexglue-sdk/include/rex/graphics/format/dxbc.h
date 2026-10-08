@@ -1906,11 +1906,12 @@ class Assembler {
     ++stat_.uint_instruction_count;
   }
   void OpDclResource(ResourceDimension dimension, uint32_t return_type_token, const Src& operand,
-                     uint32_t space = 0) {
+                     uint32_t space = 0, uint32_t sample_count = 0) {
+    assert_true(sample_count <= 127);
     uint32_t operands_length = operand.GetLength(0b1111, false);
     code_.reserve(code_.size() + 3 + operands_length);
     code_.push_back(OpcodeToken(Opcode::kDclResource, 2 + operands_length) |
-                    (uint32_t(dimension) << 11));
+                    (uint32_t(dimension) << 11) | (sample_count << 16));
     operand.Write(code_, false, 0b1111, false, true);
     code_.push_back(return_type_token);
     code_.push_back(space);

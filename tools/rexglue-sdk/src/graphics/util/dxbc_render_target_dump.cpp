@@ -351,16 +351,22 @@ bool DxbcRenderTargetDumpShader::Create(Key key, const Options& options,
   dxbc::ResourceDimension source_dimension = key.msaa_samples != xenos::MsaaSamples::k1X
                                                  ? dxbc::ResourceDimension::kTexture2DMS
                                                  : dxbc::ResourceDimension::kTexture2D;
+  // Include the bound texture's sample count in the SM 5.0 declaration used
+  // by D3D11, including guest 2x textures backed by four host samples.
+  const uint32_t source_sample_count =
+      key.msaa_samples == xenos::MsaaSamples::k1X
+          ? 0
+          : (key.msaa_samples == xenos::MsaaSamples::k2X && options.msaa_2x_supported ? 2 : 4);
   a.OpDclResource(
       source_dimension,
       dxbc::ResourceReturnTypeX4Token(source_is_uint ? dxbc::ResourceReturnType::kUInt
                                                      : dxbc::ResourceReturnType::kFloat),
-      dxbc::Src::T(dxbc::Src::Dcl, 0, 0, 0));
+      dxbc::Src::T(dxbc::Src::Dcl, 0, 0, 0), 0, source_sample_count);
   // Source stencil texture.
   if (key.is_depth) {
     a.OpDclResource(source_dimension,
                     dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
-                    dxbc::Src::T(dxbc::Src::Dcl, 1, 1, 1));
+                    dxbc::Src::T(dxbc::Src::Dcl, 1, 1, 1), 0, source_sample_count);
   }
   // EDRAM buffer.
   a.OpDclUnorderedAccessViewTyped(dxbc::ResourceDimension::kBuffer, 0,

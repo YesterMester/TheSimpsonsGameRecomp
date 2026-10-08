@@ -37,6 +37,7 @@ struct Result {
   uint32_t surfaces = 0, clears = 0, transfers = 0, snapshots = 0, rejected = 0;
   uint32_t encodes = 0, stencil_reference_transfers = 0;
 };
+void CheckDebugMessages(D3D11Device& owner);
 struct Fixture {
   D3D11Device& device;
   DrawContext draws;
@@ -412,6 +413,11 @@ struct Fixture {
                     source.description().guest_format, unsigned(source.description().depth),
                     unsigned(source.description().samples), scale, unsigned(native_2x),
                     static_cast<unsigned long long>(mismatch), value, expected[mismatch]);
+      try {
+        CheckDebugMessages(device);
+      } catch (const std::exception& debug_error) {
+        throw std::runtime_error(std::string(message) + ": " + debug_error.what());
+      }
       throw std::runtime_error(message);
     }
     result.encoded_words += 4 * tile_words;

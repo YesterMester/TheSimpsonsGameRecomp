@@ -377,6 +377,11 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
+  // The descriptor keeps the object alive and every view maps it, so the name
+  // is no longer needed. Without it, a crashed or killed process cannot leave
+  // the file in /dev/shm, where each copy kept the memory the game had used
+  // until a reboot, and once it was full the next start died of SIGBUS.
+  shm_unlink(full_path.c_str());
   return static_cast<FileMappingHandle>(ret);
 #endif
 }

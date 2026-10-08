@@ -500,8 +500,8 @@ float4 main() : SV_Target { return color; }
   Require(!context.Draw(command, error), "Out-of-bounds retained indices accepted");
   ++results.hazards;
   command.first = 0;
-  auto small = CreateTexture(owner, width / 2, height / 2, DXGI_FORMAT_R8G8B8A8_UNORM);
-  std::array<ID3D11RenderTargetView*, 2> mismatched = {color.rtv.Get(), small.rtv.Get()};
+  auto smaller_target = CreateTexture(owner, width / 2, height / 2, DXGI_FORMAT_R8G8B8A8_UNORM);
+  std::array<ID3D11RenderTargetView*, 2> mismatched = {color.rtv.Get(), smaller_target.rtv.Get()};
   command.render_targets = mismatched;
   Require(!context.Draw(command, error), "Mismatched render target dimensions accepted");
   ++results.hazards;

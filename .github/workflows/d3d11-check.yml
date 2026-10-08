@@ -13,6 +13,7 @@ on:
       - 'tools/bench/bytes_equal_check.cpp'
       - 'tools/rexglue-sdk/include/rex/graphics/util/bytes_equal.h'
       - 'simpsons/generated/default/simpsons_init.h'
+      - 'simpsons/src/guest_jump.h'
       - 'tools/bench/d3d11_check.cpp'
       - 'tools/bench/d3d11_shader_check.cpp'
       - 'tools/bench/d3d11_kernel_check.cpp'
@@ -54,6 +55,8 @@ jobs:
         run: tools/bench/d3d11/out/Release/jump_context_check.exe --output jump-context-windows.json
       - name: Check native buffer byte comparisons and protected boundaries
         run: tools/bench/d3d11/out/Release/bytes_equal_check.exe --output bytes-equal-windows.json
+      - name: Check AVX2 native buffer byte comparisons and protected boundaries
+        run: tools/bench/d3d11/out/Release/bytes_equal_avx2_check.exe --output bytes-equal-avx2-windows.json
       - name: Export renderer helper and primitive shaders
         run: |
           python tools/bench/export_d3d11_helpers.py --output tools/bench/d3d11/out/helpers
@@ -90,6 +93,7 @@ jobs:
             d3d11-warp.json
             jump-context-windows.json
             bytes-equal-windows.json
+            bytes-equal-avx2-windows.json
             d3d11-shaders-warp.json
             d3d11-shaders-fl11-0.json
             d3d11-helpers-fl11-0.json

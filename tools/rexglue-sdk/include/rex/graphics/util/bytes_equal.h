@@ -19,13 +19,16 @@
 
 namespace rex::graphics::draw_util {
 
-// Compares two byte ranges for equality 64 bytes at a time. Per-draw checks of
-// unchanged data compare a lot of memory; some C runtimes, including Wine's,
-// implement memcmp one byte at a time.
+// Per-draw checks of unchanged data compare a lot of memory. Use the optimized
+// host implementation on Linux; Windows also runs through Wine, where memcmp
+// may compare one byte at a time, so use explicit SIMD batches there.
 inline bool BytesEqual(const void* a, const void* b, size_t size) {
   if (a == b || !size) {
     return true;
   }
+#if !defined(_WIN32)
+  return std::memcmp(a, b, size) == 0;
+#else
   const auto* x = static_cast<const uint8_t*>(a);
   const auto* y = static_cast<const uint8_t*>(b);
   size_t i = 0;
@@ -70,6 +73,7 @@ inline bool BytesEqual(const void* a, const void* b, size_t size) {
     }
   }
   return !std::memcmp(x + i, y + i, size - i);
+#endif
 }
 
 }  // namespace rex::graphics::draw_util

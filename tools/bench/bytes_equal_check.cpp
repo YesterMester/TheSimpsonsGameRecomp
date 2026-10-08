@@ -121,7 +121,9 @@ int main(int argc, char** argv) {
         throw std::runtime_error("usage: bytes_equal_check [--output report.json]");
     }
     uint64_t comparisons = Check();
-#if defined(__AVX2__)
+#if !defined(_WIN32)
+    const char* path = "host memcmp";
+#elif defined(__AVX2__)
     const char* path = "AVX2";
 #else
     const char* path = "baseline";

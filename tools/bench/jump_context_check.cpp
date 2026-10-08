@@ -1,9 +1,11 @@
-#include "../../simpsons/generated/default/simpsons_init.h"
+#include "../../simpsons/src/guest_jump.h"
 
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <fstream>
+#include <string>
+#include <string_view>
 #include <thread>
 
 namespace {

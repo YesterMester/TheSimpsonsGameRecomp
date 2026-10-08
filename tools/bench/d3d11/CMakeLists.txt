@@ -13,15 +13,18 @@ target_compile_features(bytes_equal_check PRIVATE cxx_std_23)
 target_include_directories(bytes_equal_check PRIVATE
     ${REXGLUE_ROOT}/include ${REXGLUE_ROOT}/thirdparty/simde)
 
+add_executable(bytes_equal_avx2_check ../bytes_equal_check.cpp)
+target_compile_features(bytes_equal_avx2_check PRIVATE cxx_std_23)
+target_include_directories(bytes_equal_avx2_check PRIVATE
+    ${REXGLUE_ROOT}/include ${REXGLUE_ROOT}/thirdparty/simde)
+if(MSVC)
+    target_compile_options(bytes_equal_avx2_check PRIVATE /arch:AVX2)
+else()
+    target_compile_options(bytes_equal_avx2_check PRIVATE -mavx2)
+endif()
+
 add_executable(jump_context_check ../jump_context_check.cpp)
 target_compile_features(jump_context_check PRIVATE cxx_std_23)
-target_include_directories(jump_context_check PRIVATE
-    ${REXGLUE_ROOT}/include ${REXGLUE_ROOT}/thirdparty/simde
-    ${REXGLUE_ROOT}/thirdparty/fmt/include ${REXGLUE_ROOT}/thirdparty/spdlog/include)
-if(MINGW AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(jump_context_check PRIVATE
-        -include ${CMAKE_CURRENT_SOURCE_DIR}/chrono_compat.h)
-endif()
 
 add_executable(d3d11_resolve_check
     ../d3d11_resolve_check.cpp

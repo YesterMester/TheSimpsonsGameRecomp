@@ -451,7 +451,7 @@ ID3D11GeometryShader* DrawContext::DiscardShader(const ShaderProgram& source, st
   // with no buffers bound. Reflect one existing component so this works with
   // vertex, domain and geometry signatures without inventing a semantic.
   ComPtr<ID3D11ShaderReflection> reflection;
-  HRESULT reflected = D3DReflect(bytes.data(), bytes.size(), __uuidof(ID3D11ShaderReflection),
+  HRESULT reflected = D3DReflect(bytes.data(), bytes.size(), IID_ID3D11ShaderReflection,
                                  reinterpret_cast<void**>(reflection.GetAddressOf()));
   D3D11_SHADER_DESC description = {};
   D3D11_SIGNATURE_PARAMETER_DESC output = {};

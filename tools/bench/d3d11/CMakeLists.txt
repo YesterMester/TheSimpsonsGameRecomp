@@ -112,7 +112,7 @@ add_executable(d3d11_texture_upload_check
 target_compile_features(d3d11_texture_upload_check PRIVATE cxx_std_23)
 target_include_directories(d3d11_texture_upload_check PRIVATE ${REXGLUE_ROOT}/thirdparty/xxHash
     ${REXGLUE_ROOT}/thirdparty/simde ${REXGLUE_ROOT}/include)
-target_link_libraries(d3d11_texture_upload_check PRIVATE d3d11 dxgi d3dcompiler)
+target_link_libraries(d3d11_texture_upload_check PRIVATE d3d11 dxgi d3dcompiler dxguid)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(d3d11_texture_upload_check PRIVATE -Wall -Wextra -Werror)
 endif()
@@ -295,7 +295,7 @@ add_executable(d3d11_buffer_check
 target_compile_features(d3d11_buffer_check PRIVATE cxx_std_23)
 target_include_directories(d3d11_buffer_check PRIVATE ${REXGLUE_ROOT}/thirdparty/xxHash
     ${REXGLUE_ROOT}/thirdparty/simde ${REXGLUE_ROOT}/include)
-target_link_libraries(d3d11_buffer_check PRIVATE d3d11 dxgi d3dcompiler)
+target_link_libraries(d3d11_buffer_check PRIVATE d3d11 dxgi d3dcompiler dxguid)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(d3d11_buffer_check PRIVATE -Wall -Wextra -Werror)
 endif()

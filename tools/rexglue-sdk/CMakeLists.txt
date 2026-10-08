@@ -141,11 +141,17 @@ add_compile_options(
 )
 
 if(REXGLUE_ENABLE_LTO)
-    if(WIN32)
-        message(WARNING "REXGLUE_ENABLE_LTO: not wired up for Windows/MSVC yet, ignoring")
-    else()
+    if(NOT WIN32)
         add_compile_options(-flto=thin)
         add_link_options(-flto=thin -fuse-ld=lld)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
+           CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+        # On Windows, clang's GNU-style driver already links with lld-link,
+        # and CMake archives with llvm-ar, which indexes bitcode members.
+        add_compile_options(-flto=thin)
+        add_link_options(-flto=thin)
+    else()
+        message(WARNING "REXGLUE_ENABLE_LTO: needs clang's GNU-style driver on Windows, ignoring")
     endif()
 endif()
 

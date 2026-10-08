@@ -48,6 +48,11 @@ function(rexglue_apply_target_settings target_name)
     if(REXGLUE_ENABLE_LTO AND NOT WIN32)
         target_compile_options(${target_name} PRIVATE -flto=thin)
         target_link_options(${target_name} PRIVATE -flto=thin -fuse-ld=lld)
+    elseif(REXGLUE_ENABLE_LTO AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
+           CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+        # Windows: clang's GNU-style driver links with lld-link already.
+        target_compile_options(${target_name} PRIVATE -flto=thin)
+        target_link_options(${target_name} PRIVATE -flto=thin)
     endif()
 endfunction()
 

@@ -37,6 +37,22 @@ class PortableDxbcAssembler : public dxbc::Assembler {
     OpMov(quotient, dxbc::Src::R(scratch_base_));
     OpMov(remainder, dxbc::Src::R(scratch_base_ + 1));
   }
+  void OpLdMS(const dxbc::Dest& dest, const dxbc::Src& address, uint32_t address_mask,
+              const dxbc::Src& resource, const dxbc::Src& sample_index, int32_t aoffimmi_u = 0,
+              int32_t aoffimmi_v = 0) {
+    if (!portable_) {
+      dxbc::Assembler::OpLdMS(dest, address, address_mask, resource, sample_index, aoffimmi_u,
+                              aoffimmi_v);
+      return;
+    }
+    // These helpers read non-array Texture2DMS views. Match FXC's SM 5.0
+    // address with zero in both unused components instead of repeating X.
+    assert_true(address_mask == 0b0011);
+    OpMov(dxbc::Dest::R(scratch_base_, 0b0011), address);
+    OpMov(dxbc::Dest::R(scratch_base_, 0b1100), dxbc::Src::LU(0));
+    dxbc::Assembler::OpLdMS(dest, dxbc::Src::R(scratch_base_), 0b1111, resource, sample_index,
+                            aoffimmi_u, aoffimmi_v);
+  }
 
  private:
   bool portable_;

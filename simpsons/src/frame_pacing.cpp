@@ -145,6 +145,10 @@ std::atomic<int64_t> g_last_level_step_ns{0};
 bool g_in_menu = true;
 // The clock's running flag (sub_826917A0).
 constexpr uint32_t kClockRunning = 0x82CED760;
+// The game's refresh rate (float, 59.94) and its timebase scale (float,
+// milliseconds per tick).
+constexpr uint32_t kRefreshHz = 0x82CF0394;
+constexpr uint32_t kMsPerTick = 0x82D61D58;
 // The game clock's frame time: scaled, raw (seconds) and in milliseconds.
 constexpr uint32_t kFrameDt = 0x82CED748;
 constexpr uint32_t kRawFrameDt = 0x82CED744;
@@ -182,6 +186,7 @@ int64_t NowNs() {
       .count();
 }
 
+using simpsons::LoadGuestFloat;
 using simpsons::LoadGuestU32;
 using simpsons::StoreGuestU32;
 
@@ -222,12 +227,33 @@ REX_FUNC(sub_82453EB0) {
 }
 
 REX_FUNC(sub_826B7B70) {
-  if (!FractionalVblanks()) {
-    __imp__sub_826B7B70(ctx, base);
-    return;
-  }
   if (!LoadGuestU32(base, kClockRunning)) {
     return;
+  }
+  if (!FractionalVblanks()) {
+    // The game's own deadline, computed as it does: r4 periods of its refresh
+    // rate after r3, in milliseconds by its timebase scale. It yielded until a
+    // millisecond before and then spun, keeping a core busy for whatever was
+    // left of every frame; on the Steam Deck the CPU shares its power with the
+    // GPU. Sleep instead, and only yield for the last 2 ms.
+    const uint32_t start = ctx.r3.u32;
+    const float target_ms =
+        float(ctx.r4.u32) / LoadGuestFloat(base, kRefreshHz) * 1000.0f;
+    const float ms_per_tick = LoadGuestFloat(base, kMsPerTick);
+    for (;;) {
+      const uint32_t elapsed = uint32_t(rex::chrono::Clock::QueryGuestTickCount()) - start;
+      const float elapsed_ms = float(double(elapsed)) * ms_per_tick;
+      if (!(elapsed_ms < target_ms)) {
+        return;
+      }
+      const float remaining_ms = target_ms - elapsed_ms;
+      if (remaining_ms > 2.0f) {
+        std::this_thread::sleep_for(
+            std::chrono::duration<double, std::milli>(double(remaining_ms) - 2.0));
+      } else {
+        std::this_thread::yield();
+      }
+    }
   }
   const uint64_t period = FramePeriodTicks();
   if (!period) {

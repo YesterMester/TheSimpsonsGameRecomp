@@ -53,8 +53,8 @@ The game boots, plays its videos, saves and loads, and runs its levels. See
   Direct3D 12 support. Choose it in the launcher's settings.
 - Audio fixes for late mixer wakeups and concurrent decoder updates, with native audio thread
   scheduling to keep the mixer running under load, on Linux and Windows.
-- 60 FPS gameplay, with menus, the title screen and loading screens kept at the original 30 FPS so
-  they run at the speed they were made for.
+- 60 FPS gameplay by default, and higher or unlimited frame rates with the game clock, physics,
+  UI animations and menus kept at the speed they were made for.
 - Render resolution scaling (supersampling), anisotropic filtering and FXAA.
 - Free camera and photo mode, with controller and keyboard controls, zoom and HUD hiding.
 - Original, soft or disabled ink outlines, custom outline colours and cleaner character eyes.
@@ -124,11 +124,18 @@ Saves and the shader cache are stored in:
 |---|---|
 | `~/.local/share/simpsons` | `%LOCALAPPDATA%\simpsons` |
 
-**Frame rate.** 60 is the default and the recommended setting. 30 matches the original console
-exactly. The game's frame scheduler cannot go above 60 FPS, so the 90 and 120 settings do not add
-frames; they make frame pacing less even. Menus and loading screens run at 30 FPS regardless,
-because the game runs their logic once per frame (`menu_frame_rate` in `simpsons.toml`, 0 turns
-this off).
+**Frame rate.** The launcher's *Frame rate in levels* setting (`frame_rate` in `simpsons.toml`)
+offers 30, 60 (the default), 90, 120, 144, 165, 240 and Unlimited (0). 30 matches the original
+console exactly. At 60 and 30 the game paces frames with its own vblank timing. At other rates
+each frame is measured precisely, so game time follows real time, and Havok physics keeps
+stepping 1/60 s, 60 times a second, as at 60. Choose your display's refresh rate: a fixed-refresh
+display never shows the extra frames, and with Unlimited they are dropped unevenly, which makes
+motion and thin distant outlines shimmer. Menus, the title screen, loading screens and the pause
+menu were made for 30 FPS and count their logic in frames (held directions repeat every few
+frames, for example), so by default they run at 30 (*Frame rate in menus*, `menu_frame_rate`).
+Set to the level rate (0), they are drawn at that rate while their logic keeps its 30 FPS pace.
+Their animations play at their authored rate either way, and videos keep their own timing at any
+frame rate.
 
 **Image quality.** FXAA anti-aliasing is on by default for new installs and smooths the
 cel-shading outlines at little cost. A render scale of 2x or 3x supersamples the whole image, which
@@ -209,9 +216,10 @@ starting every episode this way has not been checked through a full play-through
 
 **Game timing.** `physics_step` selects Steady (the default), Legacy (the previous 60 FPS fix)
 or Original (the console code). Steady uses the game clock's frame time instead of its smoothed
-copy, avoiding the extra 8.3 ms Havok steps at 60 FPS. `tick_count_precise` reads the millisecond
-clock directly so delayed background timer updates cannot distort the game's frame time.
-Both settings require a restart. These fixes do not unlock rendering above 60 FPS.
+copy, avoiding the extra 8.3 ms Havok steps at 60 FPS, and at rates other than 60 and 30 takes
+every step at 1/59.94 s. `tick_count_precise` reads the millisecond clock directly so delayed
+background timer updates cannot distort the game's frame time. Both settings require a restart.
+`physics_log` also reports how the frames the game clock counted compare with real time.
 
 **Diagnostics.** `audio_log_underruns` also reports callback rate, callback time, wait lateness
 and queue depth. `audio_dump_file` writes submitted six-channel, 256-sample big-endian float
@@ -222,11 +230,12 @@ arming rates and intervals to the existing timer diagnostics.
 
 ## Known issues
 
-- At 60 FPS some scripted sequences can misbehave, because the game was built for 30 FPS.
+- Above 30 FPS some scripted sequences can misbehave, because the game was built for 30 FPS.
   Random deaths in "Lisa the Tree Hugger" were reported in
   [#2](https://github.com/YesterMester/TheSimpsonsGameRecomp/issues/2). The fork's author reported
-  completing the affected section at 60 FPS with the timing fixes, but the whole campaign still
-  needs testing; switch to 30 if it happens.
+  completing the affected section at 60 FPS with the timing fixes. Physics steps the same way at
+  every rate above 30, but the whole campaign still needs testing at 60 and above; switch to 30 if
+  it happens.
 - If videos show a black screen on Windows, switch the graphics backend to Vulkan in the
   launcher's settings.
 - The Direct3D 11 renderer is experimental. It has been tested through Proton on a Steam Deck,
@@ -350,8 +359,10 @@ The goal is for this to be the best way to play the game. In rough order:
   coverage and validation. A native renderer is also what the features below build on.
 - **No slowdowns or stutters.** A steady 60 FPS everywhere, including at 2x internal resolution
   on the Steam Deck, with no shader compilation hitches.
-- **Higher frame rates.** Proper 120 FPS and unlimited rendering, with game logic, physics,
-  scripted sequences and audio kept at the right speed.
+- **Higher frame rates.** 90, 120, 144, 165, 240 and unlimited frame rates are available, with
+  the game clock, physics, UI and menus kept at the right speed. Next: the CPU and
+  GPU work to reach them (on the Steam Deck, Springfield runs at about 85 FPS at 1x and 70 FPS at
+  2x unlimited), and checking scripted sequences across the campaign.
 - **Direct3D 11.** A native Windows 10/11 renderer for older GPUs, experimental since 0.0.6.4.
   Next: resolve directly into native textures as the Vulkan renderer does (the round trip through
   the Xbox memory layout is what slows it at higher render scales), and testing on Windows

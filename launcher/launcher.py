@@ -178,6 +178,12 @@ SETTINGS_END = "# <<< LAUNCHER SETTINGS <<<"
 DERIVED_KEYS = ("vulkan_allow_present_mode_immediate",
                 "vulkan_allow_present_mode_fifo_relaxed")
 
+# Keys earlier launchers wrote that are no longer settings. The frame rate
+# setting used to change the guest's video refresh rate, which never added
+# frames above 60; read_settings() turns it into frame_rate once, and writing
+# the settings removes it, so the game's video mode is 60 Hz again.
+LEGACY_KEYS = ("video_mode_refresh_rate",)
+
 # Bumped whenever a shipped default changes; written as a TOML comment so the
 # engine's config parser ignores it. Each migration entry drops a stored value
 # once, but only if it still equals the default it is superseding - a player
@@ -273,8 +279,10 @@ SETTINGS_SCHEMA = {
     # artists' no-rim-shadow flag with a tolerance, "original" keeps the
     # speckled shadow of the Xbox 360 game. Patched when the game loads.
     "eye_shading": ("str", "clean", True),
-    # fps
-    "video_mode_refresh_rate": ("float", 60.0, True),
+    # Frame rate in levels (0 = unlimited) and in menus (30 as made, 0 = the
+    # same as in levels); simpsons/src/frame_pacing.cpp.
+    "frame_rate": ("int", 60, True),
+    "menu_frame_rate": ("int", 30, True),
     # input
     "mnk_mode": ("bool", False, True),
     "mnk_sensitivity": ("float", 1.0, False),
@@ -407,6 +415,7 @@ def read_settings():
         return values
     stored = {}
     file_version = 0
+    legacy_refresh = None
     for line in GAME_TOML.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if s.startswith(SETTINGS_VERSION_MARKER):
@@ -423,6 +432,11 @@ def read_settings():
                     stored[key] = _parse(raw, SETTINGS_SCHEMA[key][0])
                 except ValueError:
                     pass
+            elif key == "video_mode_refresh_rate":
+                try:
+                    legacy_refresh = round(_parse(raw, "float"))
+                except ValueError:
+                    pass
     # Settings written before a default changed are pinned to the old value,
     # so a new default would never reach anyone who has already run the
     # launcher. Drop only the specific stale keys, once, rather than resetting
@@ -430,6 +444,10 @@ def read_settings():
     for version, key, superseded_default in SETTINGS_DEFAULT_MIGRATIONS:
         if file_version < version and stored.get(key) == superseded_default:
             stored.pop(key, None)
+    # The old frame rate choice (30, 60, 90 or 120 as the video refresh rate)
+    # carries over to the frame rate setting.
+    if legacy_refresh is not None and "frame_rate" not in stored and 10 <= legacy_refresh <= 1000:
+        stored["frame_rate"] = int(legacy_refresh)
     values.update(stored)
     return values
 
@@ -457,7 +475,7 @@ def write_settings(new_values):
                 continue
             key = s.partition("=")[0].strip()
             if "=" in s and not s.startswith("#") and (
-                    key in SETTINGS_SCHEMA or key in DERIVED_KEYS
+                    key in SETTINGS_SCHEMA or key in DERIVED_KEYS or key in LEGACY_KEYS
                     or key in ("draw_telemetry", "perf_log_csv", "shader_inventory_csv",
                                "pipeline_inventory_json", "trace_gpu_prefix")):
                 continue
@@ -727,9 +745,9 @@ def patches_list():
                  "starts; choose Land of Chocolate to go back to the original game.",
          "state": start_episode_state(), "available": start_episode_state() != "unavailable",
          "options": start_episode_options()},
-        {"id": "fps_unlock", "name": "60 FPS mode",
-         "desc": "Runs the game at 60 Hz instead of the original 30. Set it in "
-                 "Settings → FRAMERATE. Experimental: cutscenes/physics may misbehave.",
+        {"id": "fps_unlock", "name": "Frame rate",
+         "desc": "Runs levels at 60 FPS, a higher rate or unlimited instead of the original 30. "
+                 "Set it in Settings → Frame rate.",
          "state": "see settings", "available": False},
     ]
 

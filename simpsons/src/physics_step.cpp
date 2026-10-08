@@ -27,6 +27,13 @@
 //   16.7 ms a second at 60 and at 30 fps, the step size and rate of the
 //   console's usual mode, and physics time follows the game clock exactly.
 //   While the time scale is 0 the game's own path runs.
+//   Frames counted in fractional vblanks (game_clock.cpp) can be any length.
+//   One no longer than T gets a step of T when the simulation is behind the
+//   marker, so above 60 fps physics still steps 60 times a second. One longer
+//   than T but shorter than H (a static of the step, set from 0x82159240,
+//   4/59.94 s, on its first call) would be stepped in halves: at 40-60 fps,
+//   two steps of 8.3-12.5 ms every frame, up to 120 steps a second. While
+//   frames are fractional H is 0, so every step is T.
 // Only sub_827A55C0 reads the three constants, so T is set in the image when
 // the game is loaded.
 //
@@ -67,6 +74,9 @@ REXCVAR_DEFINE_BOOL(physics_log, false, "GPU",
                     "Log the physics steps per frame every 5 s and the hazard damage messages per "
                     "second");
 
+// frame_pacing.cpp: whether frames are counted in fractional vblanks.
+bool FractionalVblanks();
+
 REX_EXTERN(__imp__sub_827A55C0);
 // hkWorld::stepDeltaTime(world, f1 = step).
 REX_EXTERN(sub_82AA2070);
@@ -91,6 +101,12 @@ constexpr uint32_t kStepThreshold = 0x82159238;
 constexpr uint32_t kStepThresholdOriginal = 0x3D08AB86;
 // 1/59.94 s, the game's own vblank period.
 constexpr uint32_t kVblankStep = 0x3C88AB86;
+// The step's half-step limit H, a function static: its guard word (bit 0 set
+// once H has been initialized) and the constant it is initialized from.
+constexpr uint32_t kHalfStepLimit = 0x82DFFA58;
+constexpr uint32_t kHalfStepLimitGuard = 0x82DFFA5C;
+constexpr uint32_t kHalfStepLimitInitial = 0x82159240;
+constexpr uint32_t kHalfStepLimitOriginal = 0x3D88AB86;  // 4/59.94 s
 // The game clock's frame time, whole vblanks times the time scale.
 constexpr uint32_t kFrameDt = 0x82CED748;
 // The same without the time scale.
@@ -115,6 +131,7 @@ const char* ModeName() {
 
 using simpsons::LoadGuestFloat;
 using simpsons::LoadGuestU32;
+using simpsons::StoreGuestU32;
 
 uint32_t Bits(double value) {
   return std::bit_cast<uint32_t>(float(value));
@@ -240,6 +257,16 @@ void Record(const uint8_t* base, uint32_t smoothed, uint32_t used, bool clock_fr
   }
 }
 
+// Steps of T only while frames are fractional; the shipped H otherwise.
+void SetHalfStepLimit(uint8_t* base, bool fractional) {
+  const uint32_t guard = LoadGuestU32(base, kHalfStepLimitGuard);
+  if (!fractional && !(guard & 1)) {
+    return;  // not initialized yet: the step sets the shipped value itself
+  }
+  StoreGuestU32(base, kHalfStepLimitGuard, guard | 1);
+  StoreGuestU32(base, kHalfStepLimit, fractional ? 0 : kHalfStepLimitOriginal);
+}
+
 // Runs a hazard handler, noting where its damage message will be: the
 // handler's stack frame (frame_size below the caller's r1) plus 80.
 void RunHazard(PPCContext& ctx, uint8_t* base, Hazard hazard, uint32_t frame_size,
@@ -263,7 +290,9 @@ void ApplyPhysicsStepOptions(rex::memory::Memory* memory) {
     return;
   }
   // Another release of the game has its data elsewhere: change nothing.
-  const simpsons::ImageWordPatch patch[] = {{kStepThreshold, kStepThresholdOriginal, kVblankStep}};
+  const simpsons::ImageWordPatch patch[] = {
+      {kStepThreshold, kStepThresholdOriginal, kVblankStep},
+      {kHalfStepLimitInitial, kHalfStepLimitOriginal, kHalfStepLimitOriginal}};
   if (!simpsons::ApplyImagePatch(memory, patch)) {
     REXLOG_WARN(
         "physics_step: this game image is not the one the option was made for; "
@@ -284,6 +313,7 @@ void HavokStep(PPCContext& ctx, uint8_t* base) {
       ctx.f1.f64 = double(frame_dt);
       clock_frame = true;
     }
+    SetHalfStepLimit(base, FractionalVblanks());
   }
   if (!REXCVAR_GET(physics_log)) {
     __imp__sub_827A55C0(ctx, base);

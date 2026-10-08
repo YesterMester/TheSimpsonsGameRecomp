@@ -159,6 +159,29 @@ class LauncherPatches(unittest.TestCase):
         self.assertIn("native_resolve_copy_free = false", text)
         self.assertIn("native_buffer_write_watches = false", text)
 
+    def test_old_refresh_rate_setting_becomes_frame_rate(self):
+        self.app.GAME_TOML = self.app.GAMEDATA / "simpsons.toml"
+        self.app.capture_keys = lambda: {}
+        for refresh, frame_rate in ((None, 60), ("30.0", 30), ("60.0", 60), ("90.0", 90),
+                                    ("120.0", 120)):
+            with self.subTest(refresh=refresh):
+                text = "resolution_scale = 2\n"
+                if refresh:
+                    text += (f"{self.app.SETTINGS_BEGIN}\nvideo_mode_refresh_rate = {refresh}\n"
+                             f"{self.app.SETTINGS_END}\n")
+                self.app.GAME_TOML.write_text(text)
+                self.assertEqual(self.app.read_settings()["frame_rate"], frame_rate)
+                self.app.write_settings({})
+                text = self.app.GAME_TOML.read_text()
+                self.assertNotIn("video_mode_refresh_rate", text)
+                self.assertIn(f"frame_rate = {frame_rate}", text)
+                self.assertIn("menu_frame_rate = 30", text)
+                self.assertIn("resolution_scale = 2", text)
+                self.assertEqual(self.app.read_settings()["frame_rate"], frame_rate)
+        self.app.write_settings({"frame_rate": 0, "menu_frame_rate": 0})
+        values = self.app.read_settings()
+        self.assertEqual((values["frame_rate"], values["menu_frame_rate"]), (0, 0))
+
     def test_launch_errors_return_http_json_and_close_diagnostics(self):
         (self.app.GAMEDATA / "default.xex").write_bytes(b"synthetic game image")
         (self.app.GAMEDATA / "movies").mkdir()

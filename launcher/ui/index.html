@@ -564,17 +564,32 @@
       <h3>Frame rate</h3>
       <div class="grid">
         <div class="field">
-          <label>Refresh rate / FPS target</label>
-          <select id="s-video_mode_refresh_rate">
+          <label>Frame rate in levels</label>
+          <select id="s-frame_rate">
             <option value="30">30 FPS — original console behavior</option>
-            <option value="60">60 FPS — smooth (default)</option>
-            <option value="90">90 FPS — not recommended</option>
-            <option value="120">120 FPS — not recommended</option>
+            <option value="60">60 FPS (default)</option>
+            <option value="90">90 FPS</option>
+            <option value="120">120 FPS</option>
+            <option value="144">144 FPS</option>
+            <option value="165">165 FPS</option>
+            <option value="240">240 FPS</option>
+            <option value="0">Unlimited</option>
           </select>
-          <div class="hint">The game shipped at 30 FPS. The timing fixes helped a reported
-            play-through of "Lisa the Tree Hugger" at 60, but the whole campaign still needs testing.
-            If random deaths happen, switch to 30 for that part. The game cannot run faster than 60, so 90 and 120 only make
-            frame pacing less even. Menus always run at 30, as on the console. Restart needed.</div>
+          <div class="hint">The game shipped at 30 FPS. Above 60, frames are timed precisely
+            while physics keeps stepping 60 times a second, as at 60. Pick your display's refresh
+            rate: frames beyond it are never shown, and with Unlimited they are dropped unevenly.
+            If random deaths happen in a scripted part such as "Lisa the Tree Hugger", switch to 30
+            for that part. Restart needed.</div>
+        </div>
+        <div class="field">
+          <label>Frame rate in menus</label>
+          <select id="s-menu_frame_rate">
+            <option value="30">30 FPS — as made (default)</option>
+            <option value="0">Same as in levels</option>
+          </select>
+          <div class="hint">Menus, loading screens and the pause menu were made for 30 FPS and
+            animate at 30 either way. With "Same as in levels" they are drawn at the level frame
+            rate while their logic keeps its 30 FPS pace, so nothing runs faster. Restart needed.</div>
         </div>
       </div>
     </div>
@@ -1538,7 +1553,18 @@ async function loadSettings(){
   $("#s-present_effect").value = v.present_effect || "bilinear";
   $("#s-present_fsr_sharpness_reduction").value = String(Number(v.present_fsr_sharpness_reduction));
   $("#s-anisotropic_override").value = String(v.anisotropic_override);
-  $("#s-video_mode_refresh_rate").value = String(Math.round(v.video_mode_refresh_rate));
+  for (const key of ["frame_rate", "menu_frame_rate"]) {
+    const select = $(`#s-${key}`);
+    select.value = String(v[key]);
+    if (select.value !== String(v[key])) {
+      // A rate the list doesn't offer, set by hand: show it as its own entry.
+      const option = document.createElement("option");
+      option.value = String(v[key]);
+      option.textContent = `${v[key]} FPS`;
+      select.appendChild(option);
+      select.value = String(v[key]);
+    }
+  }
   $("#s-mnk_mode").checked = v.mnk_mode;
   $("#s-mnk_sensitivity").value = v.mnk_sensitivity;
   $("#senslabel").textContent = Number(v.mnk_sensitivity).toFixed(1);
@@ -1574,7 +1600,8 @@ function settingsValues(){
     present_effect: $("#s-present_effect").value,
     present_fsr_sharpness_reduction: Number($("#s-present_fsr_sharpness_reduction").value),
     anisotropic_override: Number($("#s-anisotropic_override").value),
-    video_mode_refresh_rate: Number($("#s-video_mode_refresh_rate").value),
+    frame_rate: Number($("#s-frame_rate").value),
+    menu_frame_rate: Number($("#s-menu_frame_rate").value),
     mnk_mode: $("#s-mnk_mode").checked,
     mnk_sensitivity: Number($("#s-mnk_sensitivity").value),
     mnk_invert_y: $("#s-mnk_invert_y").checked,

@@ -377,7 +377,6 @@ void main() {
         r1.w = MulZ(r2.y, r2.x) + r1.w;
       }
       loop_address += loop_step;
-      loop_address += loop_step;
     }
   }
 #endif
@@ -477,7 +476,6 @@ void main() {
       // 31: mad r1.w, r2.y, r2.x, r1.w
       r1.w = MulZ(r2.y, r2.x) + r1.w;
     }
-    loop_address += loop_step;
     loop_address += loop_step;
   }
 

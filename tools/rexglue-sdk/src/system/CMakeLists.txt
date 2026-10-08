@@ -100,3 +100,8 @@ if(REXGLUE_USE_VULKAN)
     )
     target_compile_definitions(rexruntime PUBLIC REX_HAS_VULKAN=1)
 endif()
+
+if(REXGLUE_USE_D3D11)
+    target_link_libraries(rexruntime PUBLIC d3d11 dxgi d3dcompiler dxguid)
+    target_compile_definitions(rexruntime PUBLIC REX_HAS_D3D11=1)
+endif()

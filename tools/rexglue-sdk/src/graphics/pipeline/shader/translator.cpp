@@ -50,6 +50,7 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
   if (is_ucode_analyzed_) {
     return;
   }
+  vertex_index_registers_[0].valid = true;
 
   // Control flow instructions come paired in blocks of 3 dwords and all are
   // listed at the top of the ucode.
@@ -69,18 +70,36 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
       if (IsControlFlowOpcodeExec(cf.opcode())) {
         cf_pair_index_bound_ = std::min(cf_pair_index_bound_, cf.exec.address());
       }
+      uint32_t cf_index = i * 2 + j;
       switch (cf.opcode()) {
         case ControlFlowOpcode::kCondCall:
+          static_vertex_fetch_cf_bound_ =
+              std::min({static_vertex_fetch_cf_bound_, cf_index, cf.cond_call.address()});
           label_addresses_.insert(cf.cond_call.address());
           break;
         case ControlFlowOpcode::kCondJmp:
+          static_vertex_fetch_cf_bound_ =
+              std::min({static_vertex_fetch_cf_bound_, cf_index, cf.cond_jmp.address()});
           label_addresses_.insert(cf.cond_jmp.address());
           break;
         case ControlFlowOpcode::kLoopStart:
+          static_vertex_fetch_cf_bound_ =
+              std::min({static_vertex_fetch_cf_bound_, cf_index, cf.loop_start.address()});
           label_addresses_.insert(cf.loop_start.address());
           break;
         case ControlFlowOpcode::kLoopEnd:
+          static_vertex_fetch_cf_bound_ =
+              std::min({static_vertex_fetch_cf_bound_, cf_index, cf.loop_end.address()});
           label_addresses_.insert(cf.loop_end.address());
+          break;
+        case ControlFlowOpcode::kReturn:
+        case ControlFlowOpcode::kCondExec:
+        case ControlFlowOpcode::kCondExecEnd:
+        case ControlFlowOpcode::kCondExecPred:
+        case ControlFlowOpcode::kCondExecPredEnd:
+        case ControlFlowOpcode::kCondExecPredClean:
+        case ControlFlowOpcode::kCondExecPredCleanEnd:
+          static_vertex_fetch_cf_bound_ = std::min(static_vertex_fetch_cf_bound_, cf_index);
           break;
         default:
           break;
@@ -355,6 +374,12 @@ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
     if (sequence & 0b01) {
       auto& op = *reinterpret_cast<const FetchInstruction*>(op_ptr);
       if (op.opcode() == FetchOpcode::kVertexFetch) {
+        // A linear fetch prefix may be followed by skinning or lighting
+        // branches. No branch may enter that prefix, and no later fetch may
+        // depend on a register or the full-fetch address those branches change.
+        if (instr.dword_index >= static_vertex_fetch_cf_bound_) {
+          has_static_vertex_addresses_ = false;
+        }
         GatherVertexFetchInformation(op.vertex_fetch(), previous_vfetch_full, ucode_disasm_buffer);
       } else {
         GatherTextureFetchInformation(op.texture_fetch(), unique_texture_bindings,
@@ -375,6 +400,20 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
     previous_vfetch_full = op;
   }
   fetch_instr.Disassemble(&ucode_disasm_buffer);
+
+  if (fetch_instr.is_predicated) {
+    has_static_vertex_addresses_ = false;
+  }
+  if (!fetch_instr.is_mini_fetch) {
+    previous_vfetch_index_expression_ = GetVertexIndexExpression(fetch_instr.operands[0], 0);
+    if (!fetch_instr.attributes.stride) {
+      previous_vfetch_index_expression_ = {};
+      previous_vfetch_index_expression_.valid = true;
+    }
+  }
+  if (!previous_vfetch_index_expression_.valid) {
+    has_static_vertex_addresses_ = false;
+  }
 
   GatherFetchResultInformation(fetch_instr.result);
 
@@ -420,6 +459,7 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
 
   // Populate attribute.
   attrib->fetch_instr = fetch_instr;
+  attrib->index_expression = previous_vfetch_index_expression_;
 }
 
 void Shader::GatherTextureFetchInformation(const TextureFetchInstruction& op,
@@ -479,8 +519,75 @@ void Shader::GatherAluInstructionInformation(const AluInstruction& op, uint32_t 
                   (ucode::GetAluScalarOpcodeInfo(op.scalar_opcode()).changed_state &
                    ucode::kAluOpChangedStatePixelKill);
 
+  // Vector and scalar operations read registers before either result is
+  // stored. Unsupported or predicated writes make their destination unknown.
+  std::array<VertexIndexExpression, 4> vector_indices{};
+  VertexIndexExpression scalar_index;
+  auto constant_component = [](const InstructionOperand& operand, uint32_t component) {
+    SwizzleSource source = operand.GetComponent(component);
+    if (operand.storage_source != InstructionStorageSource::kConstantFloat ||
+        operand.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute ||
+        operand.is_negated || operand.is_absolute_value || source > SwizzleSource::kW) {
+      return UINT32_MAX;
+    }
+    return operand.storage_index * 4 + uint32_t(source);
+  };
+  if (!instr.is_predicated && exec_cf_index < static_vertex_fetch_cf_bound_) {
+    if (instr.vector_opcode == AluVectorOpcode::kAdd &&
+        !instr.vector_and_constant_result.is_clamped) {
+      for (uint32_t component = 0; component < 4; ++component) {
+        for (uint32_t index_operand = 0; index_operand < 2; ++index_operand) {
+          VertexIndexExpression index =
+              GetVertexIndexExpression(instr.vector_operands[index_operand], component);
+          uint32_t offset = constant_component(instr.vector_operands[1 - index_operand], component);
+          if (index.valid && index.offset_constant == UINT32_MAX &&
+              index.scale_constant == UINT32_MAX && offset != UINT32_MAX) {
+            index.offset_constant = offset;
+            vector_indices[component] = index;
+          }
+        }
+      }
+    }
+    if ((instr.scalar_opcode == AluScalarOpcode::kMulsc0 ||
+         instr.scalar_opcode == AluScalarOpcode::kMulsc1) &&
+        !instr.scalar_result.is_clamped) {
+      uint32_t scale = constant_component(instr.scalar_operands[0], 0);
+      VertexIndexExpression index = GetVertexIndexExpression(instr.scalar_operands[1], 0);
+      if (index.valid && index.scale_constant == UINT32_MAX && scale != UINT32_MAX) {
+        index.scale_constant = scale;
+        scalar_index = index;
+      }
+    }
+  }
+
   GatherAluResultInformation(instr.vector_and_constant_result, exec_cf_index);
   GatherAluResultInformation(instr.scalar_result, exec_cf_index);
+  auto store_indices = [&](const InstructionResult& result, bool scalar) {
+    if (result.storage_target != InstructionStorageTarget::kRegister ||
+        result.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute) {
+      return;
+    }
+    for (uint32_t component = 0; component < 4; ++component) {
+      if (!(result.GetUsedWriteMask() & (1u << component))) {
+        continue;
+      }
+      SwizzleSource source = result.components[component];
+      vertex_index_registers_[result.storage_index * 4 + component] =
+          source <= SwizzleSource::kW ? (scalar ? scalar_index : vector_indices[uint32_t(source)])
+                                      : VertexIndexExpression{};
+    }
+  };
+  store_indices(instr.vector_and_constant_result, false);
+  store_indices(instr.scalar_result, true);
+  // A relative destination can alias a newly tracked absolute destination
+  // in the other half of this ALU instruction.
+  if (instr.vector_and_constant_result.storage_addressing_mode !=
+      InstructionStorageAddressingMode::kAbsolute) {
+    InvalidateVertexIndexRegisters(instr.vector_and_constant_result);
+  }
+  if (instr.scalar_result.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute) {
+    InvalidateVertexIndexRegisters(instr.scalar_result);
+  }
   for (size_t i = 0; i < instr.vector_operand_count; ++i) {
     GatherOperandInformation(instr.vector_operands[i]);
   }
@@ -538,6 +645,36 @@ void Shader::GatherOperandInformation(const InstructionOperand& operand) {
   }
 }
 
+Shader::VertexIndexExpression Shader::GetVertexIndexExpression(const InstructionOperand& operand,
+                                                               uint32_t component) const {
+  SwizzleSource source = operand.GetComponent(component);
+  if (operand.storage_source != InstructionStorageSource::kRegister ||
+      operand.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute ||
+      operand.is_negated || operand.is_absolute_value || source > SwizzleSource::kW) {
+    return {};
+  }
+  return vertex_index_registers_[operand.storage_index * 4 + uint32_t(source)];
+}
+
+void Shader::InvalidateVertexIndexRegisters(const InstructionResult& result) {
+  if (result.storage_target != InstructionStorageTarget::kRegister) {
+    return;
+  }
+  uint32_t mask = result.GetUsedWriteMask();
+  uint32_t first = result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute
+                       ? result.storage_index
+                       : 0;
+  uint32_t last =
+      result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute ? first : 63;
+  for (uint32_t reg = first; reg <= last; ++reg) {
+    for (uint32_t component = 0; component < 4; ++component) {
+      if (mask & (1u << component)) {
+        vertex_index_registers_[reg * 4 + component] = {};
+      }
+    }
+  }
+}
+
 void Shader::GatherFetchResultInformation(const InstructionResult& result) {
   if (!result.GetUsedWriteMask()) {
     return;
@@ -545,6 +682,7 @@ void Shader::GatherFetchResultInformation(const InstructionResult& result) {
   // Fetch instructions can't export - don't need the current memexport count
   // operand.
   assert_true(result.storage_target == InstructionStorageTarget::kRegister);
+  InvalidateVertexIndexRegisters(result);
   if (result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
     register_static_address_bound_ =
         std::max(register_static_address_bound_, result.storage_index + uint32_t(1));
@@ -560,6 +698,7 @@ void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_
   }
   switch (result.storage_target) {
     case InstructionStorageTarget::kRegister:
+      InvalidateVertexIndexRegisters(result);
       if (result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
         register_static_address_bound_ =
             std::max(register_static_address_bound_, result.storage_index + uint32_t(1));

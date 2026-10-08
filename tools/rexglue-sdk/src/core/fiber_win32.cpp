@@ -11,7 +11,7 @@
 
 #include <rex/platform.h>
 #if REX_PLATFORM_WIN32
-#include <Windows.h>
+#include <windows.h>
 #include <rex/thread/fiber.h>
 
 #include <cassert>

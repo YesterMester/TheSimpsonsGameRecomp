@@ -410,6 +410,13 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   pending_load_out.load_base = base_outdated;
   pending_load_out.load_mips = mips_outdated;
   pending_range_count_out = 0;
+  pending_load_out.from_cpu = CanLoadTextureDataFromCpu(texture, base_outdated, mips_outdated);
+  pending_load_out.from_native_gpu =
+      !pending_load_out.from_cpu &&
+      CanLoadTextureDataFromNativeGpu(texture, base_outdated, mips_outdated);
+  if (pending_load_out.from_cpu || pending_load_out.from_native_gpu) {
+    return true;
+  }
 
   TextureKey texture_key = texture.key();
   if (base_outdated) {
@@ -437,7 +444,7 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   Texture& texture = *pending_load.texture;
   TextureKey texture_key = texture.key();
-  if (texture_key.scaled_resolve) {
+  if (texture_key.scaled_resolve && !pending_load.from_native_gpu) {
     // Make sure all the scaled resolve memory is resident and accessible from
     // the shader, including any possible padding that hasn't yet been touched
     // by an actual resolve, but is still included in the texture size, so the
@@ -452,8 +459,17 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
-  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
-                                             pending_load.load_mips)) {
+  if (pending_load.from_cpu) {
+    if (!LoadTextureDataFromCpuImpl(texture, pending_load.load_base, pending_load.load_mips)) {
+      return false;
+    }
+  } else if (pending_load.from_native_gpu) {
+    if (!LoadTextureDataFromNativeGpuImpl(texture, pending_load.load_base,
+                                          pending_load.load_mips)) {
+      return false;
+    }
+  } else if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
+                                                    pending_load.load_mips)) {
     return false;
   }
 
@@ -462,9 +478,31 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  if (pending_load.from_cpu) {
+    // Watches must catch reuse and in-place texture updates without marking
+    // the mirror valid: no bytes were uploaded to that mirror.
+    if (pending_load.load_base) {
+      shared_memory().WatchCpuMemoryRange(texture_key.base_page << 12, texture.GetGuestBaseSize());
+    }
+    if (pending_load.load_mips) {
+      shared_memory().WatchCpuMemoryRange(texture_key.mip_page << 12, texture.GetGuestMipsSize());
+    }
+  }
   texture.LogAction("Loaded");
 
   return true;
+}
+
+void TextureCache::InvalidateCpuTextureInputsForTrace() {
+  auto invalidate = [&](uint32_t page, uint32_t length) {
+    uint32_t address = page << 12;
+    shared_memory().InvalidateCpuMemoryRangeForTrace(address, length);
+  };
+  for (const auto& entry : textures_) {
+    const Texture& texture = *entry.second;
+    invalidate(texture.key().base_page, texture.GetGuestBaseSize());
+    invalidate(texture.key().mip_page, texture.GetGuestMipsSize());
+  }
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {

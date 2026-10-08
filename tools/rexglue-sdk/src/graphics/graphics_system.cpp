@@ -14,17 +14,22 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/platform.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/perf/event_trace.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
@@ -33,6 +38,19 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+
+#if REX_PLATFORM_LINUX
+#include <sys/prctl.h>
+#endif
+
+namespace {
+// The vblank schedule: the guest tick count of the last vblank raised and the
+// interval, shared by the threads that can raise them (DeliverDueVblanks).
+// There is one graphics system.
+std::mutex g_vblank_mutex;
+std::atomic<uint64_t> g_vblank_last_frame_time{0};
+std::atomic<uint64_t> g_vblank_interval_ticks{0};
+}  // namespace
 
 REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
 
@@ -193,24 +211,33 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         }
         uint64_t no_vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / unlocked_hz));
-        uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        {
+          std::lock_guard<std::mutex> vblank_lock(g_vblank_mutex);
+          g_vblank_last_frame_time.store(chrono::Clock::QueryGuestTickCount(),
+                                         std::memory_order_relaxed);
+        }
         // File-based frame trace trigger, checked about once a second. A
         // keybind can be swallowed by whatever sits between the compositor
         // and the game (and compact keyboards hide the F-row), but touching
         // a file next to the trace prefix works from any terminal or from
         // the launcher UI: drop <trace_gpu_prefix>.request and the next
         // frame is traced.
-        uint32_t trace_trigger_divider = 0;
+        auto next_trace_trigger_check = std::chrono::steady_clock::now();
+#if REX_PLATFORM_LINUX
+        // Wake up for vblanks within microseconds rather than the default
+        // 50 us timer slack.
+        prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);
+#endif
         while (vsync_worker_running_) {
-          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          while (current_time - last_frame_time >= interval_ticks) {
-            MarkVblank();
-            last_frame_time += interval_ticks;
-          }
-          if (++trace_trigger_divider >= 1000) {
-            trace_trigger_divider = 0;
+          g_vblank_interval_ticks.store(interval_ticks, std::memory_order_relaxed);
+          DeliverDueVblanks();
+          uint64_t last_frame_time = g_vblank_last_frame_time.load(std::memory_order_relaxed);
+          auto checks_start = std::chrono::steady_clock::now();
+          if (checks_start >= next_trace_trigger_check) {
+            next_trace_trigger_check = checks_start + std::chrono::seconds(1);
+            rex::perf::FlushEventTrace();
             const std::string& trace_prefix = REXCVAR_GET(trace_gpu_prefix);
             if (!trace_prefix.empty()) {
               std::filesystem::path request_path(trace_prefix + ".request");
@@ -225,11 +252,71 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
               std::filesystem::path shot_request_path(trace_prefix + ".shot");
               if (std::filesystem::exists(shot_request_path, trace_request_ec)) {
                 std::filesystem::remove(shot_request_path, trace_request_ec);
-                SaveGuestOutputScreenshot(trace_prefix);
+                // On its own thread: capturing and writing the screenshot
+                // takes about 50 ms, which held back vblanks - and with them
+                // the game's swaps - every time the test harness took one.
+                // Only requested while the game runs, never at shutdown.
+                std::thread([this, trace_prefix]() {
+                  SaveGuestOutputScreenshot(trace_prefix);
+                }).detach();
               }
             }
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          {
+            // Debugging: REX_VBLANK_STALL_LOG=1 logs vblank thread sleeps
+            // that took much longer than asked, with how long the thread
+            // waited for a CPU meanwhile (from /proc schedstat).
+            static const bool stall_log = std::getenv("REX_VBLANK_STALL_LOG") != nullptr;
+            auto read_run_delay_ns = []() -> uint64_t {
+              uint64_t on_cpu = 0, run_delay = 0;
+              FILE* f = std::fopen("/proc/thread-self/schedstat", "r");
+              if (f) {
+                if (std::fscanf(f, "%llu %llu", (unsigned long long*)&on_cpu,
+                                (unsigned long long*)&run_delay) != 2) {
+                  run_delay = 0;
+                }
+                std::fclose(f);
+              }
+              return run_delay;
+            };
+            if (stall_log) {
+              auto checks_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - checks_start)
+                                   .count();
+              if (checks_us > 8000) {
+                REXGPU_WARN("[vblank-stall] trace checks took {:.2f} ms",
+                            double(checks_us) / 1000.0);
+              }
+            }
+            uint64_t delay_before = stall_log ? read_run_delay_ns() : 0;
+            auto sleep_start = std::chrono::steady_clock::now();
+            // Sleep until the next vblank is due, at most 1 ms at a time so
+            // vsync and rate changes are picked up soon. Sleeping whole
+            // milliseconds made vblanks up to about 1.1 ms late.
+            uint64_t now_ticks = chrono::Clock::QueryGuestTickCount();
+            uint64_t due_ticks = last_frame_time + interval_ticks;
+            uint64_t remaining_us = due_ticks > now_ticks
+                                        ? (due_ticks - now_ticks) * 1000000 /
+                                              std::max(guest_tick_frequency, uint64_t(1))
+                                        : 0;
+            if (remaining_us >= 20) {
+              rex::thread::Sleep(std::chrono::microseconds(std::min<uint64_t>(remaining_us, 1000)));
+            } else {
+              rex::thread::MaybeYield();
+            }
+            if (stall_log) {
+              auto slept_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - sleep_start)
+                                  .count();
+              if (slept_us > 8000) {
+                uint64_t delay_after = read_run_delay_ns();
+                REXGPU_WARN(
+                    "[vblank-stall] 1 ms sleep took {:.2f} ms, {:.2f} ms of it waiting "
+                    "for a CPU",
+                    double(slept_us) / 1000.0, double(delay_after - delay_before) / 1e6);
+              }
+            }
+          }
         }
         return 0;
       }));
@@ -381,9 +468,49 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   // REXGPU_INFO("Dispatching GPU interrupt at {:08X} w/ mode {} on cpu {}",
   //          interrupt_callback_, source, cpu);
 
+  // Debugging: REX_SWAP_QUEUE_LOG=1 logs the XDK swap callback's argument
+  // (front buffer | present interval << 8 | immediate threshold percent) on
+  // command buffer interrupts.
+  static const bool swap_queue_log = std::getenv("REX_SWAP_QUEUE_LOG") != nullptr;
+  if (swap_queue_log && source == 1 && interrupt_callback_data_) {
+    static uint32_t swap_queue_log_count = 0;
+    if (swap_queue_log_count++ % 600 < 3) {
+      auto load = [this](uint32_t address) -> uint32_t {
+        return rex::memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(address));
+      };
+      uint32_t swap_state = load(interrupt_callback_data_ + 10900);
+      if (swap_state) {
+        REXGPU_WARN(
+            "[swap-queue] state {:08X}: word0 {:08X} word1 {:08X} callback {:08X} arg "
+            "{:08X} | vblanks {} last target {} swaps {} presented {}",
+            swap_state, load(swap_state), load(swap_state + 4), load(swap_state + 16),
+            load(swap_state + 20), load(interrupt_callback_data_ + 16524),
+            load(interrupt_callback_data_ + 16532), load(interrupt_callback_data_ + 16540),
+            load(interrupt_callback_data_ + 16544));
+      }
+    }
+  }
   uint64_t args[] = {source, interrupt_callback_data_};
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
+}
+
+void GraphicsSystem::DeliverDueVblanks() {
+  std::unique_lock<std::mutex> lock(g_vblank_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return;
+  }
+  uint64_t interval_ticks = g_vblank_interval_ticks.load(std::memory_order_relaxed);
+  if (!interval_ticks) {
+    return;
+  }
+  uint64_t now = chrono::Clock::QueryGuestTickCount();
+  uint64_t last_frame_time = g_vblank_last_frame_time.load(std::memory_order_relaxed);
+  while (now - last_frame_time >= interval_ticks) {
+    MarkVblank();
+    last_frame_time += interval_ticks;
+    g_vblank_last_frame_time.store(last_frame_time, std::memory_order_relaxed);
+  }
 }
 
 void GraphicsSystem::MarkVblank() {
@@ -398,7 +525,9 @@ void GraphicsSystem::MarkVblank() {
   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
+  rex::perf::TraceEvent("vblank");
   DispatchInterruptCallback(0, 2);
+  rex::perf::TraceEvent("vblank_done");
 }
 
 void GraphicsSystem::ClearCaches() {
@@ -497,3 +626,14 @@ bool GraphicsSystem::Restore(::rex::stream::ByteStream* stream) {
 }
 
 }  // namespace rex::graphics
+
+extern "C" bool rex_graphics_get_vblank_schedule(uint64_t* last_vblank_ticks,
+                                                 uint64_t* interval_ticks) {
+  uint64_t interval = g_vblank_interval_ticks.load(std::memory_order_relaxed);
+  if (!interval) {
+    return false;
+  }
+  *last_vblank_ticks = g_vblank_last_frame_time.load(std::memory_order_relaxed);
+  *interval_ticks = interval;
+  return true;
+}

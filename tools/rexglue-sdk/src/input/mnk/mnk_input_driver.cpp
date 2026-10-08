@@ -25,7 +25,7 @@
 
 #if REX_PLATFORM_WIN32
 #include <rex/ui/window_win.h>
-#include <Windows.h>
+#include <windows.h>
 #endif
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");

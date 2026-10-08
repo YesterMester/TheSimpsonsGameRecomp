@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -52,6 +53,35 @@ enum class CounterId : uint16_t {
   kTextureCacheMisses,
   kPipelineCacheHits,
   kPipelineCacheMisses,
+
+  // Guest memory write watches on what the GPU reads.
+  kWatchFaults,
+  kWatchFaultUs,
+  kWatchProtects,
+  // CPU time of the GPU command processor thread in the frame.
+  kCommandProcessorCpuUs,
+  // Wall time in parts of the command processor's work (inclusive).
+  kCpDrawUs,
+  kCpTextureRequestUs,
+  kCpUploadUs,
+  kCpCopyUs,
+  kCpSwapUs,
+  // Parts of shared memory uploads (inside kCpUploadUs).
+  kUploadBytes,
+  kUploadLockWaitUs,
+  kUploadScanUs,
+  kUploadValidUs,
+  kUploadCopyUs,
+  kUploadPoolUs,
+  kWatchProtectUs,
+  // Where the command processor thread waits: for the game to submit more,
+  // in WAIT_REG_MEM packets, and for host GPU fences.
+  kCpRingIdleUs,
+  kCpWaitRegMemUs,
+  kCpGpuFenceUs,
+  // The game's swapping thread: CPU time and wall time between its VdSwap calls.
+  kGuestSwapCpuUs,
+  kGuestSwapIntervalUs,
 
   kCount  // sentinel -- must be last
 };
@@ -138,6 +168,31 @@ class Profiler {
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 
 // Generic helpers for easily adding new counters
+// Adds the microseconds the scope took to a counter.
+namespace rex::perf {
+class ScopedCounterTimer {
+ public:
+  explicit ScopedCounterTimer(rex::perf::CounterId id)
+      : id_(id), start_(std::chrono::steady_clock::now()) {}
+  ~ScopedCounterTimer() { Stop(); }
+  // Adds the time so far, and nothing more later.
+  void Stop() {
+    if (stopped_) {
+      return;
+    }
+    stopped_ = true;
+    rex::perf::IncrementCounter(id_, std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - start_)
+                                         .count());
+  }
+
+ private:
+  rex::perf::CounterId id_;
+  std::chrono::steady_clock::time_point start_;
+  bool stopped_ = false;
+};
+}  // namespace rex::perf
+
 #define PERF_counter_set(id, value) rex::perf::SetCounter(rex::perf::CounterId::id, value)
 #define PERF_counter_inc(id) rex::perf::IncrementCounter(rex::perf::CounterId::id)
 #define PERF_counter_add(id, delta) rex::perf::IncrementCounter(rex::perf::CounterId::id, delta)
@@ -163,6 +218,14 @@ class Profiler {
 #define PROFILE_PIPELINE_CACHE_MISS() PERF_counter_inc(kPipelineCacheMisses)
 
 #else
+
+namespace rex::perf {
+class ScopedCounterTimer {
+ public:
+  explicit ScopedCounterTimer(rex::perf::CounterId) {}
+  void Stop() {}
+};
+}  // namespace rex::perf
 
 #define PERF_counter_set(id, value)
 #define PERF_counter_inc(id)

@@ -24,7 +24,7 @@
 #include <rex/ui/windowed_app_context.h>
 
 // For per-monitor DPI awareness v1.
-#include <ShellScalingApi.h>
+#include <shellscalingapi.h>
 
 namespace rex {
 namespace ui {

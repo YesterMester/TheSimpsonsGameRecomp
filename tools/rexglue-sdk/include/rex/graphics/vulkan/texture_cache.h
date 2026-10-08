@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -130,9 +131,13 @@ class VulkanTextureCache final : public TextureCache {
                                               length_scaled_alignment_log2);
   }
   VkBuffer scaled_resolve_buffer() const { return scaled_resolve_buffer_; }
-  void UseScaledResolveBufferForRead();
+  void UseScaledResolveBufferForRead(std::pair<uint32_t, uint32_t> read_range = {
+                                         0, SharedMemory::kBufferSize});
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);
+  void SetNativeResolveMemoryFlusher(std::function<bool(uint32_t, uint32_t)> flusher) {
+    native_resolve_memory_flusher_ = std::move(flusher);
+  }
 
   // Native resolves: resolved render target data written directly into the
   // textures that sample it instead of being reloaded from guest memory. Must be
@@ -161,8 +166,8 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t FindNativeResolveTargets(uint32_t dest_base, uint32_t dest_pitch_texels,
                                     xenos::TextureFormat format, xenos::Endian endian, bool scaled,
                                     NativeResolveTarget* targets_out);
-  // Pushes the barrier for writing the target as a color attachment.
-  void BeginNativeResolveWrite(const NativeResolveTarget& target);
+  // Pushes the barrier for writing the target as a color attachment or copy.
+  void BeginNativeResolveWrite(const NativeResolveTarget& target, bool image_copy = false);
   // To be called once the target's memory range has been marked as resolved and
   // the texture data has been written, so it matches guest memory again.
   void EndNativeResolveWrite(const NativeResolveTarget& target);
@@ -173,6 +178,29 @@ class VulkanTextureCache final : public TextureCache {
   // Transitions the texture for reading in the write-back compute shader, and
   // returns its raw bits (integer) view.
   VkImageView BeginScaledMemoryWriteback(void* texture);
+
+  // native_resolve_copy_free: native resolve target textures created with
+  // their own memory and the properties of render target images, so a render
+  // target can hand its image over instead of copying it in a resolve. Gives
+  // the host extent of the texture's image if it's such a texture.
+  bool GetCopyFreeResolveTargetExtent(void* texture, uint32_t& width_out,
+                                      uint32_t& height_out) const;
+  // Exchanges the texture's image and memory with the given ones. In: the
+  // state of the given image; out: the state of the texture's old image. With
+  // content_red_blue_swapped, the given image holds red and blue swapped
+  // relative to the texture's format (the render target's own order), and the
+  // texture's views swap them back.
+  void ExchangeCopyFreeResolveTargetImage(void* texture, VkImage& image, VkDeviceMemory& memory,
+                                          VkPipelineStageFlags& stage_mask,
+                                          VkAccessFlags& access_mask, VkImageLayout& layout,
+                                          bool content_red_blue_swapped);
+  VkImage GetTextureImage(void* texture) const {
+    return static_cast<const VulkanTexture*>(texture)->image();
+  }
+  // For data written in the texture's own order (a resolve copy, a load).
+  void ClearTextureContentRedBlueSwapped(void* texture);
+  void SetTextureContentRedBlueSwapped(void* texture, bool swapped);
+  bool IsTextureContentRedBlueSwapped(void* texture) const;
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
@@ -189,10 +217,20 @@ class VulkanTextureCache final : public TextureCache {
 
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
+  bool CanLoadTextureDataFromCpu(const Texture& texture, bool load_base,
+                                 bool load_mips) const override;
+  bool CanLoadTextureDataFromNativeGpu(const Texture& texture, bool load_base,
+                                       bool load_mips) const override;
+  bool LoadTextureDataFromNativeGpuImpl(Texture& texture, bool load_base, bool load_mips) override;
+  bool LoadTextureDataFromCpuImpl(Texture& texture, bool load_base, bool load_mips) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
  private:
+  bool LoadTextureDataImpl(Texture& texture, bool load_base, bool load_mips, bool from_cpu,
+                           bool from_native_gpu = false);
+  std::function<bool(uint32_t, uint32_t)> native_resolve_memory_flusher_;
+
   enum LoadDescriptorSetIndex {
     kLoadDescriptorSetIndexDestination,
     kLoadDescriptorSetIndexSource,
@@ -243,9 +281,21 @@ class VulkanTextureCache final : public TextureCache {
     // Takes ownership of the image and its memory.
     explicit VulkanTexture(VulkanTextureCache& texture_cache, const TextureKey& key, VkImage image,
                            VmaAllocation allocation, bool track_usage = true);
+    // An image with its own dedicated memory (native_resolve_copy_free).
+    explicit VulkanTexture(VulkanTextureCache& texture_cache, const TextureKey& key, VkImage image,
+                           VkDeviceMemory memory, VkDeviceSize memory_size);
     ~VulkanTexture();
 
     VkImage image() const { return image_; }
+    // Images with their own memory can be exchanged with render targets'.
+    VkDeviceMemory memory() const { return memory_; }
+    bool content_red_blue_swapped() const { return content_red_blue_swapped_; }
+    void SetContentRedBlueSwapped(bool swapped) { content_red_blue_swapped_ = swapped; }
+    // Replaces the image and its memory (only for one with its own memory),
+    // returning the old ones; the views of the old image are appended to
+    // retired_views_out.
+    void ExchangeImage(VkImage& image, VkDeviceMemory& memory,
+                       std::vector<VkImageView>& retired_views_out);
 
     // Doesn't transition (the caller must insert the barrier).
     Usage SetUsage(Usage new_usage) {
@@ -314,6 +364,9 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImage image_;
     VmaAllocation allocation_;
+    // Instead of allocation_.
+    VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    bool content_red_blue_swapped_ = false;
 
     Usage usage_ = Usage::kUndefined;
 
@@ -403,6 +456,10 @@ class VulkanTextureCache final : public TextureCache {
   // on Windows versions before 10, may have an allocation count limit as low as
   // 4096.
   VmaAllocator vma_allocator_ = VK_NULL_HANDLE;
+  // Views of images textures gave away, destroyed once the submission that
+  // may still use them completes.
+  std::deque<std::pair<uint64_t, VkImageView>> retired_image_views_;
+  void RefreshBindingsOfTexture(const Texture* texture);
 
   static const HostFormatPair kBestHostFormats[64];
   static const HostFormatPair kHostFormatGBGRUnaligned;

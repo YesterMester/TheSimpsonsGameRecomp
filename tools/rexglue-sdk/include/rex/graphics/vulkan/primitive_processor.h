@@ -10,11 +10,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <deque>
 #include <memory>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/graphics/primitive_processor.h>
+#include <rex/graphics/util/vertex_index_bounds.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
 
 namespace rex::graphics::vulkan {
@@ -25,20 +27,22 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
  public:
   VulkanPrimitiveProcessor(const RegisterFile& register_file, memory::Memory& memory,
                            TraceWriter& trace_writer, SharedMemory& shared_memory,
-                           VulkanCommandProcessor& command_processor)
-      : PrimitiveProcessor(register_file, memory, trace_writer, shared_memory),
-        command_processor_(command_processor) {}
+                           VulkanCommandProcessor& command_processor);
   ~VulkanPrimitiveProcessor();
 
   bool Initialize();
   void Shutdown(bool from_destructor = false);
-  void ClearCache() { frame_index_buffer_pool_->ClearCache(); }
+  void ClearCache();
 
   void CompletedSubmissionUpdated();
   void BeginSubmission();
   void BeginFrame();
   void EndSubmission();
   void EndFrame();
+
+  draw_util::VertexIndexBounds GetNativeVertexIndexBounds(const ProcessingResult& primitives,
+                                                          xenos::Endian endian, uint32_t base,
+                                                          uint32_t clamp_min, uint32_t clamp_max);
 
   std::pair<VkBuffer, VkDeviceSize> GetBuiltinIndexBuffer(size_t handle) const {
     assert_not_null(builtin_index_buffer_);
@@ -58,6 +62,10 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
                                                        uint32_t coalignment_original_address,
                                                        size_t& backend_handle_out) override;
 
+  bool TryRetainedNativeIndexBuffer(uint32_t address, uint32_t length, const void* source,
+                                    size_t& backend_handle_out,
+                                    const void*& cpu_snapshot_out) override;
+
  private:
   VulkanCommandProcessor& command_processor_;
 
@@ -74,6 +82,9 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
   uint64_t builtin_index_buffer_upload_submission_ = UINT64_MAX;
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> frame_index_buffer_pool_;
+  struct NativeIndexCache;
+  std::unique_ptr<NativeIndexCache> native_index_cache_;
+  std::deque<std::pair<uint64_t, std::unique_ptr<NativeIndexCache>>> native_index_caches_retired_;
   // Indexed by the backend handles.
   std::deque<std::pair<VkBuffer, VkDeviceSize>> frame_index_buffers_;
 };

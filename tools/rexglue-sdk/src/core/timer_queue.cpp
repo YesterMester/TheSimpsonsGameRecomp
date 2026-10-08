@@ -15,19 +15,61 @@
 #include <forward_list>
 
 #include <disruptorplus/spin_wait_strategy.hpp>
+#include <disruptorplus/blocking_wait_strategy.hpp>
 #include <disruptorplus/multi_threaded_claim_strategy.hpp>
 #include <disruptorplus/ring_buffer.hpp>
 #include <disruptorplus/sequence_barrier.hpp>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/thread.h>
 #include <rex/thread/timer_queue.h>
+
+namespace {
+// The timer queue starts before runtime configuration is read. Its selector
+// must be atomic while the config chooses the wait strategy at startup.
+std::atomic<bool> timer_queue_sleep{false};
+auto timer_queue_sleep_flag = rex::cvar::FlagRegistrar(
+    {"timer_queue_sleep",
+     rex::cvar::FlagType::Boolean,
+     "Kernel",
+     "Sleep until a timer deadline or a new timer instead of spinning",
+     [](std::string_view value) {
+       timer_queue_sleep.store(value == "true" || value == "1" || value == "yes",
+                               std::memory_order_relaxed);
+       return true;
+     },
+     []() { return timer_queue_sleep.load(std::memory_order_relaxed) ? "true" : "false"; },
+     []() {},
+     rex::cvar::Lifecycle::kInitOnly,
+     {},
+     "false",
+     false});
+}  // namespace
 
 namespace dp = disruptorplus;
 
 namespace rex::thread {
 
 using WaitItem = TimerQueueWaitItem;
+
+class TimerWaitStrategy : public dp::blocking_wait_strategy {
+ public:
+  using dp::blocking_wait_strategy::wait_until_published;
+
+  template <typename Clock, typename Duration>
+  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
+                                      const std::atomic<dp::sequence_t>* const sequences[],
+                                      const std::chrono::time_point<Clock, Duration>& deadline) {
+    if (timer_queue_sleep.load(std::memory_order_relaxed)) {
+      return dp::blocking_wait_strategy::wait_until_published(sequence, count, sequences, deadline);
+    }
+    return spin_.wait_until_published(sequence, count, sequences, deadline);
+  }
+
+ private:
+  dp::spin_wait_strategy spin_;
+};
 
 class TimerQueue {
  public:
@@ -178,15 +220,11 @@ class TimerQueue {
   // This ring buffer will be used to introduce timers queued by the public API
   static constexpr size_t kWaitCount = 512;
   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
-  // Spinning costs about half a CPU core (the 1 ms timestamp timer is always
-  // due soon), but a blocking wait silences this game's audio: callbacks then
-  // run about 60 us late instead of about 0.5 ms, so the game's ~5 ms one-shot
-  // timer, which it re-arms itself, fires about 198 times a second instead of
-  // close to the audio frame rate (48000 / 256 = 187.5), and its sound engine
-  // outputs silence. REX_TIMER_STATS shows the rates.
-  dp::spin_wait_strategy wait_strategy_;
-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
+  // The blocking path releases the CPU between deadlines. Keep the spin
+  // strategy selectable for comparisons and platforms not yet qualified.
+  TimerWaitStrategy wait_strategy_;
+  dp::multi_threaded_claim_strategy<TimerWaitStrategy> claim_strategy_;
+  dp::sequence_barrier<TimerWaitStrategy> consumed_;
 
   // This is a _sorted_ (ascending due_) list of active timers managed by a
   // dedicated thread

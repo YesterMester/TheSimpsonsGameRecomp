@@ -76,6 +76,11 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data);
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
+  // Raises the vblanks that are due, if no other thread is doing it right now.
+  // Called by the vblank thread, and by the command processor while it waits
+  // for the game (a vblank releases its swaps), so a vblank isn't late when
+  // the vblank thread is kept off a CPU for a while.
+  void DeliverDueVblanks();
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
@@ -139,3 +144,10 @@ class GraphicsSystem : public system::IGraphicsSystem {
 };
 
 }  // namespace rex::graphics
+
+// The guest tick count (the timebase games read) of the last vblank raised
+// and the vblank interval in ticks, for games that pace their frames to the
+// vblank. Returns false before the first vblank. C linkage so a game can
+// reference it weakly and still run with runtimes that lack it.
+extern "C" bool rex_graphics_get_vblank_schedule(uint64_t* last_vblank_ticks,
+                                                 uint64_t* interval_ticks);

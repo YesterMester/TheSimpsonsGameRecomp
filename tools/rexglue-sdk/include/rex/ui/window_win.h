@@ -25,7 +25,7 @@
 #include <dxgi.h>
 #include <windows.h>
 
-#include <ShellScalingApi.h>
+#include <shellscalingapi.h>
 
 namespace rex {
 namespace ui {

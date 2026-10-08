@@ -55,6 +55,18 @@ if(REXGLUE_USE_D3D12)
     )
 endif()
 
+# Native Direct3D 11 presentation
+if(REXGLUE_USE_D3D11)
+    set(REXUI_D3D11_SOURCES
+        d3d11/d3d11_device.cpp
+        d3d11/d3d11_image_renderer.cpp
+        d3d11/d3d11_immediate_drawer.cpp
+        d3d11/d3d11_presenter.cpp
+        d3d11/d3d11_provider.cpp
+        d3d11/d3d11_swap_chain.cpp
+    )
+endif()
+
 # Platform-specific sources
 if(WIN32)
     set(REXUI_PLATFORM_SOURCES
@@ -83,6 +95,10 @@ endif()
 
 if(REXGLUE_USE_D3D12)
     list(APPEND REXUI_SOURCES ${REXUI_D3D12_SOURCES})
+endif()
+
+if(REXGLUE_USE_D3D11)
+    list(APPEND REXUI_SOURCES ${REXUI_D3D11_SOURCES})
 endif()
 
 add_library(rexui OBJECT ${REXUI_SOURCES})
@@ -134,7 +150,7 @@ endif()
 if(WIN32)
     target_link_libraries(rexui PUBLIC
         dwmapi
-        Shcore
+        shcore
     )
 else()
     find_package(PkgConfig REQUIRED)
@@ -165,3 +181,7 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 
+
+if(REXGLUE_USE_D3D11)
+    target_link_libraries(rexui PUBLIC d3d11 dxgi d3dcompiler dxguid)
+endif()

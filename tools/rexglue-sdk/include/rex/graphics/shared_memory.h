@@ -86,6 +86,10 @@ class SharedMemory {
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
                      bool allow_streamed = false);
   bool RequestRange(uint32_t start, uint32_t length, bool allow_streamed = false);
+  // Detect changes to a native upload without declaring the mirror valid.
+  bool WatchCpuMemoryRange(uint32_t start, uint32_t length);
+  // Force CPU-owned texture inputs to be captured again by a new trace.
+  void InvalidateCpuMemoryRangeForTrace(uint32_t start, uint32_t length);
 
   // Call once per guest frame, on the command processor thread, to update
   // which pages count as streamed (see RequestRanges).
@@ -111,6 +115,10 @@ class SharedMemory {
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+  // A CPU snapshot cannot replace GPU-generated data that has not been read
+  // back. Checks whole pages, so a neighboring GPU write also keeps the range
+  // on the shared-memory path.
+  bool IsRangeGpuWritten(uint32_t start, uint32_t length);
   // Whether the host GPU buffer has memory behind a guest physical address
   // (always with a non-sparse buffer).
   uint32_t host_gpu_memory_sparse_granularity_log2_public() const {
@@ -125,6 +133,12 @@ class SharedMemory {
   }
 
  protected:
+  // Native GPU resources may hold newer bytes than the compatibility mirror.
+  // Called before requesting or overwriting a mirror range.
+  virtual bool FlushGpuWrittenRange(uint32_t /*start*/, uint32_t /*length*/,
+                                    bool /*writing*/ = false) {
+    return true;
+  }
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
   void InitializeCommon();

@@ -25,18 +25,6 @@ REXCVAR_DEFINE_STRING(perf_log_csv, "", "Perf",
 namespace rex::perf {
 
 namespace {
-std::atomic<uint64_t> g_guest_frame_index{0};
-}  // namespace
-
-uint64_t GuestFrameIndex() {
-  return g_guest_frame_index.load(std::memory_order_relaxed);
-}
-
-void AdvanceGuestFrameIndex() {
-  g_guest_frame_index.fetch_add(1, std::memory_order_relaxed);
-}
-
-namespace {
 
 constexpr size_t kNumCounters = static_cast<size_t>(CounterId::kCount);
 
@@ -65,6 +53,27 @@ constexpr const char* kCounterNames[] = {
     "texture_cache_misses",
     "pipeline_cache_hits",
     "pipeline_cache_misses",
+    "watch_faults",
+    "watch_fault_us",
+    "watch_protects",
+    "command_processor_cpu_us",
+    "cp_draw_us",
+    "cp_texture_request_us",
+    "cp_upload_us",
+    "cp_copy_us",
+    "cp_swap_us",
+    "upload_bytes",
+    "upload_lock_wait_us",
+    "upload_scan_us",
+    "upload_valid_us",
+    "upload_copy_us",
+    "upload_pool_us",
+    "watch_protect_us",
+    "cp_ring_idle_us",
+    "cp_wait_reg_mem_us",
+    "cp_gpu_fence_us",
+    "guest_swap_cpu_us",
+    "guest_swap_interval_us",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -88,6 +97,27 @@ constexpr bool kIsGauge[] = {
     false,  // kTextureCacheMisses
     false,  // kPipelineCacheHits
     false,  // kPipelineCacheMisses
+    false,  // kWatchFaults
+    false,  // kWatchFaultUs
+    false,  // kWatchProtects
+    false,  // kCommandProcessorCpuUs (set each frame)
+    false,  // kCpDrawUs
+    false,  // kCpTextureRequestUs
+    false,  // kCpUploadUs
+    false,  // kCpCopyUs
+    false,  // kCpSwapUs
+    false,  // kUploadBytes
+    false,  // kUploadLockWaitUs
+    false,  // kUploadScanUs
+    false,  // kUploadValidUs
+    false,  // kUploadCopyUs
+    false,  // kUploadPoolUs
+    false,  // kWatchProtectUs
+    false,  // kCpRingIdleUs
+    false,  // kCpWaitRegMemUs
+    false,  // kCpGpuFenceUs
+    false,  // kGuestSwapCpuUs
+    false,  // kGuestSwapIntervalUs
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

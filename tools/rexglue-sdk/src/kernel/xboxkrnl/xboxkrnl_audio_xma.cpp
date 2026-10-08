@@ -192,28 +192,22 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
 }
 
 u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_DATA> loop_data) {
-  XMA_CONTEXT_DATA context(context_ptr);
-
-  context.loop_start = loop_data->loop_start;
-  context.loop_end = loop_data->loop_end;
-  context.loop_count = loop_data->loop_count;
-  context.loop_subframe_end = loop_data->loop_subframe_end;
-  context.loop_subframe_skip = loop_data->loop_subframe_skip;
-
-  context.Store(context_ptr);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 3, 0x03FFFFFFu, loop_data->loop_start);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 4, 0x03FFFFFFu, loop_data->loop_end);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 0, 255u << 12, uint32_t(loop_data->loop_count) << 12);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 1, 63u << 14,
+                               (uint32_t(loop_data->loop_subframe_end) << 14) |
+                                   (uint32_t(loop_data->loop_subframe_skip) << 17));
 
   return 0;
 }
 
 u32 XMAGetInputBufferReadOffset_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  return context.input_buffer_read_offset;
+  return XMA_CONTEXT_DATA::LoadWord(context_ptr, 2) & 0x03FFFFFFu;
 }
 
 u32 XMASetInputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  context.input_buffer_read_offset = value;
-  context.Store(context_ptr);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 2, 0x03FFFFFFu, value);
 
   return 0;
 }
@@ -229,25 +223,18 @@ u32 XMASetInputBuffer0_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
     return X_E_FALSE;
   }
 
-  XMA_CONTEXT_DATA context(context_ptr);
-
-  context.input_buffer_0_ptr = buffer_physical_address;
-  context.input_buffer_0_packet_count = packet_count;
-
-  context.Store(context_ptr);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 5, 0xFFFFFFFFu, buffer_physical_address);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 0, 4095u, packet_count);
 
   return 0;
 }
 
 u32 XMAIsInputBuffer0Valid_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  return context.input_buffer_0_valid;
+  return (XMA_CONTEXT_DATA::LoadWord(context_ptr, 0) >> 20) & 1u;
 }
 
 u32 XMASetInputBuffer0Valid_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  context.input_buffer_0_valid = 1;
-  context.Store(context_ptr);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 0, 1u << 20, 1u << 20);
 
   return 0;
 }
@@ -263,63 +250,49 @@ u32 XMASetInputBuffer1_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
     return X_E_FALSE;
   }
 
-  XMA_CONTEXT_DATA context(context_ptr);
-
-  context.input_buffer_1_ptr = buffer_physical_address;
-  context.input_buffer_1_packet_count = packet_count;
-
-  context.Store(context_ptr);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 6, 0xFFFFFFFFu, buffer_physical_address);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 1, 4095u, packet_count);
 
   return 0;
 }
 
 u32 XMAIsInputBuffer1Valid_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  return context.input_buffer_1_valid;
+  return (XMA_CONTEXT_DATA::LoadWord(context_ptr, 0) >> 21) & 1u;
 }
 
 u32 XMASetInputBuffer1Valid_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  context.input_buffer_1_valid = 1;
-  context.Store(context_ptr);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 0, 1u << 21, 1u << 21);
 
   return 0;
 }
 
 u32 XMAIsOutputBufferValid_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  return context.output_buffer_valid;
+  return XMA_CONTEXT_DATA::LoadWord(context_ptr, 1) >> 31;
 }
 
 u32 XMASetOutputBufferValid_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  context.output_buffer_valid = 1;
-  context.Store(context_ptr);
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 1, 1u << 31, 1u << 31);
 
   return 0;
 }
 
 u32 XMAGetOutputBufferReadOffset_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  return context.output_buffer_read_offset;
+  return XMA_CONTEXT_DATA::LoadWord(context_ptr, 9) & 31u;
 }
 
 u32 XMASetOutputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  context.output_buffer_read_offset = value;
-  context.Store(context_ptr);
+  // Advancing the mixer must not overwrite samples published by the decoder.
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 9, 31u, value);
 
   return 0;
 }
 
 u32 XMAGetOutputBufferWriteOffset_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  return context.output_buffer_write_offset;
+  return XMA_CONTEXT_DATA::LoadWord(context_ptr, 0) >> 27;
 }
 
 u32 XMAGetPacketMetadata_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA context(context_ptr);
-  return context.packet_metadata;
+  return (XMA_CONTEXT_DATA::LoadWord(context_ptr, 4) >> 26) & 31u;
 }
 
 u32 XMAEnableContext_entry(mapped_void context_ptr) {

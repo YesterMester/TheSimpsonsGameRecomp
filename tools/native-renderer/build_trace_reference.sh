@@ -54,7 +54,8 @@ if [ "$failed" -ne 0 ]; then
   exit 1
 fi
 
+# Let LD_LIBRARY_PATH select the runtime for A/B runs.
 LD_LIBRARY_PATH=$HOME/simpsons-build-shim${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
   "$CXX" -o "$OUT" "$OBJ"/*.o -L"$SDK/out/linux-amd64" -lrexruntimerd "$SDK/out/linux-amd64/libsnappyrd.a" \
-  -Wl,-rpath,"$RPATH" -Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2
+  -Wl,-rpath,"$RPATH" -Wl,--enable-new-dtags -Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2
 echo "built $OUT (rpath $RPATH)"

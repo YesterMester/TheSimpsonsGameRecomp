@@ -31,7 +31,7 @@
 #include <rex/ui/virtual_key.h>
 #include <rex/ui/windowed_app_context_win.h>
 
-#include <ShellScalingApi.h>
+#include <shellscalingapi.h>
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <tpcshrd.h>

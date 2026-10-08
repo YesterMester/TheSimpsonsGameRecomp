@@ -93,6 +93,8 @@ REXCVAR_DEFINE_STRING(shader_inventory_csv, "", "GPU",
 // tools/native-renderer/native_shaders/build_native_shaders.py); anything
 // missing falls back to the runtime translator transparently. Empty uses the
 // native_shaders folder next to the executable, where release packages put it.
+REXCVAR_DECLARE(bool, native_vertex_buffers);
+
 REXCVAR_DEFINE_STRING(aot_shader_path, "", "GPU",
                       "Directory of ahead-of-time compiled shader modules (empty = the "
                       "native_shaders folder next to the executable if there is one, otherwise "
@@ -104,6 +106,11 @@ REXCVAR_DEFINE_STRING(aot_export_path, "", "GPU",
                       "(<hash>_<vs|ps>_<modification>.spv and <hash>_<vs|ps>.bind, in "
                       "scale<X>x<Y> for other draw resolution scales), to build a complete set "
                       "from the shader storage or from play");
+
+REXCVAR_DEFINE_BOOL(aot_export_storage, false, "GPU/Vulkan",
+                    "With aot_export_path, bake common modifications of stored shaders even "
+                    "when no recorded pipeline references them (offline tool)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_STRING(pipeline_inventory_json, "", "GPU",
                       "Path to write the full pipeline state inventory to at exit "
@@ -696,7 +703,60 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
            shader_storage_file_);
   }
 
-  // Translate shader modifications needed for stored pipelines.
+  // A storage made from the executable has programs but no recorded pipeline
+  // state. Bake ordinary vertex and pixel modifications using their actual
+  // interpolator masks. Other draw state and dynamically indexed register
+  // counts still come from recorded pipelines, or translate at first use.
+  if (REXCVAR_GET(aot_export_storage) && !REXCVAR_GET(aot_export_path).empty() &&
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+    std::unordered_set<uint32_t> interpolator_masks = {0};
+    reg::SQ_PROGRAM_CNTL program_cntl = {};
+    program_cntl.ps_num_reg = 63;
+    reg::SQ_CONTEXT_MISC context_misc = {};
+    for (const auto& [hash, shader] : shaders_) {
+      if (!shader->is_ucode_analyzed()) {
+        shader->AnalyzeUcode(ucode_disasm_buffer_);
+      }
+      if (shader->type() != xenos::ShaderType::kPixel ||
+          shader->uses_register_dynamic_addressing()) {
+        continue;
+      }
+      uint32_t param_gen_pos;
+      uint32_t mask = shader->GetInterpolatorInputMask(program_cntl, context_misc, param_gen_pos);
+      interpolator_masks.insert(mask);
+      SpirvShaderTranslator::Modification modification(
+          shader_translator_->GetDefaultPixelShaderModification(0));
+      modification.pixel.interpolator_mask = mask;
+      shader_translations_needed.emplace(hash, modification.value);
+      if (shader->implicit_early_z_write_allowed()) {
+        modification.pixel.depth_stencil_mode =
+            SpirvShaderTranslator::Modification::DepthStencilMode::kEarlyHint;
+        shader_translations_needed.emplace(hash, modification.value);
+      }
+    }
+    uint32_t dynamic_shaders = 0;
+    for (const auto& [hash, shader] : shaders_) {
+      if (shader->uses_register_dynamic_addressing()) {
+        ++dynamic_shaders;
+        continue;
+      }
+      if (shader->type() != xenos::ShaderType::kVertex) {
+        continue;
+      }
+      SpirvShaderTranslator::Modification modification(
+          shader_translator_->GetDefaultVertexShaderModification(0));
+      for (uint32_t mask : interpolator_masks) {
+        modification.vertex.interpolator_mask = mask & shader->writes_interpolators();
+        shader_translations_needed.emplace(hash, modification.value);
+      }
+    }
+    REXGPU_INFO(
+        "[aot-storage] {} stored programs, {} common modifications, {} dynamic "
+        "programs need recorded register counts",
+        shaders_.size(), shader_translations_needed.size(), dynamic_shaders);
+  }
+
+  // Translate shader modifications needed for stored pipelines or the bake.
   for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {
     auto shader_it = shaders_.find(translation_needed.first);
     if (shader_it == shaders_.end()) {
@@ -717,6 +777,27 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
         (++aot_misses_, !TranslateAnalyzedShader(*shader_translator_, *translation))) {
       if (translation_is_new) {
         shader->DestroyTranslation(translation_needed.second);
+      }
+    }
+    // Native stream addressing changes only the vertex fetch loads. Keep both
+    // versions: resource ownership and bounds may require a fallback on any
+    // draw. Prewarm the other version too, and include it in exported sets.
+    if (shader->type() == xenos::ShaderType::kVertex) {
+      SpirvShaderTranslator::Modification native(translation_needed.second);
+      if (native.vertex.host_vertex_shader_type == Shader::HostVertexShaderType::kVertex &&
+          (native.vertex.native_vertex_streams ||
+           (shader->has_static_vertex_addresses() &&
+            (REXCVAR_GET(native_vertex_buffers) || !REXCVAR_GET(aot_export_path).empty())))) {
+        native.vertex.native_vertex_streams = !native.vertex.native_vertex_streams;
+        bool native_is_new = false;
+        auto* native_translation = static_cast<VulkanShader::VulkanTranslation*>(
+            shader->GetOrCreateTranslation(native.value, &native_is_new));
+        if (!native_translation->is_translated() &&
+            !TryLoadAotTranslation(*native_translation, "vs") &&
+            (++aot_misses_, !TranslateAnalyzedShader(*shader_translator_, *native_translation)) &&
+            native_is_new) {
+          shader->DestroyTranslation(native.value);
+        }
       }
     }
   }
@@ -751,13 +832,37 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     }
   }
 
+  // Preload both buffer paths for stored draws. A ready shader module still
+  // needs a driver pipeline; waiting for its first native draw would cause
+  // an async placeholder and skip that frame's presentation.
+  std::vector<PipelineDescription> pipeline_descriptions;
+  pipeline_descriptions.reserve(pipeline_stored_descriptions.size() * 2);
+  for (const PipelineStoredDescription& stored : pipeline_stored_descriptions) {
+    pipeline_descriptions.push_back(stored.description);
+    if (edram_fragment_shader_interlock) {
+      continue;
+    }
+    auto shader_it = shaders_.find(stored.description.vertex_shader_hash);
+    if (shader_it == shaders_.end()) {
+      continue;
+    }
+    SpirvShaderTranslator::Modification native(stored.description.vertex_shader_modification);
+    if (native.vertex.host_vertex_shader_type != Shader::HostVertexShaderType::kVertex ||
+        (!native.vertex.native_vertex_streams &&
+         (!REXCVAR_GET(native_vertex_buffers) ||
+          !shader_it->second->has_static_vertex_addresses()))) {
+      continue;
+    }
+    native.vertex.native_vertex_streams = !native.vertex.native_vertex_streams;
+    PipelineDescription description = stored.description;
+    description.vertex_shader_modification = native.value;
+    pipeline_descriptions.push_back(description);
+  }
+
   // Create the pipelines.
   std::vector<PipelineCreationArguments> pipeline_creations;
-  pipeline_creations.reserve(pipeline_stored_descriptions.size());
-  for (const PipelineStoredDescription& pipeline_stored_description :
-       pipeline_stored_descriptions) {
-    const PipelineDescription& pipeline_description = pipeline_stored_description.description;
-
+  pipeline_creations.reserve(pipeline_descriptions.size());
+  for (const PipelineDescription& pipeline_description : pipeline_descriptions) {
     auto find_it = pipelines_.find(pipeline_description);
     if (find_it != pipelines_.end()) {
       continue;

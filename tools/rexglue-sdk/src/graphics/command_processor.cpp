@@ -11,6 +11,8 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
+#include <ctime>
 #include <condition_variable>
 #include <mutex>
 #include <bitset>
@@ -27,6 +29,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/perf/event_trace.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
@@ -47,6 +50,19 @@
 
 #if REX_PLATFORM_LINUX
 #include <sys/resource.h>
+#elif REX_PLATFORM_WIN32
+// clang-format off
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+// clang-format on
+#endif
+#if REX_HAS_D3D11
+#include <rex/graphics/d3d11/profile.h>
 #endif
 
 namespace rex::memory {
@@ -63,6 +79,8 @@ extern std::atomic<uint32_t> g_watch_view_protects[3];
 
 namespace rex::graphics {
 // Defined in shared_memory.cpp, for the gpu_wait_stats log.
+extern std::atomic<uint64_t> g_watch_arms_vertex;
+extern std::atomic<uint64_t> g_watch_arms_other;
 extern std::atomic<uint64_t> g_streamed_page_uploads;
 extern std::atomic<uint64_t> g_streamed_page_max_uploads;
 extern std::atomic<uint64_t> g_streamed_pages_over[4];
@@ -241,6 +259,16 @@ void GetCommandProcessorThreadTimes(double& user_ms, double& system_ms) {
     user_ms = double(usage.ru_utime.tv_sec) * 1000.0 + double(usage.ru_utime.tv_usec) / 1000.0;
     system_ms = double(usage.ru_stime.tv_sec) * 1000.0 + double(usage.ru_stime.tv_usec) / 1000.0;
   }
+#elif REX_PLATFORM_WIN32
+  FILETIME creation, exited, kernel, user;
+  if (GetThreadTimes(GetCurrentThread(), &creation, &exited, &kernel, &user)) {
+    // FILETIME counts 100-nanosecond intervals.
+    auto to_ms = [](const FILETIME& time) {
+      return double((uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime) / 10000.0;
+    };
+    user_ms = to_ms(user);
+    system_ms = to_ms(kernel);
+  }
 #endif
 }
 
@@ -358,6 +386,12 @@ void LogGpuWaitStats(uint32_t interval) {
   double user_ms, system_ms;
   GetCommandProcessorThreadTimes(user_ms, system_ms);
   uint64_t streamed_page_uploads = g_streamed_page_uploads.exchange(0);
+  uint64_t watch_arms_vertex = g_watch_arms_vertex.exchange(0);
+  uint64_t watch_arms_other = g_watch_arms_other.exchange(0);
+  REXGPU_INFO(
+      "[gpu-wait]   watch arming: {:.1f} for vertex / index data, {:.1f} for textures and "
+      "the rest per frame",
+      double(watch_arms_vertex) / frames, double(watch_arms_other) / frames);
   REXGPU_INFO(
       "[gpu-wait]   write watches: {:.1f} protects ({:.3f} ms), {:.1f} guest write faults "
       "({:.3f} ms in handlers), {:.1f} streamed pages uploaded unwatched | command processor "
@@ -434,6 +468,86 @@ void LogGpuWaitStats(uint32_t interval) {
         double(vulkan::g_stencil_nonzero_clears.exchange(0)) / frames);
   }
 #endif  // REX_HAS_VULKAN
+#if REX_HAS_D3D11
+  {
+    auto& profile = d3d11::g_profile;
+    auto take = [](std::atomic<uint64_t>& value) { return value.exchange(0); };
+    uint64_t ns[size_t(d3d11::ProfilePhase::kCount)];
+    for (size_t i = 0; i < std::size(ns); ++i) {
+      ns[i] = take(profile.ns[i]);
+    }
+    auto ns_ms = [&](uint64_t value) { return double(value) / 1e6 / frames; };
+    auto phase_ms = [&](d3d11::ProfilePhase phase) { return ns_ms(ns[size_t(phase)]); };
+    uint64_t draw_ns = 0;
+    for (size_t i = 0; i <= size_t(d3d11::ProfilePhase::kDrawReadback); ++i) {
+      draw_ns += ns[i];
+    }
+    uint64_t draws = take(profile.draws), resolves = take(profile.resolves);
+    uint64_t uploads = take(profile.memory_uploads);
+    uint64_t upload_bytes = take(profile.memory_upload_bytes);
+    uint64_t invalidations = take(profile.context_invalidations);
+    uint64_t buffer_hits = take(profile.buffer_hits);
+    uint64_t buffer_creations = take(profile.buffer_creations);
+    uint64_t buffer_bytes = take(profile.buffer_creation_bytes);
+    uint64_t output_changes = take(profile.output_changes);
+    uint64_t transfers = take(profile.transfers), transfer_draws = take(profile.transfer_draws);
+    uint64_t transfer_pixels = take(profile.transfer_pixels);
+    uint64_t transfer_same_format = take(profile.transfer_same_format);
+    uint64_t snapshots = take(profile.snapshots), snapshot_bytes = take(profile.snapshot_bytes);
+    uint64_t gpu_ns[size_t(d3d11::GpuCategory::kCount)];
+    uint64_t gpu_total_ns = 0;
+    for (size_t i = 0; i < std::size(gpu_ns); ++i) {
+      gpu_ns[i] = take(profile.gpu_ns[i]);
+      gpu_total_ns += gpu_ns[i];
+    }
+    uint64_t gpu_frames = take(profile.gpu_frames);
+    uint64_t gpu_disjoint = take(profile.gpu_disjoint_frames);
+    if (draws || resolves) {
+      using Phase = d3d11::ProfilePhase;
+      REXGPU_INFO(
+          "[gpu-wait]   DX11 per frame: {:.1f} draws in {:.2f} ms (context {:.2f}, setup {:.2f}, "
+          "primitives {:.2f}, render targets {:.2f}, shaders {:.2f}, textures {:.2f}, streams "
+          "{:.2f}, bindings {:.2f}, pipelines {:.2f}, submit {:.2f}, readback {:.2f}), {:.1f} "
+          "resolves in {:.2f} ms, swap {:.2f} ms",
+          double(draws) / frames, ns_ms(draw_ns), phase_ms(Phase::kDrawContext),
+          phase_ms(Phase::kDrawSetup), phase_ms(Phase::kDrawPrimitives),
+          phase_ms(Phase::kDrawRenderTargets), phase_ms(Phase::kDrawShaders),
+          phase_ms(Phase::kDrawTextures), phase_ms(Phase::kDrawStreams),
+          phase_ms(Phase::kDrawBindings), phase_ms(Phase::kDrawPipelines),
+          phase_ms(Phase::kDrawSubmit), phase_ms(Phase::kDrawReadback), double(resolves) / frames,
+          phase_ms(Phase::kResolve), phase_ms(Phase::kSwap));
+      REXGPU_INFO(
+          "[gpu-wait]   DX11 resources per frame: {:.1f} buffers created or rewritten ({:.1f} "
+          "KiB), {:.1f} reused, {:.1f} guest memory uploads ({:.1f} KiB), {:.1f} context resets, "
+          "{:.1f} output changes",
+          double(buffer_creations) / frames, double(buffer_bytes) / 1024.0 / frames,
+          double(buffer_hits) / frames, double(uploads) / frames,
+          double(upload_bytes) / 1024.0 / frames, double(invalidations) / frames,
+          double(output_changes) / frames);
+      REXGPU_INFO(
+          "[gpu-wait]   DX11 render target transfers per frame: {:.1f} ({:.1f} with the same "
+          "format and pitch) in {:.1f} draws over {:.2f} Mpixels, {:.1f} snapshots ({:.1f} MiB)",
+          double(transfers) / frames, double(transfer_same_format) / frames,
+          double(transfer_draws) / frames, double(transfer_pixels) / 1e6 / frames,
+          double(snapshots) / frames, double(snapshot_bytes) / 1048576.0 / frames);
+      if (gpu_frames) {
+        using Category = d3d11::GpuCategory;
+        auto gpu_ms = [&](Category category) {
+          return double(gpu_ns[size_t(category)]) / 1e6 / double(gpu_frames);
+        };
+        REXGPU_INFO(
+            "[gpu-wait]   DX11 GPU per frame over {} frames ({} disjoint): {:.2f} ms (draws "
+            "{:.2f}, render target transfers {:.2f}, textures {:.2f}, resolves: encoding {:.2f}, "
+            "copies {:.2f}, original-resolution copies {:.2f}, clears {:.2f}, swap {:.2f})",
+            gpu_frames, gpu_disjoint, double(gpu_total_ns) / 1e6 / double(gpu_frames),
+            gpu_ms(Category::kDraws), gpu_ms(Category::kRenderTargets), gpu_ms(Category::kTextures),
+            gpu_ms(Category::kResolves), gpu_ms(Category::kResolveCopies),
+            gpu_ms(Category::kResolveMirrors), gpu_ms(Category::kResolveClears),
+            gpu_ms(Category::kSwap));
+      }
+    }
+  }
+#endif  // REX_HAS_D3D11
   uint64_t streamed_max = g_streamed_page_max_uploads.exchange(0);
   uint64_t streamed_over[4];
   for (uint32_t i = 0; i < 4; ++i) {
@@ -691,6 +805,8 @@ void CommandProcessor::WorkerThreadMain() {
       PrepareForWait();
       const bool wait_stats = REXCVAR_GET(gpu_wait_stats) > 0;
       uint64_t idle_start_tick = wait_stats ? rex::chrono::Clock::QueryHostTickCount() : 0;
+      rex::perf::ScopedCounterTimer idle_timer(rex::perf::CounterId::kCpRingIdleUs);
+      rex::perf::TraceEvent("idle");
       uint32_t loop_count = 0;
       do {
         if (loop_count < 32) {
@@ -703,6 +819,8 @@ void CommandProcessor::WorkerThreadMain() {
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      idle_timer.Stop();
+      rex::perf::TraceEvent("idle_done");
       if (wait_stats) {
         ++g_gpu_wait_stats.ring_idle_waits;
         g_gpu_wait_stats.ring_idle_ticks +=
@@ -1096,6 +1214,8 @@ void CommandProcessor::PrepareForWait() {
 void CommandProcessor::ReturnFromWait() {}
 
 void CommandProcessor::RecordHostGpuFenceWait(uint64_t host_ticks, bool full_sync) {
+  PERF_counter_add(kCpGpuFenceUs,
+                   int64_t(host_ticks * 1000000 / rex::chrono::Clock::QueryHostTickFrequency()));
   if (REXCVAR_GET(gpu_wait_stats) <= 0) {
     return;
   }
@@ -1168,6 +1288,9 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 REXCVAR_DEFINE_BOOL(pm4_bulk_float_constants, true, "GPU",
                     "Apply type-0 packets of shader float constants as one range instead of "
                     "register by register");
+
+REXCVAR_DEFINE_BOOL(pm4_bulk_state_registers, false, "GPU",
+                    "Apply type-0 packets of context and fetch/bool/loop constants as ranges");
 
 REXCVAR_DEFINE_INT32(pm4_census, 0, "GPU",
                      "Log a per-frame census of the PM4 command stream every N frames "
@@ -1401,10 +1524,21 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
-  if (!write_one_reg && base_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
-      base_index + count - 1 <= XE_GPU_REG_SHADER_CONSTANT_511_W &&
-      REXCVAR_GET(pm4_bulk_float_constants)) {
-    // Most of this game's command stream: no per-register side effects.
+  uint32_t end_index = base_index + count - 1;
+  bool bulk_float = REXCVAR_GET(pm4_bulk_float_constants) &&
+                    base_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+                    end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W;
+  bool bulk_state = REXCVAR_GET(pm4_bulk_state_registers) &&
+                    ((base_index >= 0x2000 && end_index < XE_GPU_REG_SHADER_CONSTANT_000_X) ||
+                     (base_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+                      end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+                     (base_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+                      end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31));
+  if (!write_one_reg && (bulk_float || bulk_state)) {
+    // These ranges have no sequential register side effects. The backend's
+    // range writer still invalidates every affected constant buffer and fetch
+    // binding. Scratch, gamma, status and single-register packets keep their
+    // ordered writes below.
     WriteRegisterRangeFromRing(reader, base_index, count);
     trace_writer_.WritePacketEnd();
     return true;
@@ -1662,6 +1796,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       if (graphics_system_) {
+        rex::perf::TraceEvent("swap_irq", n);
         graphics_system_->DispatchInterruptCallback(1, n);
       }
     }
@@ -1687,6 +1822,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   }
 #endif
   rex::perf::Profiler::Flip();
+  rex::perf::TraceEvent("cpswap");
 
   // Xenia-specific VdSwap hook.
   // VdSwap will post this to tell us we need to swap the screen/fire an
@@ -1704,6 +1840,21 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   // Pick up changes of the legacy memexport readback cvar once per frame.
   legacy_readback_memexport_overridden_ = -1;
 
+  // The command processor thread's CPU time since the previous swap.
+  {
+#if REX_PLATFORM_LINUX
+    timespec thread_cpu_time;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &thread_cpu_time) == 0) {
+      static int64_t last_thread_cpu_us = -1;
+      int64_t thread_cpu_us =
+          int64_t(thread_cpu_time.tv_sec) * 1000000 + thread_cpu_time.tv_nsec / 1000;
+      if (last_thread_cpu_us >= 0) {
+        PERF_counter_set(kCommandProcessorCpuUs, thread_cpu_us - last_thread_cpu_us);
+      }
+      last_thread_cpu_us = thread_cpu_us;
+    }
+#endif
+  }
   int32_t wait_stats_interval = REXCVAR_GET(gpu_wait_stats);
   uint64_t swap_start_tick =
       wait_stats_interval > 0 ? rex::chrono::Clock::QueryHostTickCount() : 0;
@@ -1904,6 +2055,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint64_t unmet_start_tick = 0;
   uint32_t unmet_value = 0;
   bool matched = false;
+  bool unmet_timed = false;
+  std::chrono::steady_clock::time_point unmet_start_time;
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1945,9 +2098,20 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (!unmet_timed) {
+        unmet_timed = true;
+        unmet_start_time = std::chrono::steady_clock::now();
+        rex::perf::TraceEvent("wrm_wait", poll_reg_addr);
+      }
       if (wait_stats && !unmet_start_tick) {
         unmet_start_tick = rex::chrono::Clock::QueryHostTickCount();
         unmet_value = value;
+      }
+      // A vblank may be what this waits for (the game's swaps are released by
+      // its vblank interrupt): raise it here if it's due and the vblank
+      // thread hasn't gotten to it.
+      if (graphics_system_) {
+        graphics_system_->DeliverDueVblanks();
       }
       // Wait.
       if (wait >= 0x100) {
@@ -1982,6 +2146,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
   } while (!matched);
 
+  if (unmet_timed) {
+    rex::perf::TraceEvent("wrm_done", poll_reg_addr);
+    PERF_counter_add(kCpWaitRegMemUs, std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - unmet_start_time)
+                                          .count());
+  }
   if (wait_stats) {
     RecordGpuWait(poll_reg_addr, wait_info, mask, ref, wait, g_pm4_indirect_depth != 0,
                   unmet_start_tick != 0, unmet_value,

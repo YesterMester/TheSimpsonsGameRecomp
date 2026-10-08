@@ -21,8 +21,8 @@
 #include <windows.h>
 #include <windowsx.h>
 
-#include <ObjBase.h>
-#include <SDKDDKVer.h>
+#include <objbase.h>
+#include <sdkddkver.h>
 #include <bcrypt.h>
 #include <dwmapi.h>
 #include <shellapi.h>

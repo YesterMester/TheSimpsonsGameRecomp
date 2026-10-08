@@ -10,14 +10,18 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
+#include <rex/graphics/util/native_buffer_watch.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -41,7 +45,44 @@ REXCVAR_DEFINE_BOOL(vulkan_geometry_shader_primitives, true, "GPU/Vulkan",
                     "the only way on devices without geometry shaders such as Mali GPUs")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(native_index_buffer_cache, false, "GPU/Vulkan",
+                    "Retain immutable DMA index buffers, validating their bytes before reuse")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(native_index_buffer_cache_mb, 16, "GPU/Vulkan",
+                     "Maximum MiB per retained index buffer generation")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_index_bounds_cache, false, "GPU/Vulkan",
+                    "Reuse vertex bounds of verified immutable native index snapshots")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DECLARE(bool, native_buffer_write_watches);
+
 namespace rex::graphics::vulkan {
+
+struct VulkanPrimitiveProcessor::NativeIndexCache {
+  struct Entry {
+    std::vector<uint8_t> bytes;
+    std::pair<VkBuffer, VkDeviceSize> buffer;
+    std::unique_ptr<NativeBufferWatch> watch;
+    std::array<uint32_t, 5> bounds_key{};
+    draw_util::VertexIndexBounds bounds;
+    bool bounds_valid = false;
+  };
+  explicit NativeIndexCache(const ui::vulkan::VulkanDevice* device)
+      : pool(device, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, size_t(2) << 20) {}
+  ui::vulkan::VulkanUploadBufferPool pool;
+  std::unordered_map<uint64_t, Entry> entries;
+  uint64_t bytes = 0;
+};
+
+VulkanPrimitiveProcessor::VulkanPrimitiveProcessor(const RegisterFile& register_file,
+                                                   memory::Memory& memory,
+                                                   TraceWriter& trace_writer,
+                                                   SharedMemory& shared_memory,
+                                                   VulkanCommandProcessor& command_processor)
+    : PrimitiveProcessor(register_file, memory, trace_writer, shared_memory),
+      command_processor_(command_processor) {}
 
 VulkanPrimitiveProcessor::~VulkanPrimitiveProcessor() {
   Shutdown(true);
@@ -89,6 +130,8 @@ void VulkanPrimitiveProcessor::Shutdown(bool from_destructor) {
   const VkDevice device = vulkan_device->device();
 
   frame_index_buffers_.clear();
+  native_index_cache_.reset();
+  native_index_caches_retired_.clear();
   frame_index_buffer_pool_.reset();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, builtin_index_buffer_upload_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
@@ -99,6 +142,13 @@ void VulkanPrimitiveProcessor::Shutdown(bool from_destructor) {
   if (!from_destructor) {
     ShutdownCommon();
   }
+}
+
+void VulkanPrimitiveProcessor::ClearCache() {
+  // The command processor has waited for all queue operations.
+  frame_index_buffer_pool_->ClearCache();
+  native_index_cache_.reset();
+  native_index_caches_retired_.clear();
 }
 
 void VulkanPrimitiveProcessor::CompletedSubmissionUpdated() {
@@ -141,10 +191,17 @@ void VulkanPrimitiveProcessor::BeginSubmission() {
 
 void VulkanPrimitiveProcessor::BeginFrame() {
   frame_index_buffer_pool_->Reclaim(command_processor_.GetCompletedFrame());
+  while (!native_index_caches_retired_.empty() &&
+         native_index_caches_retired_.front().first <= command_processor_.GetCompletedFrame()) {
+    native_index_caches_retired_.pop_front();
+  }
 }
 
 void VulkanPrimitiveProcessor::EndSubmission() {
   frame_index_buffer_pool_->FlushWrites();
+  if (native_index_cache_) {
+    native_index_cache_->pool.FlushWrites();
+  }
 }
 
 void VulkanPrimitiveProcessor::EndFrame() {
@@ -236,6 +293,105 @@ void* VulkanPrimitiveProcessor::RequestHostConvertedIndexBufferForCurrentFrame(
   backend_handle_out = frame_index_buffers_.size();
   frame_index_buffers_.emplace_back(buffer, offset);
   return mapping;
+}
+
+draw_util::VertexIndexBounds VulkanPrimitiveProcessor::GetNativeVertexIndexBounds(
+    const ProcessingResult& primitives, xenos::Endian endian, uint32_t base, uint32_t clamp_min,
+    uint32_t clamp_max) {
+  bool index_16 = primitives.host_index_format == xenos::IndexFormat::kInt16;
+  bool restart = primitives.host_primitive_reset_enabled;
+  NativeIndexCache::Entry* entry = nullptr;
+  std::array<uint32_t, 5> key = {
+      primitives.host_draw_vertex_count, base, clamp_min, clamp_max,
+      uint32_t(endian) | (uint32_t(index_16) << 8) | (uint32_t(restart) << 9)};
+  if (REXCVAR_GET(native_index_bounds_cache) && native_index_cache_) {
+    uint64_t length = uint64_t(primitives.host_draw_vertex_count) * (index_16 ? 2 : 4);
+    if (length <= UINT32_MAX) {
+      uint64_t buffer_key = (uint64_t(primitives.guest_index_base) << 32) | length;
+      auto found = native_index_cache_->entries.find(buffer_key);
+      // Process validated the bytes before returning this immutable shadow.
+      // Its identity excludes the fresh scratch shadow rewritten each draw.
+      if (found != native_index_cache_->entries.end() &&
+          primitives.native_index_snapshot == found->second.bytes.data()) {
+        entry = &found->second;
+        if (entry->bounds_valid && entry->bounds_key == key) {
+          static thread_local uint64_t reused = 0;
+          if (++reused <= 8 || !(reused & 4095)) {
+            REXGPU_INFO("[native-index-bounds-reuse] {} verified scans reused", reused);
+          }
+          return entry->bounds;
+        }
+      }
+    }
+  }
+  auto bounds = draw_util::GetVertexIndexBounds(primitives.native_index_snapshot,
+                                                primitives.host_draw_vertex_count, index_16, endian,
+                                                restart, base, clamp_min, clamp_max);
+  if (entry) {
+    entry->bounds_key = key;
+    entry->bounds = bounds;
+    entry->bounds_valid = true;
+  }
+  return bounds;
+}
+
+bool VulkanPrimitiveProcessor::TryRetainedNativeIndexBuffer(uint32_t address, uint32_t length,
+                                                            const void* source,
+                                                            size_t& backend_handle_out,
+                                                            const void*& cpu_snapshot_out) {
+  if (!REXCVAR_GET(native_index_buffer_cache) || !length || length > (1u << 20)) {
+    return false;
+  }
+  uint64_t key = (uint64_t(address) << 32) | length;
+  if (native_index_cache_) {
+    auto found = native_index_cache_->entries.find(key);
+    if (found != native_index_cache_->entries.end()) {
+      const NativeIndexCache::Entry& entry = found->second;
+      if ((!entry.watch || !entry.watch->IsCurrent()) &&
+          std::memcmp(entry.bytes.data(), source, length)) {
+        // Keep the old GPU version immutable while earlier draws use it.
+        return false;
+      }
+      cpu_snapshot_out = entry.bytes.data();
+      backend_handle_out = frame_index_buffers_.size();
+      frame_index_buffers_.push_back(entry.buffer);
+      static thread_local uint64_t reused = 0;
+      if (++reused <= 8 || !(reused & 4095)) {
+        REXGPU_INFO("[native-index-reuse] {} unchanged snapshots reused", reused);
+      }
+      return true;
+    }
+    size_t byte_limit = size_t(std::clamp(REXCVAR_GET(native_index_buffer_cache_mb), 1, 64)) << 20;
+    if (native_index_cache_->bytes + length > byte_limit ||
+        native_index_cache_->entries.size() >= 4096) {
+      native_index_cache_->pool.FlushWrites();
+      native_index_caches_retired_.emplace_back(command_processor_.GetCurrentFrame(),
+                                                std::move(native_index_cache_));
+    }
+  }
+  if (!native_index_cache_) {
+    native_index_cache_ = std::make_unique<NativeIndexCache>(command_processor_.GetVulkanDevice());
+  }
+  NativeIndexCache::Entry entry;
+  entry.bytes.resize(length);
+  std::memcpy(entry.bytes.data(), source, length);
+  uint8_t* mapping =
+      native_index_cache_->pool.Request(command_processor_.GetCurrentFrame(), length,
+                                        sizeof(uint32_t), entry.buffer.first, entry.buffer.second);
+  if (!mapping) {
+    return false;
+  }
+  std::memcpy(mapping, entry.bytes.data(), length);
+  backend_handle_out = frame_index_buffers_.size();
+  frame_index_buffers_.push_back(entry.buffer);
+  native_index_cache_->bytes += length;
+  if (REXCVAR_GET(native_buffer_write_watches) && length >= 1024) {
+    entry.watch = std::make_unique<NativeBufferWatch>(shared_memory());
+    entry.watch->AddRange(address, length, entry.bytes.data(), source);
+  }
+  cpu_snapshot_out =
+      native_index_cache_->entries.emplace(key, std::move(entry)).first->second.bytes.data();
+  return true;
 }
 
 }  // namespace rex::graphics::vulkan

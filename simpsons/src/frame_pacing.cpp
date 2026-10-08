@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
@@ -25,10 +26,37 @@ REXCVAR_DEFINE_INT32(menu_frame_rate, 30, "GPU",
                      "runs its logic once per frame and was made for 30 fps (0 = same as gameplay)")
     .range(0, 240);
 
+REXCVAR_DEFINE_BOOL(frame_pacing_vblank_lock, false, "GPU",
+                    "Put the game's frame deadlines on the vblank grid. The game times its frames "
+                    "on its own 59.94 Hz clock, which drifts against the 60 Hz vblank its swaps "
+                    "wait for, so for seconds at a time frames finished right at a vblank and "
+                    "reached the screen at uneven times");
+
+REXCVAR_DEFINE_INT32(frame_pacing_vblank_offset_us, 0, "GPU",
+                     "With frame_pacing_vblank_lock, where frame deadlines go relative to the "
+                     "vblank, in microseconds (negative = before it)")
+    .range(-16000, 16000);
+
+REXCVAR_DEFINE_BOOL(present_late_frames_immediately, true, "GPU",
+                    "Show a frame that is finished just after its vblank right away instead of "
+                    "holding it until the next vblank. The game only allowed that within 0% of a "
+                    "frame (on the console it tears), so a frame late by a fraction of a "
+                    "millisecond was shown a whole frame late: a stutter. The host presents "
+                    "without tearing either way");
+
 // Steps the Havok world by f1 seconds of frame time. Runs every frame while a
 // level is live and never in the front end.
 REX_EXTERN(__imp__sub_827A55C0);
 REX_EXTERN(sub_827A55C0);
+
+// The XDK's swap callback (D3D's swap queue), called by the GPU interrupt the
+// command stream raises when it reaches a Swap, right before the GPU waits
+// for the swap to be released. r3 = front buffer address | present interval
+// << 8 | immediate threshold: if the target vblank has already passed, the
+// swap is released now when less than this percentage of a frame has passed
+// since the last vblank, otherwise at the next vblank. The game passes 0.
+REX_EXTERN(__imp__sub_82453EB0);
+REX_EXTERN(sub_82453EB0);
 
 // Returns the time until the frame scheduler's next deadline. r3 = the
 // scheduler, which holds the frame's start timebase at +136 and its periods
@@ -36,6 +64,18 @@ REX_EXTERN(sub_827A55C0);
 // refresh rate (59.94 Hz), whatever rate the guest vblank runs at.
 REX_EXTERN(__imp__sub_82718710);
 REX_EXTERN(sub_82718710);
+
+// Marks the start of a frame: the scheduler's start timebase (+136) = now.
+REX_EXTERN(__imp__sub_82718788);
+REX_EXTERN(sub_82718788);
+
+// From the runtime, referenced weakly so this still runs with runtimes that
+// don't have them.
+extern "C" bool rex_graphics_get_vblank_schedule(uint64_t* last_vblank_ticks,
+                                                 uint64_t* interval_ticks) __attribute__((weak));
+namespace rex::perf {
+void TraceEvent(const char* name, uint64_t arg) __attribute__((weak));
+}  // namespace rex::perf
 
 namespace {
 
@@ -66,6 +106,13 @@ void StoreBE32(uint8_t* base, uint32_t address, uint32_t value) {
 }
 
 }  // namespace
+
+REX_FUNC(sub_82453EB0) {
+  if (REXCVAR_GET(present_late_frames_immediately)) {
+    ctx.r3.u64 = (ctx.r3.u32 & ~uint32_t(0xFF)) | 100;
+  }
+  __imp__sub_82453EB0(ctx, base);
+}
 
 REX_FUNC(sub_827A55C0) {
   g_last_level_step_ns.store(NowNs(), std::memory_order_relaxed);
@@ -109,4 +156,33 @@ REX_FUNC(sub_82718710) {
     }
   }
   __imp__sub_82718710(ctx, base);
+  // r3 = timebase ticks until the frame's deadline. Move the deadline to the
+  // nearest vblank (plus the offset), so frames start in step with the
+  // vblanks that release their swaps.
+  uint64_t last_vblank = 0, vblank_interval = 0;
+  if (REXCVAR_GET(frame_pacing_vblank_lock) && rex_graphics_get_vblank_schedule &&
+      rex_graphics_get_vblank_schedule(&last_vblank, &vblank_interval) && vblank_interval) {
+    uint64_t now = rex::chrono::Clock::QueryGuestTickCount();
+    int64_t offset_ticks = int64_t(REXCVAR_GET(frame_pacing_vblank_offset_us)) *
+                           int64_t(rex::chrono::Clock::guest_tick_frequency()) / 1000000;
+    int64_t interval = int64_t(vblank_interval);
+    int64_t grid_base = int64_t(last_vblank) + offset_ticks;
+    int64_t deadline = int64_t(now) + int64_t(ctx.r3.u32);
+    // Nearest grid point to the game's deadline, then not in the past.
+    int64_t from_base = deadline - grid_base;
+    int64_t steps = from_base >= 0 ? (from_base + interval / 2) / interval
+                                   : -((-from_base + interval / 2) / interval);
+    int64_t snapped = grid_base + steps * interval;
+    while (snapped <= int64_t(now)) {
+      snapped += interval;
+    }
+    ctx.r3.u64 = uint32_t(snapped - int64_t(now));
+  }
+}
+
+REX_FUNC(sub_82718788) {
+  __imp__sub_82718788(ctx, base);
+  if (rex::perf::TraceEvent) {
+    rex::perf::TraceEvent("frame_start", 0);
+  }
 }

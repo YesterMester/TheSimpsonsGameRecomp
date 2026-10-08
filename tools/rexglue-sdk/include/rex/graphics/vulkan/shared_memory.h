@@ -11,6 +11,7 @@
  */
 
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -46,7 +47,11 @@ class VulkanSharedMemory : public SharedMemory {
   };
   // Inserts a pipeline barrier for the target usage, also ensuring consecutive
   // read-write accesses are ordered with each other.
-  void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
+  void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {},
+           std::pair<uint32_t, uint32_t> read_range = {});
+  void SetNativeResolveMemoryFlusher(std::function<bool(uint32_t, uint32_t, bool)> flusher) {
+    native_resolve_memory_flusher_ = std::move(flusher);
+  }
 
   VkBuffer buffer() const { return buffer_; }
 
@@ -55,6 +60,7 @@ class VulkanSharedMemory : public SharedMemory {
   void InitializeTraceCompleteDownloads();
 
  protected:
+  bool FlushGpuWrittenRange(uint32_t start, uint32_t length, bool writing = false) override;
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                         uint32_t length_allocations) override;
 
@@ -75,6 +81,7 @@ class VulkanSharedMemory : public SharedMemory {
 
   Usage last_usage_;
   std::pair<uint32_t, uint32_t> last_written_range_;
+  std::function<bool(uint32_t, uint32_t, bool)> native_resolve_memory_flusher_;
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;

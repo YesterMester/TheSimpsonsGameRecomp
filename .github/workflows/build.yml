@@ -36,19 +36,19 @@ jobs:
             libxcursor-dev libxi-dev libxfixes-dev libxss-dev \
             libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev wayland-protocols libudev-dev \
-            libasound2-dev libpulse-dev libpipewire-0.3-dev
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libdbus-1-dev
       - name: Configure + build (SDK + game, unified via REXSDK_DIR)
         working-directory: simpsons
         run: |
           cmake --preset linux-amd64-relwithdebinfo \
             -DREXSDK_DIR="$GITHUB_WORKSPACE/tools/rexglue-sdk" \
+            -DSDL_DBUS=ON \
             "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
           cmake --build --preset linux-amd64-relwithdebinfo --target simpsons
 
   windows:
-    name: Windows (x86_64) — experimental
+    name: Windows (x86_64)
     runs-on: windows-latest
-    continue-on-error: true   # first-pass port; not release-blocking yet
     steps:
       - uses: actions/checkout@v4
       - name: Install LLVM/Clang ${{ env.LLVM_VERSION }}
@@ -66,5 +66,6 @@ jobs:
         run: |
           cmake --preset win-amd64-relwithdebinfo `
             -DREXSDK_DIR="$env:GITHUB_WORKSPACE/tools/rexglue-sdk" `
+            -DREXGLUE_USE_D3D11=ON `
             "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
           cmake --build --preset win-amd64-relwithdebinfo --target simpsons

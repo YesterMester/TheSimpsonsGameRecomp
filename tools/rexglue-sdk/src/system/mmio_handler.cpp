@@ -25,6 +25,10 @@ using namespace rex::arch;
 
 namespace rex::runtime {
 
+// The host instruction of the access violation being handled, for statistics
+// of what writes watched memory.
+thread_local uintptr_t g_access_violation_pc = 0;
+
 MMIOHandler* MMIOHandler::global_handler_ = nullptr;
 
 MMIOHandler* MMIOHandler::global_handler() {
@@ -430,6 +434,7 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
 #endif
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
+    g_access_violation_pc = uintptr_t(ex->pc());
     if (access_violation_callback_) {
       return access_violation_callback_(std::move(lock), access_violation_callback_context_,
                                         fault_host_address, is_write);

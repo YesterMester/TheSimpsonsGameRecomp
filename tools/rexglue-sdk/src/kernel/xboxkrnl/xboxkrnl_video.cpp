@@ -13,6 +13,8 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <cstdlib>
+#include <ctime>
 #include <string>
 
 #include <rex/cvar.h>
@@ -21,6 +23,9 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/graphics/xenos.h>
+#include <rex/perf/counter.h>
+#include <rex/perf/event_trace.h>
+#include <rex/platform.h>
 #include <rex/perf/frame_index.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
@@ -33,6 +38,10 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
+
+#if REX_PLATFORM_LINUX
+#include <unistd.h>
+#endif
 
 namespace {
 // Display gamma type: 0 - linear, 1 - sRGB (CRT), 2 - BT.709 (HDTV), 3 - power
@@ -438,6 +447,37 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   // against this, and it must be stamped before any work below so a draw
   // recorded after this point belongs to the next frame.
   rex::perf::AdvanceGuestFrameIndex();
+  rex::perf::MarkSwapThread();
+  rex::perf::TraceEvent("vdswap");
+
+#if REX_PLATFORM_LINUX
+  // CPU time and wall time of the game's swapping thread since its previous
+  // swap.
+  {
+    static int64_t last_cpu_us = -1;
+    static int64_t last_wall_us = -1;
+    timespec now_cpu, now_wall;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now_cpu) == 0 &&
+        clock_gettime(CLOCK_MONOTONIC, &now_wall) == 0) {
+      int64_t cpu_us = int64_t(now_cpu.tv_sec) * 1000000 + now_cpu.tv_nsec / 1000;
+      int64_t wall_us = int64_t(now_wall.tv_sec) * 1000000 + now_wall.tv_nsec / 1000;
+      if (last_cpu_us >= 0) {
+        PERF_counter_add(kGuestSwapCpuUs, cpu_us - last_cpu_us);
+        PERF_counter_add(kGuestSwapIntervalUs, wall_us - last_wall_us);
+        // Debugging: REX_LONG_FRAME_LOG=<ms> logs the CLOCK_MONOTONIC span
+        // of every frame the swapping thread spent more CPU time on, to
+        // match against samples of a profiler such as perf.
+        static const char* long_frame_log = std::getenv("REX_LONG_FRAME_LOG");
+        if (long_frame_log && cpu_us - last_cpu_us > int64_t(std::atof(long_frame_log) * 1000.0)) {
+          REXKRNL_WARN("[long-guest-frame] tid {} start {} end {} cpu {} us", gettid(),
+                       last_wall_us, wall_us, cpu_us - last_cpu_us);
+        }
+      }
+      last_cpu_us = cpu_us;
+      last_wall_us = wall_us;
+    }
+  }
+#endif
 
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);

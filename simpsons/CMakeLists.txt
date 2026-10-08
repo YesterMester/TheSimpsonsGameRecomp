@@ -21,6 +21,7 @@ include(generated/rexglue.cmake)
 # turning the cvar off costs one relaxed atomic load and a branch per draw.
 set(SIMPSONS_SOURCES
     src/main.cpp
+    src/audio.cpp
     src/draw_telemetry.cpp
     src/frame_pacing.cpp
     src/ring_wait.cpp

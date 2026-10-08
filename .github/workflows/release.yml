@@ -37,7 +37,7 @@ jobs:
   # (0xc0000142 on Windows, #28). build_variant.txt tells the launcher which
   # one is installed, so its updater keeps fetching the right package.
   windows:
-    name: Windows x64 ${{ matrix.march }} (clang / Vulkan + D3D12)
+    name: Windows x64 ${{ matrix.march }} (clang / Vulkan + D3D12 + D3D11)
     runs-on: windows-latest
     strategy:
       matrix:
@@ -62,12 +62,13 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y --no-progress
 
-      - name: Configure (game + SDK, Vulkan + D3D12)
+      - name: Configure (game + SDK, Vulkan + D3D12 + experimental D3D11)
         shell: pwsh
         working-directory: simpsons
         run: |
           cmake --preset win-amd64-relwithdebinfo `
             -DREXSDK_DIR="$env:GITHUB_WORKSPACE/tools/rexglue-sdk" `
+            -DREXGLUE_USE_D3D11=ON `
             -DSIMPSONS_X86_MARCH=${{ matrix.march }} `
             "-DCMAKE_C_FLAGS=-march=${{ matrix.march }}" "-DCMAKE_CXX_FLAGS=-march=${{ matrix.march }}"
 
@@ -230,13 +231,14 @@ jobs:
             libxcursor-dev libxi-dev libxfixes-dev libxss-dev \
             libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev wayland-protocols libudev-dev \
-            libasound2-dev libpulse-dev libpipewire-0.3-dev glslang-tools
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libdbus-1-dev glslang-tools
 
       - name: Configure (game + SDK, Vulkan)
         working-directory: simpsons
         run: |
           cmake --preset linux-amd64-relwithdebinfo \
             -DREXSDK_DIR="$GITHUB_WORKSPACE/tools/rexglue-sdk" \
+            -DSDL_DBUS=ON \
             -DSIMPSONS_X86_MARCH=${{ matrix.march }} \
             "-DCMAKE_C_FLAGS=-march=${{ matrix.march }}" "-DCMAKE_CXX_FLAGS=-march=${{ matrix.march }}"
 
@@ -277,20 +279,23 @@ jobs:
           cp tools/extract-xiso/build/extract-xiso release/
           cp -r launcher release/launcher
           cp README.md release/
-          # Native replacement shaders for the most expensive passes, used by
-          # the runtime from native_shaders next to the executable (sets for
-          # 1x and 2x internal resolution; bit-identical to the translation).
-          python3 tools/native-renderer/native_shaders/build_native_shaders.py \
-            release/native_shaders 0000400000000001
+          # Older launchers already update launcher/ui, but do not copy new
+          # top-level folders. Keep the shader assets there so the first
+          # update from those versions receives them too.
+          mkdir -p release/launcher/ui/native_shaders
           # Every other shader, translated ahead of time on a Steam Deck
           # (tools/native-renderer/build_translated_set.sh): served only where
           # the translator source and the GPU configuration match the ones it
           # was made with, translated at runtime everywhere else.
           if [ -f tools/native-renderer/translated_shaders.tar.xz ]; then
-            tar -C release/native_shaders -xJf tools/native-renderer/translated_shaders.tar.xz
+            tar -C release/launcher/ui/native_shaders -xJf tools/native-renderer/translated_shaders.tar.xz
           fi
+          # Build replacements last so an older module in the translated
+          # archive cannot overwrite the current shader source.
+          python3 tools/native-renderer/native_shaders/build_native_shaders.py \
+            release/launcher/ui/native_shaders 0000400000000001
           printf '%s\n' "${{ matrix.march }}" > release/build_variant.txt
-          printf '# The Simpsons Game - runtime configuration (edit these via the launcher)\ngpu_allow_invalid_fetch_constants = false\ngpu_shader_max_cf_iterations = 0\n' > release/simpsons.toml
+          python3 tools/native-renderer/write_runtime_defaults.py release/simpsons.toml
 
           # launcher.py's DEFAULT_CONFIG assumes the nested dev-tree layout
           # (simpsons/out/build/.../simpsons, tools/extract-xiso/build/...).

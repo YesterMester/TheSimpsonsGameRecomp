@@ -165,15 +165,21 @@ class Run:
         while self.alive():
             r = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
                                capture_output=True, text=True, env=self.env())
+            clients = subprocess.run(["pactl", "-f", "json", "list", "clients"],
+                                     capture_output=True, text=True, env=self.env())
             try:
                 inputs = json.loads(r.stdout or "[]")
-            except ValueError:
-                inputs = []
+                client_ids = {str(c["index"]) for c in json.loads(clients.stdout or "[]")
+                              if str(c.get("properties", {}).get("application.process.id"))
+                              == str(self.proc.pid)}
+            except (ValueError, KeyError):
+                inputs, client_ids = [], set()
             for si in inputs:
                 props = si.get("properties", {})
-                # SDL names the stream after the app ("rexglue"); the process id
-                # sits on the client object, not on the stream itself.
+                # Native PipeWire streams may put the process id only on the
+                # client. Match both layouts and the older SDL app name.
                 if (str(props.get("application.process.id")) != str(self.proc.pid)
+                        and str(si.get("client")) not in client_ids
                         and props.get("application.name") != "rexglue"):
                     continue
                 if si.get("index") in moved:
@@ -354,7 +360,7 @@ class Run:
                     gaps += 1
                 run = 0
         self.note(f"audio {label}: {frames / 48000:.1f}s rms {rms:.0f} peak {peak} "
-                  f"dropouts(>=2ms)={gaps} ({'SILENT' if peak < 50 else 'sound present'})")
+                  f"quiet gaps(>=2ms)={gaps} ({'SILENT' if peak < 50 else 'sound present'})")
 
     def fps_since(self, t_start):
         """Mean of the engine's [native] fps lines logged after t_start."""

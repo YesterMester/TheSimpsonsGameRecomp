@@ -1,0 +1,113 @@
+name: Direct3D 11 renderer checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tools/rexglue-sdk/include/rex/ui/d3d11/**'
+      - 'tools/rexglue-sdk/src/ui/d3d11/**'
+      - 'tools/rexglue-sdk/include/rex/graphics/d3d11/**'
+      - 'tools/rexglue-sdk/src/graphics/d3d11/**'
+      - 'tools/bench/d3d11/**'
+      - 'tools/bench/jump_context_check.cpp'
+      - 'simpsons/generated/default/simpsons_init.h'
+      - 'tools/bench/d3d11_check.cpp'
+      - 'tools/bench/d3d11_shader_check.cpp'
+      - 'tools/bench/d3d11_kernel_check.cpp'
+      - 'tools/bench/d3d11_buffer_check.cpp'
+      - 'tools/bench/d3d11_draw_check.cpp'
+      - 'tools/bench/d3d11_present_check.cpp'
+      - 'tools/bench/d3d11_render_target_check.cpp'
+      - 'tools/bench/d3d11_resolve_check.cpp'
+      - 'tools/bench/d3d11_texture_upload_check.cpp'
+      - 'tools/bench/d3d11_texture_swizzle_check.cpp'
+      - 'tools/bench/export_d3d11_helpers.py'
+      - 'tools/shaderkit/dxbc_geometry.cpp'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/dxbc_geometry.h'
+      - 'tools/rexglue-sdk/src/graphics/util/dxbc_geometry.cpp'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/dxbc_float.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/dxbc_portable.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/dxbc_render_target_*.h'
+      - 'tools/rexglue-sdk/src/graphics/util/dxbc_float.cpp'
+      - 'tools/rexglue-sdk/src/graphics/util/dxbc_render_target_*.cpp'
+      - 'tools/shaderkit/dxbc_transfer.cpp'
+      - 'tools/shaderkit/dxbc_dump.cpp'
+      - '.github/workflows/d3d11-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native device and resource checks
+        run: |
+          cmake -S tools/bench/d3d11 -B tools/bench/d3d11/out -A x64
+          cmake --build tools/bench/d3d11/out --config Release
+      - name: Check Windows software device
+        run: tools/bench/d3d11/out/Release/d3d11_check.exe --warp --output d3d11-warp.json
+      - name: Check native Windows jump context alignment and round trips
+        run: tools/bench/d3d11/out/Release/jump_context_check.exe --output jump-context-windows.json
+      - name: Export renderer helper and primitive shaders
+        run: |
+          python tools/bench/export_d3d11_helpers.py --output tools/bench/d3d11/out/helpers
+          tools/bench/d3d11/out/Release/dxbc_geometry.exe tools/bench/d3d11/out/geometry
+      - name: Compare native shader bindings and primitive draws
+        run: tools/bench/d3d11/out/Release/d3d11_shader_check.exe --warp --geometry-directory tools/bench/d3d11/out/geometry --output d3d11-shaders-warp.json
+      - name: Check older GPU feature baseline
+        run: tools/bench/d3d11/out/Release/d3d11_shader_check.exe --warp --fl11-0 --geometry-directory tools/bench/d3d11/out/geometry --output d3d11-shaders-fl11-0.json
+      - name: Create renderer helper shaders at feature level 11.0
+        run: tools/bench/d3d11/out/Release/d3d11_kernel_check.exe --warp --fl11-0 --kernel-directory tools/bench/d3d11/out/helpers --output d3d11-helpers-fl11-0.json
+      - name: Create primitive shader configurations at feature level 11.0
+        run: tools/bench/d3d11/out/Release/d3d11_kernel_check.exe --warp --fl11-0 --kernel-directory tools/bench/d3d11/out/geometry --output d3d11-geometry-fl11-0.json
+      - name: Preserve queued native buffers through mutation and eviction
+        run: tools/bench/d3d11/out/Release/d3d11_buffer_check.exe --warp --output d3d11-buffers-fl11-0.json
+      - name: Check native draw transitions, depth, stencil and sampling
+        run: tools/bench/d3d11/out/Release/d3d11_draw_check.exe --warp --output d3d11-draws-fl11-0.json
+      - name: Compare native frame composition, gamma and UI
+        run: tools/bench/d3d11/out/Release/d3d11_present_check.exe --warp --output d3d11-presentation-fl11-0.json
+      - name: Preserve native render target ownership, samples and encoded words
+        run: tools/bench/d3d11/out/Release/d3d11_render_target_check.exe --warp --output d3d11-render-targets-fl11-0.json
+      - name: Transfer depth and stencil in one pass at feature level 11.1
+        run: tools/bench/d3d11/out/Release/d3d11_render_target_check.exe --warp --fl11-1 --output d3d11-render-targets-fl11-1.json
+      - name: Compare native tiled resolves with independent byte references
+        run: tools/bench/d3d11/out/Release/d3d11_resolve_check.exe --warp --output d3d11-resolves-fl11-0.json
+      - name: Transfer exact texel bits from native buffers to images
+        run: tools/bench/d3d11/out/Release/d3d11_texture_upload_check.exe --warp --output d3d11-texture-upload-fl11-0.json
+      - name: Compare texture channel mappings with independent pixel references
+        run: tools/bench/d3d11/out/Release/d3d11_texture_swizzle_check.exe --warp --output d3d11-texture-swizzle-fl11-0.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: d3d11-device-check
+          path: |
+            d3d11-warp.json
+            jump-context-windows.json
+            d3d11-shaders-warp.json
+            d3d11-shaders-fl11-0.json
+            d3d11-helpers-fl11-0.json
+            d3d11-geometry-fl11-0.json
+            d3d11-buffers-fl11-0.json
+            d3d11-draws-fl11-0.json
+            d3d11-presentation-fl11-0.json
+            d3d11-render-targets-fl11-0.json
+            d3d11-render-targets-fl11-1.json
+            d3d11-resolves-fl11-0.json
+            d3d11-texture-upload-fl11-0.json
+            d3d11-texture-swizzle-fl11-0.json
+            tools/bench/d3d11/out/Release/d3d11_check.exe
+            tools/bench/d3d11/out/Release/jump_context_check.exe
+            tools/bench/d3d11/out/Release/d3d11_shader_check.exe
+            tools/bench/d3d11/out/Release/d3d11_kernel_check.exe
+            tools/bench/d3d11/out/Release/dxbc_geometry.exe
+            tools/bench/d3d11/out/Release/d3d11_buffer_check.exe
+            tools/bench/d3d11/out/Release/d3d11_draw_check.exe
+            tools/bench/d3d11/out/Release/d3d11_present_check.exe
+            tools/bench/d3d11/out/Release/d3d11_render_target_check.exe
+            tools/bench/d3d11/out/Release/d3d11_resolve_check.exe
+            tools/bench/d3d11/out/Release/dxbc_transfer.exe
+            tools/bench/d3d11/out/Release/dxbc_dump.exe
+            tools/bench/d3d11/out/Release/d3d11_texture_upload_check.exe
+            tools/bench/d3d11/out/Release/d3d11_texture_swizzle_check.exe

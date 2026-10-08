@@ -13,6 +13,9 @@
 #include <atomic>
 #include <cstring>
 #include <utility>
+#include <string>
+#include <vector>
+#include <unordered_map>
 
 #include <fmt/format.h>
 
@@ -21,14 +24,20 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
 #include <rex/system/xmemory.h>
+#include <rex/perf/counter.h>
 #include <rex/thread.h>
 
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
+
+#if !REX_PLATFORM_WIN32
+#include <dlfcn.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -38,6 +47,14 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
+REXCVAR_DEFINE_INT32(watch_fault_writer_stats, 0, "Memory",
+                     "Debugging: every this many guest write faults on memory the GPU reads, log "
+                     "the host instructions that caused the most (0 = off)");
+
+namespace rex::runtime {
+extern thread_local uintptr_t g_access_violation_pc;
+}  // namespace rex::runtime
+
 namespace rex::memory {
 
 // Diagnostic counters for the command processor's gpu_wait_stats log: host
@@ -46,6 +63,10 @@ namespace rex::memory {
 std::atomic<uint64_t> g_watch_protect_calls{0};
 std::atomic<uint64_t> g_watch_protect_ticks{0};
 std::atomic<uint64_t> g_watch_fault_count{0};
+// watch_fault_writer_stats: the host instructions of guest write faults.
+std::unordered_map<uintptr_t, uint32_t> g_watch_fault_pcs;
+std::unordered_map<uintptr_t, uint32_t> g_watch_fault_pc_addresses;
+uint64_t g_watch_fault_pcs_total = 0;
 std::atomic<uint64_t> g_watch_fault_ticks{0};
 // Per 1 MB region of physical memory: protect calls, pages protected, write
 // faults; and protect calls per physical heap view (A, C, E).
@@ -504,8 +525,44 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
     g_watch_fault_count.fetch_add(1, std::memory_order_relaxed);
     g_watch_region_faults[(physical_heap->GetPhysicalAddress(virtual_address) >> 20) & 511]
         .fetch_add(1, std::memory_order_relaxed);
-    g_watch_fault_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - fault_start_tick,
-                                  std::memory_order_relaxed);
+    uint64_t fault_ticks = rex::chrono::Clock::QueryHostTickCount() - fault_start_tick;
+    if (int32_t stats_interval = REXCVAR_GET(watch_fault_writer_stats); stats_interval > 0) {
+      // Under the global lock (the callback runs with it).
+      ++g_watch_fault_pcs[rex::runtime::g_access_violation_pc];
+      g_watch_fault_pc_addresses[rex::runtime::g_access_violation_pc] =
+          physical_heap->GetPhysicalAddress(virtual_address);
+      if (++g_watch_fault_pcs_total % uint64_t(stats_interval) == 0) {
+        std::vector<std::pair<uint32_t, uintptr_t>> top;
+        for (const auto& pc_count : g_watch_fault_pcs) {
+          top.emplace_back(pc_count.second, pc_count.first);
+        }
+        std::sort(top.rbegin(), top.rend());
+        std::string text;
+        for (size_t i = 0; i < std::min(top.size(), size_t(12)); ++i) {
+          uintptr_t offset = top[i].second;
+          const char* module = "?";
+#if !REX_PLATFORM_WIN32
+          Dl_info info = {};
+          if (dladdr(reinterpret_cast<void*>(top[i].second), &info) && info.dli_fbase) {
+            offset = top[i].second - uintptr_t(info.dli_fbase);
+            module = info.dli_fname ? info.dli_fname : "?";
+            if (const char* slash = std::strrchr(module, '/')) {
+              module = slash + 1;
+            }
+          }
+#endif
+          text += fmt::format(" {}+{:x}:{}@{:08X}", module, offset, top[i].first,
+                              g_watch_fault_pc_addresses[top[i].second]);
+        }
+        REXSYS_INFO("[fault-writers] {} faults, top:{}", g_watch_fault_pcs_total, text);
+        g_watch_fault_pcs.clear();
+        g_watch_fault_pc_addresses.clear();
+      }
+    }
+    g_watch_fault_ticks.fetch_add(fault_ticks, std::memory_order_relaxed);
+    PERF_counter_inc(kWatchFaults);
+    PERF_counter_add(kWatchFaultUs,
+                     int64_t(fault_ticks * 1000000 / rex::chrono::Clock::QueryHostTickFrequency()));
     if (handled) {
       return true;
     }
@@ -1863,7 +1920,11 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
                                                : rex::memory::PageAccess::kReadOnly;
   uint8_t* protect_base = membase_ + heap_base_;
   uint32_t protect_system_page_first = UINT32_MAX;
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.TryAcquire();
+  if (!global_lock.owns_lock()) {
+    rex::perf::ScopedCounterTimer wait_timer(rex::perf::CounterId::kUploadLockWaitUs);
+    global_lock.lock();
+  }
   for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
     // Check if need to enable callbacks for the page and raise its protection.
     //
@@ -1917,10 +1978,13 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
     } else {
       if (protect_system_page_first != UINT32_MAX) {
         uint64_t protect_start_tick = rex::chrono::Clock::QueryHostTickCount();
+        rex::perf::ScopedCounterTimer protect_timer(rex::perf::CounterId::kWatchProtectUs);
         rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
                              size_t(i - protect_system_page_first) * system_page_size_,
                              protect_access);
+        protect_timer.Stop();
         g_watch_protect_calls.fetch_add(1, std::memory_order_relaxed);
+        PERF_counter_inc(kWatchProtects);
         CountWatchProtect(physical_address, i - protect_system_page_first, heap_base_);
         g_watch_protect_ticks.fetch_add(
             rex::chrono::Clock::QueryHostTickCount() - protect_start_tick,
@@ -1931,11 +1995,14 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
   }
   if (protect_system_page_first != UINT32_MAX) {
     uint64_t protect_start_tick = rex::chrono::Clock::QueryHostTickCount();
+    rex::perf::ScopedCounterTimer protect_timer(rex::perf::CounterId::kWatchProtectUs);
     rex::memory::Protect(
         protect_base + protect_system_page_first * system_page_size_,
         size_t(system_page_last + 1 - protect_system_page_first) * system_page_size_,
         protect_access);
+    protect_timer.Stop();
     g_watch_protect_calls.fetch_add(1, std::memory_order_relaxed);
+    PERF_counter_inc(kWatchProtects);
     CountWatchProtect(physical_address, system_page_last + 1 - protect_system_page_first,
                       heap_base_);
     g_watch_protect_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - protect_start_tick,

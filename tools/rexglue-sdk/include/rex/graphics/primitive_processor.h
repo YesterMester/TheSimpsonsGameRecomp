@@ -20,6 +20,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -148,6 +149,9 @@ class PrimitiveProcessor {
     // only valid for index_buffer_type kHostConverted, kHostBuiltinForAuto and
     // kHostBuiltinForDMA.
     size_t host_index_buffer_handle;
+    // Exact CPU copy of a native DMA index stream, valid until the next
+    // Process call. Bounds scans must not read a write-combined GPU mapping.
+    const void* native_index_snapshot;
     bool IsTessellated() const {
       return Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type);
     }
@@ -168,13 +172,17 @@ class PrimitiveProcessor {
 
   // Submission must be open to call (may request the index buffer in the shared
   // memory).
-  bool Process(ProcessingResult& result_out);
+  // native_dma_indices snapshots supported CPU index streams into a host
+  // buffer for this draw, without uploading them to the guest memory mirror.
+  bool Process(ProcessingResult& result_out, bool native_dma_indices = false);
 
   // Invalidates the cache within the range.
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
                                                            uint32_t length, bool exact_range);
 
  protected:
+  SharedMemory& shared_memory() const { return shared_memory_; }
+
   // For host-side index buffer creation, the biggest possibly needed contiguous
   // allocation, in indices.
   // - No conversion: up to 0xFFFF vertices (as the vertex count in
@@ -301,7 +309,18 @@ class PrimitiveProcessor {
       xenos::IndexFormat format, uint32_t index_count, bool coalign_for_simd,
       uint32_t coalignment_original_address, size_t& backend_handle_out) = 0;
 
+  // A backend may retain an immutable native DMA buffer after comparing its
+  // CPU shadow with the current source bytes. The shadow and buffer must stay
+  // alive through the current frame. False keeps the ordinary fresh snapshot.
+  virtual bool TryRetainedNativeIndexBuffer(uint32_t, uint32_t, const void*, size_t&,
+                                            const void*&) {
+    return false;
+  }
+
  private:
+  // Refilled for every native DMA draw, never reused by guest address.
+  std::vector<uint8_t> native_index_snapshot_;
+
 #if XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE
 #if REX_ARCH_AMD64
   // SSSE3 or AVX.

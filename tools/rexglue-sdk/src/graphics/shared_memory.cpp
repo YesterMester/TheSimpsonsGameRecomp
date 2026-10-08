@@ -21,8 +21,11 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
+#include <rex/graphics/util/bytes_equal.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+#include <rex/perf/counter.h>
 
 REXCVAR_DEFINE_BOOL(gpu_stream_dynamic_pages, true, "GPU",
                     "Upload vertex and index data in pages the game rewrites every frame on "
@@ -35,13 +38,38 @@ REXCVAR_DEFINE_BOOL(gpu_stream_skip_unchanged, true, "GPU",
                     "uploaded (every upload waits for the GPU to finish all earlier work)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_stream_after_one_fault, false, "GPU",
+                    "With gpu_stream_dynamic_pages, stream a page after one guest write fault "
+                    "instead of faults in two frames in a row - level streaming rewrites pages "
+                    "once or a few times, and each time costs a fault and a protection change")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
+
+namespace {
+// Acquires the global critical region, adding the time spent waiting for
+// another thread to release it to upload_lock_wait_us.
+std::unique_lock<std::recursive_mutex> AcquireGlobalLockTimed(
+    rex::thread::global_critical_region& region) {
+  std::unique_lock<std::recursive_mutex> lock = region.TryAcquire();
+  if (!lock.owns_lock()) {
+    rex::perf::ScopedCounterTimer wait_timer(rex::perf::CounterId::kUploadLockWaitUs);
+    lock.lock();
+  }
+  return lock;
+}
+}  // namespace
 
 // Pages uploaded without being made valid (streamed), for the gpu_wait_stats
 // log. Also, summed over frames: the most uploads of one streamed page in a
 // frame, and how many pages were uploaded more than 8, 16, 32 and 63 times in
 // a frame.
 std::atomic<uint64_t> g_streamed_page_uploads{0};
+// Watch arming (EnablePhysicalMemoryAccessCallbacks calls) by the kind of
+// request: vertex / index data (allow_streamed) or anything else (textures,
+// resolves), for the gpu_wait_stats log.
+std::atomic<uint64_t> g_watch_arms_vertex{0};
+std::atomic<uint64_t> g_watch_arms_other{0};
 std::atomic<uint64_t> g_streamed_page_max_uploads{0};
 std::atomic<uint64_t> g_streamed_pages_over[4] = {};
 // Debugging (REX_CMD_STATS): requests that needed an upload, their requested
@@ -171,6 +199,7 @@ void SharedMemory::OnGuestFrameEnd() {
     streamed_pages_frames_ = 0;
     streamed_page_shadows_.clear();
   }
+  bool after_one_fault = REXCVAR_GET(gpu_stream_after_one_fault);
   for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
     uint64_t faulted = system_page_flags_faulted_[i];
     if (reset) {
@@ -178,7 +207,8 @@ void SharedMemory::OnGuestFrameEnd() {
       system_page_flags_streamed_blocked_[i] = 0;
     } else {
       system_page_flags_streamed_[i] |=
-          faulted & system_page_flags_faulted_previous_[i] & ~system_page_flags_streamed_blocked_[i];
+          faulted & (after_one_fault ? UINT64_MAX : system_page_flags_faulted_previous_[i]) &
+          ~system_page_flags_streamed_blocked_[i];
     }
     system_page_flags_faulted_previous_[i] = faulted;
     system_page_flags_faulted_[i] = 0;
@@ -398,12 +428,56 @@ void SharedMemory::FireWatchesLocked(const std::unique_lock<std::recursive_mutex
   }
 }
 
+bool SharedMemory::WatchCpuMemoryRange(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize || length > kBufferSize - start ||
+      !memory_invalidation_callback_handle_) {
+    return false;
+  }
+  memory().EnablePhysicalMemoryAccessCallbacks(start, length, true, false);
+  return true;
+}
+
+void SharedMemory::InvalidateCpuMemoryRangeForTrace(uint32_t start, uint32_t length) {
+  if (length && !IsRangeGpuWritten(start, length)) {
+    FireWatches(start >> page_size_log2_, (start + length - 1) >> page_size_log2_, false);
+  }
+}
+
+bool SharedMemory::IsRangeGpuWritten(uint32_t start, uint32_t length) {
+  if (!length) {
+    return false;
+  }
+  if (start >= kBufferSize || length > kBufferSize - start) {
+    return true;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t block = page_first >> 6; block <= (page_last >> 6); ++block) {
+    uint64_t mask = UINT64_MAX;
+    if (block == (page_first >> 6)) {
+      mask &= UINT64_MAX << (page_first & 63);
+    }
+    if (block == (page_last >> 6)) {
+      mask &= UINT64_MAX >> (63 - (page_last & 63));
+    }
+    if (system_page_flags_valid_and_gpu_written_[block] & mask) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   if (length == 0 || start >= kBufferSize) {
     return;
   }
   length = std::min(length, kBufferSize - start);
   uint32_t end = start + length - 1;
+  if (!FlushGpuWrittenRange(start, length, true)) {
+    REXGPU_ERROR("Shared memory: failed to preserve native GPU data before a write");
+    return;
+  }
   uint32_t page_first = start >> page_size_log2_;
   uint32_t page_last = end >> page_size_log2_;
 
@@ -447,7 +521,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   const bool skip_streamed = upload_allow_streamed_ && !written_by_gpu;
   bool any_streamed = false;
   {
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = AcquireGlobalLockTimed(global_critical_region_);
 
     for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
       uint64_t range_bits = UINT64_MAX;
@@ -490,6 +564,8 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
 
   if (memory_invalidation_callback_handle_) {
     if (!any_streamed) {
+      (upload_allow_streamed_ ? g_watch_arms_vertex : g_watch_arms_other)
+          .fetch_add(1, std::memory_order_relaxed);
       memory().EnablePhysicalMemoryAccessCallbacks(
           valid_page_first << page_size_log2_,
           (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
@@ -506,6 +582,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
             run_first = page;
           }
         } else if (run_first != UINT32_MAX) {
+          g_watch_arms_vertex.fetch_add(1, std::memory_order_relaxed);
           memory().EnablePhysicalMemoryAccessCallbacks(
               run_first << page_size_log2_, (page - run_first) << page_size_log2_, true, false);
           run_first = UINT32_MAX;
@@ -539,6 +616,7 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
 
 bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
                                  bool allow_streamed) {
+  rex::perf::ScopedCounterTimer upload_timer(rex::perf::CounterId::kCpUploadUs);
   if (ranges == nullptr || !count) {
     return true;
   }
@@ -554,6 +632,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       return true;
     }
     if (ranges[0].first > kBufferSize || (kBufferSize - ranges[0].first) < ranges[0].second) {
+      return false;
+    }
+    if (!FlushGpuWrittenRange(ranges[0].first, ranges[0].second)) {
       return false;
     }
     SCOPE_profile_cpu_f("gpu");
@@ -605,6 +686,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   merged_ranges.resize(merged_write + 1);
 
   for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+    if (!FlushGpuWrittenRange(range.first, range.second)) {
+      return false;
+    }
     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
       return false;
     }
@@ -666,6 +750,7 @@ bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* m
     }
   }
 
+  rex::perf::ScopedCounterTimer scan_timer(rex::perf::CounterId::kUploadScanUs);
   upload_ranges_.clear();
   auto append_upload_range = [this](uint32_t page_start, uint32_t page_count) {
     if (!page_count) {
@@ -681,7 +766,7 @@ bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* m
     upload_ranges_.emplace_back(page_start, page_count);
   };
   {
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = AcquireGlobalLockTimed(global_critical_region_);
     for (size_t range_index = 0; range_index < merged_count; ++range_index) {
       const std::pair<uint32_t, uint32_t>& range = merged_ranges[range_index];
       uint32_t page_first = range.first >> page_size_log2_;
@@ -738,6 +823,7 @@ bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* m
                     uint32_t(merged_count));
   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
                     uint32_t(upload_ranges_.size()));
+  scan_timer.Stop();
 
   if (upload_ranges_.empty()) {
     return true;
@@ -803,8 +889,9 @@ void SharedMemory::DropUnchangedStreamedPages(const std::pair<uint32_t, uint32_t
             uint32_t compare_start = std::max(ranges[i].first, page_start);
             uint32_t compare_end = std::min(ranges[i].first + ranges[i].second, page_end);
             if (compare_start < compare_end &&
-                std::memcmp(guest + (compare_start - page_start),
-                            shadow + (compare_start - page_start), compare_end - compare_start)) {
+                !draw_util::BytesEqual(guest + (compare_start - page_start),
+                                       shadow + (compare_start - page_start),
+                                       compare_end - compare_start)) {
               unchanged = false;
             }
           }
@@ -846,6 +933,8 @@ void SharedMemory::EraseStreamedPageShadows(uint32_t page_first, uint32_t page_l
 }
 
 void SharedMemory::CopyPagesForUpload(uint32_t page_first, uint32_t page_count, uint8_t* dest) {
+  rex::perf::ScopedCounterTimer copy_timer(rex::perf::CounterId::kUploadCopyUs);
+  PERF_counter_add(kUploadBytes, int64_t(page_count) << page_size_log2_);
   const uint8_t* source = memory().TranslatePhysical(page_first << page_size_log2_);
   if (!upload_allow_streamed_ || !REXCVAR_GET(gpu_stream_skip_unchanged)) {
     std::memcpy(dest, source, size_t(page_count) << page_size_log2_);

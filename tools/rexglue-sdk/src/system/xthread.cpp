@@ -16,6 +16,7 @@
 #include <fmt/format.h>
 
 #include <rex/chrono/clock.h>
+#include <rex/perf/event_trace.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
@@ -994,6 +995,10 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
     timeout_ms = 0;
   }
   timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
+  rex::perf::TraceSwapThreadEvent("kdelay", uint64_t(-timeout_ticks));
+  struct DelayDoneTrace {
+    ~DelayDoneTrace() { rex::perf::TraceSwapThreadEvent("kdelay_done"); }
+  } delay_done_trace;
   if (alertable) {
     auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
     switch (result) {

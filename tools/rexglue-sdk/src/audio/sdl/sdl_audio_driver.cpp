@@ -152,33 +152,40 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
                                [](float sample) { return sample == 0.0f; });
   }
 
-  static uint32_t sdl_submit_count = 0;
-  if (sdl_submit_count < 10) {
-    REXAPU_DEBUG("SDLAudioDriver::SubmitFrame: frame_ptr={:08X} queued_count={}", frame_ptr,
-                 frames_queued_.size() + 1);
-    sdl_submit_count++;
-  }
-
+  std::array<uint32_t, 5> diagnostic = {};
+  bool report = false;
+  size_t queued_count;
   {
     std::unique_lock<std::mutex> guard(frames_mutex_);
     frames_queued_.push(output_frame);
-    PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
+    queued_count = frames_queued_.size();
+    PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(queued_count));
     if (log_underruns) {
       diag_silent_submitted_frames_ += uint32_t(silent_frame);
-      // About every 5 seconds, logged from the submitting thread rather than
-      // the realtime audio callback.
+      // About every 5 seconds. Snapshot under the lock, then log outside it
+      // so the realtime callback never waits for a file or terminal write.
       if (++diag_submitted_frames_ >= 960) {
-        REXAPU_INFO(
-            "[audio-diag] played {} frames: {} silence (nothing queued); submitted {}: {} all "
-            "zero; queued now {}",
-            diag_played_frames_, diag_underrun_frames_, diag_submitted_frames_,
-            diag_silent_submitted_frames_, frames_queued_.size());
+        diagnostic = {diag_played_frames_, diag_underrun_frames_, diag_submitted_frames_,
+                      diag_silent_submitted_frames_, uint32_t(queued_count)};
         diag_played_frames_ = 0;
         diag_underrun_frames_ = 0;
         diag_submitted_frames_ = 0;
         diag_silent_submitted_frames_ = 0;
+        report = true;
       }
     }
+  }
+  static uint32_t sdl_submit_count = 0;
+  if (sdl_submit_count < 10) {
+    ++sdl_submit_count;
+    REXAPU_DEBUG("SDLAudioDriver::SubmitFrame: frame_ptr={:08X} queued_count={}", frame_ptr,
+                 queued_count);
+  }
+  if (report) {
+    REXAPU_INFO(
+        "[audio-diag] played {} frames: {} silence (nothing queued); submitted {}: {} all "
+        "zero; queued now {}",
+        diagnostic[0], diagnostic[1], diagnostic[2], diagnostic[3], diagnostic[4]);
   }
 }
 
@@ -219,51 +226,51 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     return;
   }
   while (additional_amount > 0) {
-    static uint32_t sdl_callback_count = 0;
-    std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-    if (driver->frames_queued_.empty()) {
-      if (sdl_callback_count < 10) {
-        REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
-        sdl_callback_count++;
-      }
-      std::memset(data, 0, len);
-      ++driver->diag_played_frames_;
-      ++driver->diag_underrun_frames_;
-      if (!SDL_PutAudioStreamData(stream, data, len)) {
-        REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
-        break;
-      }
-      additional_amount -= len;
-    } else {
-      auto buffer = driver->frames_queued_.front();
-      driver->frames_queued_.pop();
-      ++driver->diag_played_frames_;
-      if (REXCVAR_GET(audio_mute)) {
-        std::memset(data, 0, len);
+    float* buffer = nullptr;
+    {
+      std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+      if (!driver->frames_queued_.empty()) {
+        buffer = driver->frames_queued_.front();
+        driver->frames_queued_.pop();
       } else {
-        switch (driver->sdl_device_channels_) {
-          case 2:
-            conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_);
-            break;
-          case 6:
-            conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_);
-            break;
-          default:
-            assert_unhandled_case(driver->sdl_device_channels_);
-            break;
-        }
+        ++driver->diag_underrun_frames_;
       }
-      if (!SDL_PutAudioStreamData(stream, data, len)) {
-        REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
+      ++driver->diag_played_frames_;
+    }
+    // The popped buffer belongs to this callback until it is returned to the
+    // pool. Keep conversion, SDL calls and semaphore wakeups outside the
+    // queue lock so the submitting thread can fill the next available slot.
+    if (!buffer || REXCVAR_GET(audio_mute)) {
+      std::memset(data, 0, len);
+    } else {
+      switch (driver->sdl_device_channels_) {
+        case 2:
+          conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_);
+          break;
+        case 6:
+          conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_);
+          break;
+        default:
+          assert_unhandled_case(driver->sdl_device_channels_);
+          break;
+      }
+    }
+    bool submitted = SDL_PutAudioStreamData(stream, data, len);
+    if (buffer) {
+      {
+        std::unique_lock<std::mutex> guard(driver->frames_mutex_);
         driver->frames_unused_.push(buffer);
-        break;
       }
-      driver->frames_unused_.push(buffer);
-
+      // Return a consumed credit even if SDL rejects the write. Otherwise a
+      // device error permanently shrinks the queue and can stall the worker.
       auto ret = driver->semaphore_->Release(1, nullptr);
       assert_true(ret);
-      additional_amount -= len;
     }
+    if (!submitted) {
+      REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
+      break;
+    }
+    additional_amount -= len;
   }
   SDL_stack_free(data);
 }

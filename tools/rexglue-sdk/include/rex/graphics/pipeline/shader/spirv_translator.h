@@ -70,6 +70,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
+      // Vertex fetch constants describe a compact immutable host snapshot.
+      uint32_t native_vertex_streams : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.

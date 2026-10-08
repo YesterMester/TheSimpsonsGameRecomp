@@ -114,13 +114,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void CompletedSubmissionUpdated();
   void EndSubmission();
 
+  // Packed output of a native resolve, when the whole
+  // requested texture range is still valid. Records its submission lifetime
+  // and pushes the barrier for a texture load compute shader. GPU rewrites
+  // of matching buffers are ordered after all their earlier consumers.
+  bool UseNativeResolveBufferRange(uint32_t address, uint32_t length,
+                                   VkDescriptorBufferInfo& buffer_info, bool scaled = false);
+  bool CanUseNativeResolveBufferRange(uint32_t address, uint32_t length, bool scaled);
+  bool FlushNativeResolveMemory(uint32_t address, uint32_t length, bool scaled);
+
   Path GetPath() const override { return path_; }
 
   // True when render_target_path_vulkan == "native": conventional host render
-  // targets, but without the EDRAM ownership-transfer draws that the
-  // approximating host path issues to emulate tile aliasing. Titles that never
-  // read another target's tiles mid-pass (this one does not - measured 18
-  // pure-overhead transfer draws per frame) render identically without them.
+  // targets, with native resolves and overwrite proofs. Data needed after a
+  // surface rebind is preserved; the shadow map shares the main depth storage.
   bool native_rt_mode() const { return native_rt_mode_; }
   bool native_resolve_enabled() const { return native_resolve_enabled_; }
 
@@ -153,6 +160,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
   // Binding information for the last successful update.
+  // native_resolve_copy_free: a native resolve of a whole render target into a
+  // texture that can take over its image is held back until the next draw. If
+  // that draw overwrites the whole render target (and only it), the render
+  // target and the texture exchange images instead of copying; otherwise, or
+  // before anything else uses them (vertex_shader nullptr), the copy is done.
+  // Before the draw's textures are requested.
+  void ProcessPendingCopyFreeResolve(const Shader* vertex_shader, bool is_rasterization_done,
+                                     reg::RB_DEPTHCONTROL normalized_depth_control,
+                                     uint32_t normalized_color_mask);
+  void FlushPendingCopyFreeResolve() {
+    ProcessPendingCopyFreeResolve(nullptr, false, reg::RB_DEPTHCONTROL(), 0);
+  }
+
   // Native renderer (native_rt_clear_draws_as_clears): a draw of the XDK
   // clear shaders that replaces everything it writes with constant values in
   // a rectangle, done as a clear of the attachments there. Returns true if
@@ -419,6 +439,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     }
 
     VkImage image() const { return image_; }
+    VkDeviceMemory memory() const { return memory_; }
 
     VkImageView view_depth_color() const { return view_depth_color_; }
     VkImageView view_depth_stencil() const { return view_depth_stencil_; }
@@ -913,6 +934,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // resolve_clear_rectangle is expected to be provided by
   // PrepareHostRenderTargetsResolveClear which should do all the needed size
   // bound checks.
+  bool TryNativeSurfaceCopies(uint32_t render_target_count, RenderTarget* const* render_targets,
+                              const std::vector<Transfer>* render_target_transfers,
+                              const Transfer::Rectangle* cutout);
   void PerformTransfersAndResolveClears(
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,
@@ -964,6 +988,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // of each 2x2 quad of host pixels of the rectangle, as one dword, to the
     // buffer bound in place of the memory (not with kNativeResolveFlagWriteMemory).
     kNativeResolveFlagStencilCapture = 1u << 8,
+    // Keep a texture's existing channel order when a draw follows an image
+    // copy. This affects the attachment only, never the resolved memory.
+    kNativeResolveFlagTextureSwapRedBlue = 1u << 9,
   };
   // How a source texel is packed into the texel bits, the same way as when
   // dumping the render target to the EDRAM.
@@ -990,6 +1017,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // origin (x | (y << 16), both even) and the quads per row.
     uint32_t stencil_capture_origin;
     uint32_t stencil_capture_pitch_quads;
+    // Physical dword represented by the start of a compact output buffer.
+    uint32_t memory_base_dwords;
   };
   struct NativeResolvePlan {
     VulkanRenderTarget* source = nullptr;
@@ -1055,6 +1084,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // to write. Must be called before the memory range is marked as resolved.
   bool PrepareNativeResolve(const draw_util::ResolveInfo& resolve_info,
                             VulkanTextureCache& texture_cache, NativeResolvePlan& plan);
+  bool TryNativeResolveImageCopy(VulkanTextureCache& texture_cache, const NativeResolvePlan& plan);
   // Records the texture writes (and with write_memory, the guest memory writes
   // in the first target's draw), and marks the textures as up to date - must be
   // called after the memory range has been marked as resolved.
@@ -1067,7 +1097,22 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void PerformNativeResolve(VulkanTextureCache& texture_cache, const NativeResolvePlan& plan,
                             bool write_memory,
                             VkDescriptorSet scaled_memory_descriptor_set = VK_NULL_HANDLE,
-                            VkDescriptorSet stencil_capture_descriptor_set = VK_NULL_HANDLE);
+                            VkDescriptorSet stencil_capture_descriptor_set = VK_NULL_HANDLE,
+                            uint32_t memory_base_dwords = 0);
+  bool TryNativeResolveBuffer(const draw_util::ResolveInfo& resolve_info,
+                              const NativeResolvePlan& plan, VulkanSharedMemory& shared_memory,
+                              VulkanTextureCache& texture_cache, bool source_original_resolution);
+  struct NativeResolveBuffer;
+  NativeResolveBuffer* AcquireNativeResolveBuffer(VkDeviceSize size);
+  NativeResolveBuffer* FindNativeResolveBufferRange(uint32_t address, uint32_t length, bool scaled);
+  bool PrepareNativeResolveMemoryForWrite(uint32_t address, uint32_t length);
+  bool WriteBackNativeResolveBuffer(NativeResolveBuffer& buffer);
+  void ClearNativeResolveBuffers();
+  // Uses the same global critical region as the shared-memory write watches.
+  rex::thread::global_critical_region native_resolve_buffers_critical_region_;
+  std::vector<std::unique_ptr<NativeResolveBuffer>> native_resolve_buffers_;
+  uint64_t native_resolve_buffer_bytes_ = 0;
+  bool native_resolve_memory_flushing_ = false;
 
   bool gamma_render_target_as_unorm16_ = false;
 
@@ -1093,6 +1138,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t GetFullRenderTargetTileRows(RenderTargetKey key) const;
   bool CreateRenderTargetImage(RenderTargetKey key, uint32_t tile_rows,
                                VulkanRenderTarget::Image& image_out);
+  // Views and the transfer source descriptor of an existing render target image.
+  bool CreateRenderTargetImageViews(RenderTargetKey key, VkImage image, VkFormat format,
+                                    VkFormat transfer_format, bool is_srgb_view_needed,
+                                    const VkExtent2D& extent, VulkanRenderTarget::Image& image_out);
+  bool CreateRenderTargetImageViewsForKey(RenderTargetKey key, VkImage image,
+                                          const VkExtent2D& extent,
+                                          VulkanRenderTarget::Image& image_out);
   void DestroyRenderTargetImage(bool is_depth, const VulkanRenderTarget::Image& image);
   // Objects replaced while earlier submissions may still use them, destroyed
   // once those complete (UINT64_MAX: all, with the GPU idle).
@@ -1102,6 +1154,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     VulkanRenderTarget::Image image;
   };
   std::deque<RetiredRenderTargetImage> retired_render_target_images_;
+  // native_resolve_copy_free.
+  bool CanResolveCopyFree(const NativeResolvePlan& plan, VulkanTextureCache& texture_cache) const;
+  bool TryCopyFreeResolveExchange(const NativeResolvePlan& plan, VulkanTextureCache& texture_cache,
+                                  const Shader& vertex_shader,
+                                  reg::RB_DEPTHCONTROL normalized_depth_control,
+                                  uint32_t normalized_color_mask);
+  void RetireFramebuffersOfRenderTarget(RenderTargetKey key);
+  struct PendingCopyFreeResolve {
+    bool active = false;
+    NativeResolvePlan plan;
+    VulkanTextureCache* texture_cache = nullptr;
+  };
+  PendingCopyFreeResolve pending_copy_free_resolve_;
+  uint64_t copy_free_resolve_count_ = 0;
   std::deque<std::pair<uint64_t, VkFramebuffer>> retired_framebuffers_;
   void DestroyRetiredRenderTargetObjects(uint64_t completed_submission);
 

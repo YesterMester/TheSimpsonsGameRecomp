@@ -39,7 +39,7 @@ from pathlib import Path
 # at build time, so packaged builds always know exactly which release they
 # are (otherwise every launcher shipped inside vX.Y.Z.W would compare itself
 # against its own release and nag "update available" forever).
-VERSION = "0.0.6.3"
+VERSION = "0.0.6.4"
 
 FROZEN = getattr(sys, "frozen", False)
 if FROZEN:
@@ -313,7 +313,8 @@ SETTINGS_SCHEMA = {
     # then overrides the in-game option, so it starts off).
     "subtitles": ("bool", False, True),
     # graphics backend: "" = automatic (Vulkan first, D3D12 fallback on
-    # Windows), "vulkan" or "d3d12" to force one. Chosen at startup.
+    # Windows), "vulkan", "d3d12" or the experimental "d3d11" (Windows) to
+    # force one. Chosen at startup.
     "gpu": ("str", "", True),
     "vulkan_device": ("str", "", True),
     # renderer: "native" = GPU render targets; "fsi" = Xbox EDRAM emulated in
@@ -322,6 +323,33 @@ SETTINGS_SCHEMA = {
     # audio
     "audio_mute": ("bool", False, False),
     "audio_maxqframes": ("int", 32, True),
+}
+
+# Kept in the launcher so updates from older launchers, which preserve
+# simpsons.toml and do not copy newly added files, receive these defaults too.
+LINUX_RUNTIME_DEFAULTS = {
+    "gpu_allow_invalid_fetch_constants": False,
+    "gpu_shader_max_cf_iterations": 0,
+    "native_index_buffers": True,
+    "native_vertex_buffers": True,
+    "native_texture_uploads": True,
+    "native_vertex_buffer_cache": True,
+    "native_vertex_cache_refresh": True,
+    "native_index_buffer_cache": True,
+    "native_index_bounds_cache": True,
+    "pm4_bulk_state_registers": True,
+    "native_rt_image_copies": True,
+    "native_resolve_image_copies": True,
+    "native_resolve_buffers": True,
+    "native_resolve_buffer_reads": True,
+    "native_resolve_buffer_lazy_memory": True,
+    "native_resolve_buffer_reuse": True,
+    "native_resolve_buffer_texture_first": True,
+    "timer_queue_sleep": True,
+    "native_buffer_write_watches": False,
+    "native_vertex_cache_check_order": False,
+    "native_resolve_copy_free": False,
+    "frame_pacing_vblank_lock": False,
 }
 
 # Settings left out of the config while at their default, so the runtime's own
@@ -423,6 +451,22 @@ def write_settings(new_values):
             lines.append(line)
         while lines and not lines[-1].strip():
             lines.pop()
+    # Updates keep the player's config. Add the Linux runtime defaults only
+    # where no value was saved, so the new resource paths reach existing
+    # installs too, without replacing deliberate overrides.
+    if PLAT == "Linux":
+        present = {line.partition("=")[0].strip() for line in lines
+                   if "=" in line and not line.lstrip().startswith("#")}
+        defaults = dict(LINUX_RUNTIME_DEFAULTS)
+        # Older Linux updaters already replace launcher/ui. Put the packaged
+        # shader assets there so their first update also receives the new set.
+        shaders = LAUNCHER_DIR / "ui" / "native_shaders"
+        if shaders.is_dir():
+            defaults["aot_shader_path"] = str(shaders)
+        missing = [f"{k} = {_fmt(v, 'bool' if isinstance(v, bool) else 'str' if isinstance(v, str) else 'int')}"
+                   for k, v in defaults.items() if k not in present]
+        if missing:
+            lines.extend(["", "# Linux runtime defaults", *missing])
     block = [SETTINGS_BEGIN]
     for k, (typ, default, _r) in SETTINGS_SCHEMA.items():
         if k in OMIT_WHEN_DEFAULT and values[k] == default:

@@ -19,6 +19,7 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/perf/counter.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
@@ -203,7 +204,20 @@ void VulkanSharedMemory::EndSubmission() {
   upload_buffer_pool_->FlushWrites();
 }
 
-void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range) {
+bool VulkanSharedMemory::FlushGpuWrittenRange(uint32_t start, uint32_t length, bool writing) {
+  return !native_resolve_memory_flusher_ || native_resolve_memory_flusher_(start, length, writing);
+}
+
+void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range,
+                             std::pair<uint32_t, uint32_t> read_range) {
+  auto access_range = usage == Usage::kRead ? read_range : written_range;
+  if (!access_range.second) {
+    access_range = {0, kBufferSize};
+  }
+  if (!FlushGpuWrittenRange(access_range.first, access_range.second, usage != Usage::kRead)) {
+    REXGPU_ERROR("Shared memory: failed to make native GPU data visible to the mirror");
+    return;
+  }
   written_range.first = std::min(written_range.first, kBufferSize);
   written_range.second = std::min(written_range.second, kBufferSize - written_range.first);
   assert_true(usage != Usage::kRead || !written_range.second);
@@ -369,15 +383,20 @@ bool VulkanSharedMemory::UploadRanges(
     while (upload_range_length) {
       VkBuffer upload_buffer;
       VkDeviceSize upload_buffer_offset, upload_buffer_size;
+      rex::perf::ScopedCounterTimer pool_timer(rex::perf::CounterId::kUploadPoolUs);
       uint8_t* upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
           submission_current, upload_range_length << page_size_log2(),
           size_t(1) << page_size_log2(), upload_buffer, upload_buffer_offset, upload_buffer_size);
+      pool_timer.Stop();
       if (upload_buffer_mapping == nullptr) {
         REXGPU_ERROR("Shared memory: Failed to get a Vulkan upload buffer");
         successful = false;
         break;
       }
-      MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      {
+        rex::perf::ScopedCounterTimer valid_timer(rex::perf::CounterId::kUploadValidUs);
+        MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      }
       CopyPagesForUpload(upload_range_start, uint32_t(upload_buffer_size >> page_size_log2()),
                          upload_buffer_mapping);
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {

@@ -119,6 +119,8 @@ def main():
             out_base = os.path.join(args.out_dir, f"{trace_name}_{name}")
             result = run_variant(args.replayer, trace, out_base, cvars, args.iterations,
                                  args.timeout)
+            if result["rc"] != 0 or result["errors"]:
+                failures += 1
             line = f"  {name:10s} rc={result['rc']} {result['elapsed']:.1f}s"
             if result["gpu_ms"] is not None:
                 line += f" gpu {result['gpu_ms']:.2f} ms/frame"

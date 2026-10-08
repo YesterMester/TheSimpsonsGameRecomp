@@ -300,8 +300,9 @@ void PrimitiveProcessor::ClearPerFrameCache() {
   std::memset(cache_buckets_non_empty_l2_, 0, sizeof(cache_buckets_non_empty_l2_));
 }
 
-bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
+bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_indices) {
   SCOPE_profile_cpu_f("gpu");
+  result_out.native_index_snapshot = nullptr;
 
   const RegisterFile& regs = register_file_;
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
@@ -937,6 +938,51 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
           cache_transaction.SetNewResult(cacheable);
         }
       }
+    }
+  }
+
+  // Ordinary indexed draws can bind their own immutable host buffer. Preserve
+  // the raw index bits: the vertex shader already handles guest endian and
+  // 24-bit masking, and restart replacement above remains unchanged. Never
+  // reuse a snapshot by address alone; the game rewrites index streams in place.
+  // Expanded primitives and tessellation still read guest indices in shaders.
+  if (native_dma_indices && cacheable.host_draw_vertex_count &&
+      cacheable.index_buffer_type == ProcessedIndexBufferType::kGuestDMA &&
+      host_vertex_shader_type == Shader::HostVertexShaderType::kVertex &&
+      (cacheable.host_index_format == xenos::IndexFormat::kInt16 ||
+       full_32bit_vertex_indices_used_) &&
+      !shared_memory_.IsRangeGpuWritten(guest_index_base, guest_index_buffer_needed_bytes)) {
+    size_t snapshot_size =
+        size_t(cacheable.host_draw_vertex_count) *
+        (cacheable.host_index_format == xenos::IndexFormat::kInt16 ? sizeof(uint16_t)
+                                                                   : sizeof(uint32_t));
+    if (!TryRetainedNativeIndexBuffer(guest_index_base, uint32_t(snapshot_size),
+                                      memory_.TranslatePhysical<const void*>(guest_index_base),
+                                      cacheable.host_index_buffer_handle,
+                                      result_out.native_index_snapshot)) {
+      void* host_indices = RequestHostConvertedIndexBufferForCurrentFrame(
+          cacheable.host_index_format, cacheable.host_draw_vertex_count, false, guest_index_base,
+          cacheable.host_index_buffer_handle);
+      if (!host_indices) {
+        return false;
+      }
+      native_index_snapshot_.resize(snapshot_size);
+      std::memcpy(native_index_snapshot_.data(),
+                  memory_.TranslatePhysical<const void*>(guest_index_base), snapshot_size);
+      std::memcpy(host_indices, native_index_snapshot_.data(), snapshot_size);
+      result_out.native_index_snapshot = native_index_snapshot_.data();
+    }
+    trace_writer_.WriteMemoryRead(guest_index_base, snapshot_size,
+                                  result_out.native_index_snapshot);
+    cacheable.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
+    static thread_local uint64_t native_index_draws = 0;
+    static thread_local uint64_t native_index_bytes = 0;
+    native_index_bytes += snapshot_size;
+    if (++native_index_draws <= 8 || !(native_index_draws & 4095)) {
+      REXGPU_INFO("[native-index] {} draws, {} bytes; count {}, format {}, endian {}",
+                  native_index_draws, native_index_bytes, cacheable.host_draw_vertex_count,
+                  uint32_t(cacheable.host_index_format),
+                  uint32_t(cacheable.host_shader_index_endian));
     }
   }
 

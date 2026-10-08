@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -41,6 +42,10 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, true, "UI/Vulkan",
 namespace rex {
 namespace ui {
 namespace vulkan {
+
+// The device created with VK_KHR_present_id and VK_KHR_present_wait enabled,
+// for the presenter (kept outside VulkanDevice so its layout stays the same).
+std::atomic<VkDevice> g_present_wait_device{VK_NULL_HANDLE};
 
 template <typename Structure, VkStructureType StructureType>
 struct VulkanFeatures {
@@ -199,6 +204,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
   }
+  // For knowing when presented frames reach the display (vblank timing).
+  bool ext_KHR_present_id = false;
+  bool ext_KHR_present_wait = false;
+  if (with_swapchain && get_physical_device_properties2_supported) {
+    // #295.
+    XE_UI_VULKAN_LOCAL_EXTENSION(KHR_present_id)
+    // #249.
+    XE_UI_VULKAN_LOCAL_EXTENSION(KHR_present_wait)
+  }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
   bool ext_1_1_KHR_maintenance1 = false;
@@ -332,6 +346,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+  VulkanFeatures<VkPhysicalDevicePresentIdFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR>
+      features_KHR_present_id;
+  VulkanFeatures<VkPhysicalDevicePresentWaitFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR>
+      features_KHR_present_wait;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -372,6 +392,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+    }
+    if (ext_KHR_present_id && ext_KHR_present_wait) {
+      features_KHR_present_id.Link(supported_features_2, device_create_info);
+      features_KHR_present_wait.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -727,6 +751,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  bool present_wait_enabled = false;
+  if (ext_KHR_present_id && ext_KHR_present_wait) {
+    features_KHR_present_id.enabled.presentId = features_KHR_present_id.supported.presentId;
+    features_KHR_present_wait.enabled.presentWait = features_KHR_present_wait.supported.presentWait;
+    present_wait_enabled = features_KHR_present_id.supported.presentId &&
+                           features_KHR_present_wait.supported.presentWait;
+    if (present_wait_enabled) {
+      REXLOG_INFO("* presentId, presentWait");
+    }
+  }
+
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
 #undef XE_UI_VULKAN_FEATURE
@@ -744,6 +779,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         "'{}': {}",
         properties.deviceName, vk::to_string(vk::Result(device_create_result)));
     return nullptr;
+  }
+
+  if (present_wait_enabled) {
+    g_present_wait_device.store(device->device_, std::memory_order_relaxed);
   }
 
   // Load device functions.

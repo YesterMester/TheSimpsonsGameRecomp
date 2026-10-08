@@ -13,6 +13,7 @@
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/thread_priority.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -24,8 +25,17 @@
 #include <rex/thread.h>
 #include <rex/cvar.h>
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
+
+#include <SDL3/SDL_error.h>
+#include <SDL3/SDL_thread.h>
+#include <SDL3/SDL_timer.h>
+#if REX_PLATFORM_LINUX
+#include <SDL3/SDL_system.h>
+#include <sys/syscall.h>
+#endif
 
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
@@ -55,6 +65,25 @@ REXCVAR_DEFINE_BOOL(audio_callback_pacing, true, "Audio",
 #include <cerrno>
 #endif
 
+extern "C" bool rex_audio_set_thread_priority() {
+#if defined(_WIN32)
+  return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) != 0;
+#else
+  struct sched_param sp{};
+  sp.sched_priority = 10;
+  if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0) {
+    return true;
+  }
+#if REX_PLATFORM_LINUX
+  if (SDL_SetLinuxThreadPriorityAndPolicy(syscall(SYS_gettid), SDL_THREAD_PRIORITY_TIME_CRITICAL,
+                                          SCHED_RR)) {
+    return true;
+  }
+#endif
+  return SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+#endif
+}
+
 namespace rex::audio {
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
@@ -63,9 +92,8 @@ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
       worker_running_(false) {
   std::memset(clients_, 0, sizeof(clients_));
 
-  queued_frames_ = std::min(
-      static_cast<uint32_t>(kMaximumQueuedFrames),
-      std::max(static_cast<uint32_t>(REXCVAR_GET(audio_maxqframes)), static_cast<uint32_t>(4)));
+  queued_frames_ =
+      uint32_t(std::clamp(REXCVAR_GET(audio_maxqframes), 4, int32_t(kMaximumQueuedFrames)));
 
   for (size_t i = 0; i < kMaximumClientCount; ++i) {
     client_semaphores_[i] = rex::thread::Semaphore::Create(0, queued_frames_);
@@ -111,21 +139,9 @@ void AudioSystem::WorkerThreadMain() {
   // HAND PATCH: raise the audio worker to realtime-ish priority so guest
   // audio callbacks aren't starved by GPU/streaming threads (audible
   // stutter under load). SCHED_FIFO needs privileges we may not have, so
-  // fall back to the highest nice level for this thread.
-  {
-#if defined(_WIN32)
-    // Windows equivalent of the POSIX realtime-ish bump: time-critical priority
-    // keeps the audio worker ahead of GPU/streaming threads.
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-#else
-    struct sched_param sp {};
-    sp.sched_priority = 10;
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-      // Not privileged for SCHED_FIFO: use nice -10 for this thread.
-      errno = 0;
-      (void)nice(-10);
-    }
-#endif
+  // use SDL's native scheduling helper, including the desktop priority broker.
+  if (!rex_audio_set_thread_priority()) {
+    REXAPU_WARN("AudioWorker: cannot raise thread priority: {}", SDL_GetError());
   }
   // Initialize driver and ringbuffer.
   Initialize();
@@ -181,10 +197,19 @@ void AudioSystem::WorkerThreadMain() {
         if (REXCVAR_GET(audio_callback_pacing)) {
           auto now = std::chrono::steady_clock::now();
           if (now < next_callback[index]) {
-            std::this_thread::sleep_until(next_callback[index]);
-            now = next_callback[index];
+            // SDL uses a high-resolution timer on Windows, where a standard
+            // sleep rounds up to whole milliseconds or the system tick.
+            SDL_DelayNS(uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(next_callback[index] - now)
+                    .count()));
+            now = std::chrono::steady_clock::now();
           }
-          next_callback[index] = now + kCallbackInterval;
+          // Keep the schedule, so waking late cannot lower the average rate
+          // below the hardware's, but never ask again within half a frame:
+          // called again right away, the game's mixer returns silence. After
+          // a stall, this restarts from now instead of catching up in a burst.
+          next_callback[index] =
+              std::max(next_callback[index] + kCallbackInterval, now + kCallbackInterval / 2);
         }
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",

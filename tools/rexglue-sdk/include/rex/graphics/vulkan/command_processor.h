@@ -57,6 +57,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     // EDRAM binding, so it can stand in for it (native resolves writing the
     // scaled resolve buffer).
     kStorageBufferGuestShaders,
+    // Compatible with the host-render-target shared-memory layout, including
+    // devices where the guest buffer uses multiple descriptors.
+    kStorageBufferNativeVertexStreams,
     kCount,
   };
 
@@ -180,6 +183,13 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
   uint64_t GetCompletedFrame() const { return frame_completed_; }
+
+  // Immutable texture upload snapshot, retained until its frame completes.
+  bool UploadNativeTextureData(uint32_t address, uint32_t length,
+                               VkDescriptorBufferInfo& buffer_info);
+  bool UseNativeResolveBufferRange(uint32_t address, uint32_t length,
+                                   VkDescriptorBufferInfo& buffer_info, bool scaled = false);
+  bool CanUseNativeResolveBufferRange(uint32_t address, uint32_t length, bool scaled) const;
 
   // Submission must be open to insert barriers. If no pipeline stages access
   // the resource in a synchronization scope, the stage masks should be 0 (top /
@@ -460,6 +470,17 @@ class VulkanCommandProcessor : public CommandProcessor {
   // ending anyway; the guest consumes the data on the following frame.
   void PerformDeferredMemexportReadback();
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+  struct NativeVertexRange {
+    uint32_t address;
+    uint32_t size;
+    uint32_t offset;
+  };
+  struct NativeVertexCache;
+  VkDescriptorSet TryCachedNativeVertexStreams(const NativeVertexRange* ranges, size_t range_count,
+                                               uint32_t snapshot_size);
+
+  bool PrepareNativeVertexStreams(const VulkanShader& shader, const VulkanShader* pixel_shader,
+                                  const PrimitiveProcessor::ProcessingResult& primitives);
 
   void SplitPendingBarrier();
 
@@ -605,6 +626,21 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<VkDescriptorImageInfo> descriptor_write_image_info_;
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
+  std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> native_vertex_buffer_pool_;
+  std::unique_ptr<NativeVertexCache> native_vertex_cache_;
+  std::deque<std::pair<uint64_t, std::unique_ptr<NativeVertexCache>>> native_vertex_caches_retired_;
+
+  std::unordered_map<size_t, std::unique_ptr<ui::vulkan::VulkanUploadBufferPool>>
+      native_texture_buffer_pools_;
+
+  std::array<uint32_t, 6 * 32> native_vertex_fetch_constants_{};
+  VkDescriptorSet native_vertex_descriptor_set_ = VK_NULL_HANDLE;
+  uint32_t shared_memory_binding_count_ = 0;
+  bool native_vertex_streams_active_ = false;
+  bool native_vertex_fetch_constants_bound_ = false;
+  uint64_t native_vertex_draws_ = 0;
+  uint64_t native_vertex_total_draws_ = 0;
+  uint64_t native_vertex_bytes_ = 0;
 
   // Descriptor set layouts used by different shaders.
   VkDescriptorSetLayout descriptor_set_layout_empty_ = VK_NULL_HANDLE;

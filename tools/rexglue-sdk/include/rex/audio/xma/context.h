@@ -111,13 +111,41 @@ struct XMA_CONTEXT_DATA {
   uint32_t unk_dwords_10_15[6];  // reserved?
 
   explicit XMA_CONTEXT_DATA(const void* ptr) {
-    memory::copy_and_swap(reinterpret_cast<uint32_t*>(this), reinterpret_cast<const uint32_t*>(ptr),
-                          sizeof(XMA_CONTEXT_DATA) / 4);
+    auto snapshot = reinterpret_cast<uint32_t*>(this);
+    for (size_t i = 0; i < sizeof(XMA_CONTEXT_DATA) / 4; ++i) {
+      snapshot[i] = LoadWord(ptr, i);
+    }
+  }
+
+  // Hot mixer queries need only their own word. Acquiring a published output
+  // position also makes its PCM samples visible to the consumer.
+  static uint32_t LoadWord(const void* ptr, size_t index) {
+    // The shared context has mutable storage, even when accessed through this
+    // read-only interface. Use the same atomic storage type as its writers;
+    // some standard libraries cannot instantiate atomic_ref<const T>::load.
+    auto& storage = const_cast<uint32_t&>(reinterpret_cast<const uint32_t*>(ptr)[index]);
+    std::atomic_ref<uint32_t> word(storage);
+    return rex::byte_swap(word.load(std::memory_order_acquire));
   }
 
   void Store(void* ptr) {
     memory::copy_and_swap(reinterpret_cast<uint32_t*>(ptr), reinterpret_cast<const uint32_t*>(this),
                           sizeof(XMA_CONTEXT_DATA) / 4);
+  }
+
+  // The mixer and decoder own different fields, including fields in the
+  // same word. Publish only the bits being changed, preserving newer data.
+  static void UpdateWord(void* ptr, uint32_t index, uint32_t mask, uint32_t value) {
+    if (!mask) {
+      return;
+    }
+    std::atomic_ref<uint32_t> word(reinterpret_cast<uint32_t*>(ptr)[index]);
+    uint32_t previous = word.load(std::memory_order_relaxed);
+    uint32_t next;
+    do {
+      next = rex::byte_swap((rex::byte_swap(previous) & ~mask) | (value & mask));
+    } while (!word.compare_exchange_weak(previous, next, std::memory_order_release,
+                                         std::memory_order_relaxed));
   }
 
   bool IsInputBufferValid(uint8_t buffer_index) const {

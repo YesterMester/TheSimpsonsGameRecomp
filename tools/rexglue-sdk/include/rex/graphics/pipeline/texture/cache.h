@@ -114,6 +114,9 @@ class TextureCache {
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);
+  // Make CPU-backed resources reload into a new trace even when their native
+  // uploads have never been copied into the shared-memory mirror.
+  void InvalidateCpuTextureInputsForTrace();
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -553,6 +556,24 @@ class TextureCache {
   // into the texture object.
   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                      bool load_mips) = 0;
+  // Backends may upload CPU-owned resources directly to a native buffer,
+  // keeping texture decoding independent of a full guest-memory mirror.
+  virtual bool CanLoadTextureDataFromCpu(const Texture& /*texture*/, bool /*load_base*/,
+                                         bool /*load_mips*/) const {
+    return false;
+  }
+  virtual bool LoadTextureDataFromCpuImpl(Texture& /*texture*/, bool /*load_base*/,
+                                          bool /*load_mips*/) {
+    return false;
+  }
+  virtual bool CanLoadTextureDataFromNativeGpu(const Texture& /*texture*/, bool /*load_base*/,
+                                               bool /*load_mips*/) const {
+    return false;
+  }
+  virtual bool LoadTextureDataFromNativeGpuImpl(Texture& /*texture*/, bool /*load_base*/,
+                                                bool /*load_mips*/) {
+    return false;
+  }
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
@@ -578,6 +599,8 @@ class TextureCache {
     Texture* texture = nullptr;
     bool load_base = false;
     bool load_mips = false;
+    bool from_cpu = false;
+    bool from_native_gpu = false;
   };
   struct PendingSharedMemoryRange {
     uint32_t start = 0;

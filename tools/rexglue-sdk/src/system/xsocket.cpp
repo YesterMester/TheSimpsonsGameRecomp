@@ -21,9 +21,9 @@
 
 // Standard socket types used by Xbox API emulation
 #if REX_PLATFORM_WIN32
-#include <WinSock2.h>
+#include <winsock2.h>
 
-#include <WS2tcpip.h>
+#include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -49,7 +49,7 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 
   if (proto == Protocol::IPPROTO_VDP) {
     // VDP is a layer on top of UDP.
-    proto = Protocol::IPPROTO_UDP;
+    proto = static_cast<Protocol>(IPPROTO_UDP);
   }
 
   native_handle_ = socket(af, type, proto);

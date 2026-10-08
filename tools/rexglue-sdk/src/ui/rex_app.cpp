@@ -31,6 +31,9 @@
 #if REX_HAS_D3D12
 #include <rex/graphics/d3d12/graphics_system.h>
 #endif
+#if REX_HAS_D3D11
+#include <rex/graphics/d3d11/graphics_system.h>
+#endif
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
@@ -79,6 +82,7 @@ bool ReXApp::OnInitialize() {
   if (!SetupPresentation())
     return false;
 
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
   // HAND PATCH: SetGuestFrameStats was declared and wired into the F3 debug
   // overlay's constructor, but nothing ever called it -- the "Guest: FPS"
   // line was dead, always skipped by the `stats.frame_count > 0` check in
@@ -95,6 +99,7 @@ bool ReXApp::OnInitialize() {
     stats.frame_count = overlay_frame_counter;
     return stats;
   });
+#endif
 
   auto paths = OnFinalizePaths(resolved_defaults_, MakeResumeCallback());
   if (!paths) {
@@ -372,6 +377,15 @@ bool ReXApp::SetupPresentation() {
 #elif REX_HAS_D3D12
   config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
 #endif
+#if REX_HAS_D3D11
+#if !REX_HAS_VULKAN && !REX_HAS_D3D12
+  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d11::D3D11GraphicsSystem);
+#else
+  if (REXCVAR_GET(gpu) == "d3d11") {
+    config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d11::D3D11GraphicsSystem);
+  }
+#endif
+#endif
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;
@@ -381,7 +395,7 @@ bool ReXApp::SetupPresentation() {
   if (config_.graphics) {
     X_STATUS status = config_.graphics->SetupPresentation(&app_context());
 #if REX_HAS_D3D12 && REX_HAS_VULKAN
-    if (XFAILED(status) && !want_d3d12) {
+    if (XFAILED(status) && !want_d3d12 && REXCVAR_GET(gpu) != "d3d11") {
       REXLOG_WARN(
           "Vulkan presentation setup failed ({:08X}) - falling back to the "
           "D3D12 backend",

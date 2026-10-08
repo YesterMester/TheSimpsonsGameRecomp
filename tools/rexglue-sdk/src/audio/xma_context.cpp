@@ -100,6 +100,11 @@ bool XmaContext::Work() {
   }
 
   std::lock_guard<std::mutex> lock(lock_);
+  // A synchronous kick or cancellation may finish while we wait for the
+  // context lock. Only the caller that still owns enabled work may decode.
+  if (!is_allocated() || !is_enabled()) {
+    return false;
+  }
   set_is_enabled(false);
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
@@ -380,27 +385,38 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
 
 void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
                                     const XMA_CONTEXT_DATA& initial_data, uint8_t* context_ptr) {
-  XMA_CONTEXT_DATA fresh(context_ptr);
-
-  fresh.loop_count = data.loop_count;
-  fresh.output_buffer_write_offset = data.output_buffer_write_offset;
+  uint32_t mask = 31u << 27;
+  uint32_t value = uint32_t(data.output_buffer_write_offset) << 27;
+  if (data.loop_count != initial_data.loop_count) {
+    mask |= 255u << 12;
+    value |= uint32_t(data.loop_count) << 12;
+  }
   if (initial_data.input_buffer_0_valid && !data.input_buffer_0_valid) {
-    fresh.input_buffer_0_valid = 0;
+    mask |= 1u << 20;
   }
   if (initial_data.input_buffer_1_valid && !data.input_buffer_1_valid) {
-    fresh.input_buffer_1_valid = 0;
+    mask |= 1u << 21;
   }
-
+  // Never write the consumer's read offset (word 9) or resource pointers.
+  // The mixer can advance while a native decode is still producing samples.
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 0, mask, value);
   if (initial_data.output_buffer_valid && !data.output_buffer_valid) {
-    fresh.output_buffer_valid = 0;
+    XMA_CONTEXT_DATA::UpdateWord(context_ptr, 1, 1u << 31, 0);
   }
-
-  fresh.input_buffer_read_offset = data.input_buffer_read_offset;
-  fresh.error_status = data.error_status;
-  fresh.current_buffer = data.current_buffer;
-  fresh.output_buffer_read_offset = data.output_buffer_read_offset;
-
-  fresh.Store(context_ptr);
+  mask = 0;
+  value = 0;
+  if (data.input_buffer_read_offset != initial_data.input_buffer_read_offset) {
+    mask |= 0x03FFFFFFu;
+    value |= uint32_t(data.input_buffer_read_offset);
+  }
+  if (data.error_status != initial_data.error_status) {
+    mask |= 31u << 26;
+    value |= uint32_t(data.error_status) << 26;
+  }
+  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 2, mask, value);
+  if (data.current_buffer != initial_data.current_buffer) {
+    XMA_CONTEXT_DATA::UpdateWord(context_ptr, 4, 1u << 31, uint32_t(data.current_buffer) << 31);
+  }
 }
 
 void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data) {

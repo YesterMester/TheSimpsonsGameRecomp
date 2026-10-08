@@ -60,8 +60,8 @@ set(REXGRAPHICS_VULKAN_SOURCES
     vulkan/texture_cache.cpp
 )
 
-# D3D12 backend
-if(REXGLUE_USE_D3D12)
+# Shared Direct3D shader translation
+if(REXGLUE_USE_D3D11 OR REXGLUE_USE_D3D12)
     # DXBC third-party dependency
     set(REXGRAPHICS_DXBC_THIRDPARTY_SOURCES
         ${REXGLUE_ROOT}/thirdparty/dxbc/DXBCChecksum.cpp
@@ -75,9 +75,13 @@ if(REXGLUE_USE_D3D12)
         pipeline/shader/dxbc_translator_fetch.cpp
         pipeline/shader/dxbc_translator_memexport.cpp
         pipeline/shader/dxbc_translator_om.cpp
+        util/dxbc_geometry.cpp
     )
 
-    # D3D12 GPU backend
+endif()
+
+# D3D12 GPU backend
+if(REXGLUE_USE_D3D12)
     set(REXGRAPHICS_D3D12_SOURCES
         d3d12/graphics_system.cpp
         d3d12/command_processor.cpp
@@ -91,6 +95,37 @@ if(REXGLUE_USE_D3D12)
     )
 endif()
 
+# Native Direct3D 11 backend
+if(REXGLUE_USE_D3D11)
+    set(REXGRAPHICS_D3D11_SOURCES
+        d3d11/buffer_cache.cpp
+        d3d11/command_processor.cpp
+        d3d11/draw_context.cpp
+        d3d11/draw_state.cpp
+        d3d11/graphics_system.cpp
+        d3d11/guest_draw.cpp
+        d3d11/guest_sampler.cpp
+        d3d11/pipeline_cache.cpp
+        d3d11/primitive_processor.cpp
+        d3d11/profile.cpp
+        d3d11/render_target_cache.cpp
+        d3d11/render_target_encoder.cpp
+        d3d11/render_target_surface.cpp
+        d3d11/resolve_copy.cpp
+        d3d11/sampler_cache.cpp
+        d3d11/scaled_resolve_memory.cpp
+        d3d11/shader_bytecode.cpp
+        d3d11/shader_cache.cpp
+        d3d11/shared_memory.cpp
+        d3d11/system_constants.cpp
+        d3d11/texture_cache.cpp
+        d3d11/texture_upload.cpp
+        util/dxbc_float.cpp
+        util/dxbc_render_target_dump.cpp
+        util/dxbc_render_target_transfer.cpp
+    )
+endif()
+
 # Combine sources
 set(REXGRAPHICS_SOURCES
     ${REXGRAPHICS_CORE_SOURCES}
@@ -101,8 +136,14 @@ if(REXGLUE_USE_VULKAN)
     list(APPEND REXGRAPHICS_SOURCES ${REXGRAPHICS_SPIRV_SOURCES} ${REXGRAPHICS_VULKAN_SOURCES})
 endif()
 
+if(REXGLUE_USE_D3D11 OR REXGLUE_USE_D3D12)
+    list(APPEND REXGRAPHICS_SOURCES ${REXGRAPHICS_DXBC_THIRDPARTY_SOURCES} ${REXGRAPHICS_DXBC_SOURCES})
+endif()
+if(REXGLUE_USE_D3D11)
+    list(APPEND REXGRAPHICS_SOURCES ${REXGRAPHICS_D3D11_SOURCES})
+endif()
 if(REXGLUE_USE_D3D12)
-    list(APPEND REXGRAPHICS_SOURCES ${REXGRAPHICS_DXBC_THIRDPARTY_SOURCES} ${REXGRAPHICS_DXBC_SOURCES} ${REXGRAPHICS_D3D12_SOURCES})
+    list(APPEND REXGRAPHICS_SOURCES ${REXGRAPHICS_D3D12_SOURCES})
 endif()
 
 add_library(rexgraphics OBJECT ${REXGRAPHICS_SOURCES})
@@ -181,3 +222,7 @@ if(REXGLUE_USE_D3D12)
     target_compile_definitions(rexgraphics PUBLIC REX_HAS_D3D12=1)
 endif()
 
+if(REXGLUE_USE_D3D11)
+    target_link_libraries(rexgraphics PUBLIC d3d11 dxgi d3dcompiler dxguid)
+    target_compile_definitions(rexgraphics PUBLIC REX_HAS_D3D11=1)
+endif()

@@ -10,6 +10,7 @@
  */
 
 #include <rex/audio/xma/context.h>
+#include <rex/audio/thread_priority.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -21,6 +22,8 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
+
+#include <SDL3/SDL_error.h>
 
 extern "C" {
 #include "libavutil/log.h"
@@ -150,17 +153,8 @@ void XmaDecoder::WorkerThreadMain() {
   // voices) went crunchy/slowed when this thread fell behind under load;
   // menu/cutscene audio (fewer voices) was fine. Same approach as the
   // AudioSystem worker.
-  {
-#if defined(_WIN32)
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-#else
-    struct sched_param sp {};
-    sp.sched_priority = 10;
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-      errno = 0;
-      (void)nice(-10);
-    }
-#endif
+  if (!rex_audio_set_thread_priority()) {
+    REXAPU_WARN("XMA: cannot raise decoder thread priority: {}", SDL_GetError());
   }
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!

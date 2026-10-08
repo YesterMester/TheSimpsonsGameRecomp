@@ -172,6 +172,17 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
         word_address = builder_->createBinOp(spv::OpIAdd, type_int_, word_address,
                                              builder_->makeIntConstant(int(word_offset)));
       }
+      if (GetSpirvShaderModification().vertex.native_vertex_streams) {
+        // Native snapshots retain the exact fetch decode. The private size
+        // field stores the first captured dword + 1 (zero still means an
+        // absent optional stream), and the private address is the compact
+        // buffer offset. Guest registers remain unchanged.
+        spv::Id first_word = builder_->createBinOp(spv::OpISub, type_uint_, fetch_size,
+                                                   builder_->makeUintConstant(1));
+        word_address =
+            builder_->createBinOp(spv::OpISub, type_int_, word_address,
+                                  builder_->createUnaryOp(spv::OpBitcast, type_int_, first_word));
+      }
       // FIXME(Triang3l): Bound checking is not done here, but haven't
       // encountered any games relying on out-of-bounds access. On Adreno 200 on
       // Android (LG P705), however, words (not full elements) out of

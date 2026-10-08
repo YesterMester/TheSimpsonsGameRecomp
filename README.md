@@ -6,7 +6,8 @@ statically recompiling the original game code.
 The game's PowerPC executable is translated ahead of time into C++ and compiled for x86-64, so the
 game's own code runs directly on your CPU rather than inside an emulator. Underneath it, the
 ReXGlue runtime, which is derived from the Xenia project, provides the Xbox 360 kernel, audio, input
-and graphics layers, with a Vulkan renderer on Linux and Direct3D 12 or Vulkan on Windows.
+and graphics layers, with a Vulkan renderer on Linux and Vulkan, Direct3D 12 or an experimental
+Direct3D 11 renderer on Windows.
 
 **This project does not include any game content. You need your own copy of the Xbox 360 game.**
 
@@ -46,6 +47,12 @@ The game boots, plays its videos, saves and loads, and runs its levels. See
 - Native x86-64 executable: the recompiled game code runs without CPU emulation.
 - Vulkan renderer that draws with the GPU's own render targets, plus an accurate fallback path
   that emulates the Xbox 360's EDRAM in the pixel shader.
+- Native vertex and index buffers, texture uploads and render target copies for supported
+  resources. Changed data gets its own copy so later frames cannot overwrite an earlier draw.
+- Experimental Direct3D 11 renderer for Windows 10/11, for GPUs without good Vulkan or
+  Direct3D 12 support. Choose it in the launcher's settings.
+- Audio fixes for late mixer wakeups and concurrent decoder updates, with native audio thread
+  scheduling to keep the mixer running under load, on Linux and Windows.
 - 60 FPS gameplay, with menus, the title screen and loading screens kept at the original 30 FPS so
   they run at the speed they were made for.
 - Render resolution scaling (supersampling), anisotropic filtering and FXAA.
@@ -63,7 +70,8 @@ The game boots, plays its videos, saves and loads, and runs its levels. See
 - A 64-bit x86 CPU. The standard download needs AVX2 (Intel Haswell, AMD Excavator or Zen, or
   newer, roughly 2013 onwards). For older CPUs with SSE4.2, download the package ending in
   `-NoAVX2` instead; it runs the same game, somewhat slower.
-- A GPU with a current Vulkan driver (Linux) or Direct3D 12 driver (Windows).
+- A GPU with a current Vulkan driver (Linux) or Direct3D 12 driver (Windows). The experimental
+  Direct3D 11 renderer needs feature level 11.0 or newer.
 - A controller is recommended.
 
 ## Installation
@@ -119,8 +127,16 @@ this off).
 
 **Image quality.** FXAA anti-aliasing is on by default for new installs and smooths the
 cel-shading outlines at little cost. A render scale of 2x or 3x supersamples the whole image, which
-gives the outlines their cleanest look. On a Steam Deck, 1x holds 60 FPS; 2x looks much sharper
-and runs at about 59 FPS in Springfield, the busiest area, with occasional drops.
+gives the outlines their cleanest look. Short Springfield checks on a Steam Deck run close to
+60 FPS at 1x and around 55–58 FPS at 2x, with drops in busy areas. These are scene checks;
+performance varies through the game.
+
+**Audio.** The launcher's *Audio buffer* setting chooses how many 5.3 ms audio frames are queued:
+Small (16), Normal (32, the default) or Large (64). Without a launcher setting the game uses 8.
+Values from 4 to 64 can be set with `audio_maxqframes` in `simpsons.toml`. On the Steam Deck,
+8 and 16 frames play without underruns under a heavy CPU load check, on Linux and with the
+Windows build; the minimum of 4 can still underrun under heavy load. Updating keeps your saved
+setting.
 
 **Keyboard and mouse.** Turn on *Play with keyboard & mouse* in the launcher's Settings tab. The
 game then takes the mouse whenever its window is active, and lets go of it when you switch to
@@ -156,6 +172,13 @@ keep changes made there).
   for that section if it happens.
 - If videos show a black screen on Windows, switch the graphics backend to Vulkan in the
   launcher's settings.
+- The Direct3D 11 renderer is experimental. It has been tested through Proton on a Steam Deck,
+  not yet on Windows drivers, and it is slower than Vulkan at higher render scales: in the tested
+  Springfield scene on the Deck, about 55 FPS at 1x and 22 FPS at 2x.
+- Native rendering is still being completed. Unsupported resources and resolves use the
+  existing fallback, and the new native resource paths have been tested most on Linux/Vulkan.
+- The minimum 4-frame audio queue can still underrun under heavy CPU load. Windows audio has
+  been checked under load with the Windows build through Proton, not yet on Windows itself.
 
 ## Building from source
 
@@ -165,7 +188,7 @@ exactly these steps; see `.github/workflows/build.yml` for the full list of Linu
 ### Linux
 
 Requirements: Clang 20, CMake 3.25 or newer, Ninja, pkg-config, and the development packages for
-GTK 3, Vulkan, X11 and XCB, Wayland, xkbcommon, udev, ALSA, PulseAudio and PipeWire.
+GTK 3, Vulkan, X11 and XCB, Wayland, xkbcommon, udev, ALSA, PulseAudio, PipeWire and D-Bus.
 
 ```sh
 git clone https://github.com/YesterMester/TheSimpsonsGameRecomp.git
@@ -211,8 +234,9 @@ pip install PySide6
 python launcher\launcher.py
 ```
 
-Windows builds include both the Direct3D 12 and Vulkan renderers; the launcher's settings choose
-between them. Without PySide6 the launcher opens in your web browser instead of its own window.
+Windows builds include the Vulkan and Direct3D 12 renderers; the launcher's settings choose
+between them. Add `-DREXGLUE_USE_D3D11=ON` when configuring to include the experimental Direct3D 11
+renderer, as the release builds do. Without PySide6 the launcher opens in your web browser instead of its own window.
 
 ## Contributing
 
@@ -273,13 +297,23 @@ build output.
 The goal is for this to be the best way to play the game. In rough order:
 
 - **Fully native renderer.** The Xbox 360 GPU emulation is being replaced piece by piece with
-  native rendering, each step checked to give exactly the same image. Done: every shader compiled
-  ahead of time, native replacements for the most expensive shaders, render-to-texture and copies
-  done natively instead of through the emulated EDRAM, and render targets sized like native ones.
-  Next: real vertex and index buffers, and textures and buffers uploaded when the game loads them
-  instead of watching its memory. A native renderer is also what the features below build on.
+  native rendering, each step checked to give exactly the same image. Done: shaders compiled
+  ahead of time for the tested Vulkan configurations, native replacements for expensive shaders,
+  matching render-to-texture copies done natively, and render targets sized like native ones.
+  Supported vertex and index data now uses native buffers, with unchanged copies retained and
+  changed data checked before reuse. Supported CPU textures upload directly, and matching color
+  resolves keep separate texture images. Next: cover the remaining formats and resource aliases,
+  move resource creation to the game's own loading paths, and remove the remaining EDRAM and
+  memory-mirror fallbacks. See the [renderer notes](simpsons/re/native_renderer_plan.md) for
+  coverage and validation. A native renderer is also what the features below build on.
 - **No slowdowns or stutters.** A steady 60 FPS everywhere, including at 2x internal resolution
   on the Steam Deck, with no shader compilation hitches.
+- **Higher frame rates.** Proper 120 FPS and unlimited rendering, with game logic, physics,
+  scripted sequences and audio kept at the right speed.
+- **Direct3D 11.** A native Windows 10/11 renderer for older GPUs, experimental since 0.0.6.4.
+  Next: resolve directly into native textures as the Vulkan renderer does (the round trip through
+  the Xbox memory layout is what slows it at higher render scales), and testing on Windows
+  drivers. See the [DX11 renderer notes](simpsons/re/d3d11_renderer.md).
 - **Widescreen.** Wider aspect ratios such as 21:9 without stretching.
 - **Controller prompts.** Button icons that match the controller you have connected (Xbox,
   PlayStation, Nintendo, Steam Deck), or your keyboard keys, in every in-game prompt, menu and
@@ -310,11 +344,11 @@ responsible for complying with the laws that apply to you regarding backups of m
 
 This software is provided as is, without warranty of any kind.
 
-**A note on AI assistance:** parts of this project, including research into the game's internals,
-build tooling and bug fixes, have been developed with the assistance of Claude AI, in the interest
-of getting a working release out and turning around fixes as quickly as possible for a solo,
-fan-made effort. Treat it as a fast-moving hobby project rather than a polished commercial
-release.
+**An updated note on AI assistance:** most of the early work on this project used little to no
+AI assistance. As things have become harder, I've used ChatGPT and Claude a handful of times to
+help with research, bug fixes and improvements, and to get closer to what I want this recomp to
+be. I'm afraid I may have to use them more as I get further into the project, and I apologize
+for that. This is still a solo, fan-made effort and a fast-moving hobby project.
 
 ## License
 

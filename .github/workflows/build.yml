@@ -72,5 +72,6 @@ jobs:
           cmake --preset win-amd64-relwithdebinfo `
             -DREXSDK_DIR="$env:GITHUB_WORKSPACE/tools/rexglue-sdk" `
             -DREXGLUE_USE_D3D11=ON `
+            -DREXGLUE_ENABLE_LTO=ON `
             "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
           cmake --build --preset win-amd64-relwithdebinfo --target simpsons

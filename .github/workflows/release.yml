@@ -94,6 +94,7 @@ jobs:
           cmake --preset win-amd64-relwithdebinfo `
             -DREXSDK_DIR="$env:GITHUB_WORKSPACE/tools/rexglue-sdk" `
             -DREXGLUE_USE_D3D11=ON `
+            -DREXGLUE_ENABLE_LTO=ON `
             -DSIMPSONS_X86_MARCH=${{ matrix.march }} `
             "-DCMAKE_C_FLAGS=-march=${{ matrix.march }}" "-DCMAKE_CXX_FLAGS=-march=${{ matrix.march }}"
 

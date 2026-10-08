@@ -159,6 +159,22 @@ class LauncherPatches(unittest.TestCase):
         self.assertIn("native_resolve_copy_free = false", text)
         self.assertIn("native_buffer_write_watches = false", text)
 
+    def test_runtime_defaults_on_linux_and_windows(self):
+        self.app.GAME_TOML = self.app.GAMEDATA / "simpsons.toml"
+        self.app.capture_keys = lambda: {}
+        for platform, timer_sleep in (("Linux", True), ("Windows", False)):
+            with self.subTest(platform=platform), mock.patch.object(self.app, "PLAT", platform):
+                self.app.GAME_TOML.write_text("native_vertex_buffers = false\n")
+                self.app.write_settings({})
+                text = self.app.GAME_TOML.read_text()
+                self.assertIn(f"# {platform} runtime defaults", text)
+                self.assertIn("native_index_buffers = true", text)
+                self.assertIn("native_resolve_copy_free = false", text)
+                # A saved value stays.
+                self.assertIn("native_vertex_buffers = false", text)
+                self.assertNotIn("native_vertex_buffers = true", text)
+                self.assertEqual("timer_queue_sleep = true" in text, timer_sleep)
+
     def test_old_refresh_rate_setting_becomes_frame_rate(self):
         self.app.GAME_TOML = self.app.GAMEDATA / "simpsons.toml"
         self.app.capture_keys = lambda: {}

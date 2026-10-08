@@ -30,6 +30,30 @@ env:
   LLVM_VERSION: "20.1.8"
 
 jobs:
+  # ---------------------------------------------------------------- Shaders
+  # The shader set for Windows packages: every shader translated ahead of
+  # time on a Steam Deck, then the hand-written replacements (glslang is
+  # readily available here, not on the Windows runners). The game serves the
+  # translations only where the translator and the GPU configuration match
+  # the ones they were made with, and translates at runtime everywhere else.
+  shaders:
+    name: Shader set
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the shader set
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+          mkdir -p native_shaders
+          tar -C native_shaders -xJf tools/native-renderer/translated_shaders.tar.xz
+          python3 tools/native-renderer/native_shaders/build_native_shaders.py \
+            native_shaders 0000400000000001
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-shaders
+          path: native_shaders
+
   # ---------------------------------------------------------------- Windows
   # Each platform is built twice: the default package for x86-64-v3 CPUs
   # (AVX2, BMI2 and FMA: Intel Haswell, AMD Excavator or Zen, and newer) and
@@ -38,6 +62,7 @@ jobs:
   # one is installed, so its updater keeps fetching the right package.
   windows:
     name: Windows x64 ${{ matrix.march }} (clang / Vulkan + D3D12 + D3D11)
+    needs: shaders
     runs-on: windows-latest
     strategy:
       matrix:
@@ -157,6 +182,12 @@ jobs:
           $ff = Get-ChildItem "$env:RUNNER_TEMP\ff" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           Copy-Item $ff.FullName "ffmpeg.exe" -Force
 
+      # Next to simpsons.exe, where the game looks for it without a setting.
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-shaders
+          path: release/native_shaders
+
       - name: Package
         shell: pwsh
         run: |
@@ -177,10 +208,12 @@ jobs:
           Copy-Item "ffmpeg.exe"                         release/
           Copy-Item "README.md"                         release/
           Set-Content release/build_variant.txt -Encoding ascii -Value "${{ matrix.march }}"
-          Set-Content release/simpsons.toml -Encoding utf8 -Value @(
-            '# The Simpsons Game - runtime configuration (edit these via the launcher)',
-            'gpu_allow_invalid_fetch_constants = false',
-            'gpu_shader_max_cf_iterations = 0')
+          python tools/native-renderer/write_runtime_defaults.py release/simpsons.toml windows
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Test-Path "release/native_shaders/translator_version.txt")) {
+            Write-Error "The shader set is missing from the package"
+            exit 1
+          }
 
           # Fail here, not for a player after download, if a required file
           # never made it into the package (Copy-Item on a non-matching
@@ -348,9 +381,11 @@ jobs:
         with:
           sparse-checkout: .github
 
+      # The packages only (not the shader set the Windows packages include).
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: "*-x64*"
 
       # Always a full release marked "latest" on publish — never a prerelease.
       # The launcher's update checker uses /releases/latest, which ignores
@@ -375,6 +410,7 @@ jobs:
         uses: geekyeggo/delete-artifact@v5
         with:
           name: |
+            native-shaders
             windows-x64
             windows-x64-noavx2
             linux-x64

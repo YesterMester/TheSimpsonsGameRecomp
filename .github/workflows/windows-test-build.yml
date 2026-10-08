@@ -1,0 +1,74 @@
+name: Windows test build (manual)
+
+# A Windows build for testing, for example through Proton on Linux: the game,
+# its DLLs and the runtime defaults, packaged like a release but without the
+# shader set (build it with tools/native-renderer/native_shaders/
+# build_native_shaders.py into native_shaders next to simpsons.exe), the
+# launcher or the installer tools. Uploaded as a short-lived workflow
+# artifact, not a release.
+#
+# Trigger: Actions tab -> "Windows test build (manual)" -> Run workflow.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLVM_VERSION: "20.1.8"
+
+jobs:
+  windows:
+    name: Windows x64 test build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/Clang ${{ env.LLVM_VERSION }}
+        shell: pwsh
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\llvm.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\llvm.exe" -ArgumentList '/S' -Wait
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+
+      - name: Configure (game + SDK, Vulkan + D3D12 + experimental D3D11)
+        shell: pwsh
+        working-directory: simpsons
+        run: |
+          cmake --preset win-amd64-relwithdebinfo `
+            -DREXSDK_DIR="$env:GITHUB_WORKSPACE/tools/rexglue-sdk" `
+            -DREXGLUE_USE_D3D11=ON `
+            -DSIMPSONS_X86_MARCH=x86-64-v3 `
+            "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
+
+      - name: Build simpsons.exe
+        working-directory: simpsons
+        run: cmake --build --preset win-amd64-relwithdebinfo --target simpsons
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bd = "simpsons/out/build/win-amd64-relwithdebinfo"
+          New-Item -ItemType Directory -Force test | Out-Null
+          Copy-Item "$bd/simpsons.exe" test/
+          Copy-Item "$bd/*.dll" test/ -ErrorAction SilentlyContinue
+          Copy-Item "tools/rexglue-sdk/out/win-amd64/*.dll" test/ -ErrorAction SilentlyContinue
+          Set-Content test/build_variant.txt -Encoding ascii -Value "x86-64-v3"
+          python tools/native-renderer/write_runtime_defaults.py test/simpsons.toml windows
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Test-Path "test/rexruntimerd.dll")) {
+            Write-Error "rexruntimerd.dll is missing from the test build"
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-build
+          path: test
+          retention-days: 3

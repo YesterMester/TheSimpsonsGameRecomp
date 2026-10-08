@@ -348,7 +348,9 @@ SETTINGS_SCHEMA = {
 
 # Kept in the launcher so updates from older launchers, which preserve
 # simpsons.toml and do not copy newly added files, receive these defaults too.
-LINUX_RUNTIME_DEFAULTS = {
+# The native renderer's resource paths, on Linux and Windows (they only apply
+# to the Vulkan renderer).
+RUNTIME_DEFAULTS = {
     "gpu_allow_invalid_fetch_constants": False,
     "gpu_shader_max_cf_iterations": 0,
     "native_index_buffers": True,
@@ -366,12 +368,14 @@ LINUX_RUNTIME_DEFAULTS = {
     "native_resolve_buffer_lazy_memory": True,
     "native_resolve_buffer_reuse": True,
     "native_resolve_buffer_texture_first": True,
-    "timer_queue_sleep": True,
     "native_buffer_write_watches": False,
     "native_vertex_cache_check_order": False,
     "native_resolve_copy_free": False,
     "frame_pacing_vblank_lock": False,
 }
+# Sleeping in timer queues between deadlines was checked against the audio
+# cadence on Linux only.
+LINUX_RUNTIME_DEFAULTS = {**RUNTIME_DEFAULTS, "timer_queue_sleep": True}
 
 # Settings left out of the config while at their default, so the runtime's own
 # default applies (and a later change of it reaches the player).
@@ -482,22 +486,24 @@ def write_settings(new_values):
             lines.append(line)
         while lines and not lines[-1].strip():
             lines.pop()
-    # Updates keep the player's config. Add the Linux runtime defaults only
-    # where no value was saved, so the new resource paths reach existing
-    # installs too, without replacing deliberate overrides.
-    if PLAT == "Linux":
+    # Updates keep the player's config. Add the runtime defaults only where no
+    # value was saved, so the new resource paths reach existing installs too,
+    # without replacing deliberate overrides.
+    if PLAT in ("Linux", "Windows"):
         present = {line.partition("=")[0].strip() for line in lines
                    if "=" in line and not line.lstrip().startswith("#")}
-        defaults = dict(LINUX_RUNTIME_DEFAULTS)
+        defaults = dict(LINUX_RUNTIME_DEFAULTS if PLAT == "Linux" else RUNTIME_DEFAULTS)
         # Older Linux updaters already replace launcher/ui. Put the packaged
         # shader assets there so their first update also receives the new set.
+        # Windows packages keep them in native_shaders next to simpsons.exe,
+        # where the game finds them without a setting.
         shaders = LAUNCHER_DIR / "ui" / "native_shaders"
         if shaders.is_dir():
             defaults["aot_shader_path"] = str(shaders)
         missing = [f"{k} = {_fmt(v, 'bool' if isinstance(v, bool) else 'str' if isinstance(v, str) else 'int')}"
                    for k, v in defaults.items() if k not in present]
         if missing:
-            lines.extend(["", "# Linux runtime defaults", *missing])
+            lines.extend(["", f"# {PLAT} runtime defaults", *missing])
     block = [SETTINGS_BEGIN]
     for k, (typ, default, _r) in SETTINGS_SCHEMA.items():
         if k in OMIT_WHEN_DEFAULT and values[k] == default:
@@ -1208,7 +1214,7 @@ def restore_saves(name):
 # simpsons.toml (the player's own runtime settings).
 if PLAT == "Windows":
     UPDATE_MANAGED_PATHS = ["simpsons.exe", "extract-xiso.exe", "ffmpeg.exe", "README.md",
-                            "build_variant.txt"]
+                            "build_variant.txt", "native_shaders"]
     UPDATE_GLOB_PATHS = ["*.dll"]
 else:
     UPDATE_MANAGED_PATHS = ["simpsons", "extract-xiso", "launcher/ui",

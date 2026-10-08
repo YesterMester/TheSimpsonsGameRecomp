@@ -1,5 +1,6 @@
 #include <rex/graphics/d3d11/texture_upload.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cmath>
@@ -63,8 +64,8 @@ void CheckDebugMessages(D3D11Device& owner) {
 }
 
 void CheckFormat(D3D11Device& owner, DrawContext& draws, BufferCache& buffers,
-                 TextureUpload& uploader, const Format& format, uint32_t dimension,
-                 Result& result) {
+                 TextureUpload& uploader, const Format& format, uint32_t dimension, Result& result,
+                 uint32_t volume_first_slice = 1) {
   constexpr uint32_t width = 19, height = 13, mips = 2;
   ComPtr<ID3D11Resource> image, staging;
   bool volume = dimension == 3, array = dimension == 2;
@@ -121,7 +122,8 @@ void CheckFormat(D3D11Device& owner, DrawContext& draws, BufferCache& buffers,
   }
   for (uint32_t mip = 0; mip < mips; ++mip) {
     uint32_t w = width >> mip, h = height >> mip;
-    uint32_t planes = volume ? (5u >> mip) - 1 : array ? 4 : 1;
+    uint32_t first_slice = volume ? std::min(volume_first_slice, (5u >> mip) - 1) : 0;
+    uint32_t planes = volume ? (5u >> mip) - first_slice : array ? 4 : 1;
     TextureUpload::Layout layout;
     layout.offset = 13;
     layout.width = w - 2;
@@ -139,7 +141,7 @@ void CheckFormat(D3D11Device& owner, DrawContext& draws, BufferCache& buffers,
           uint8_t value = uint8_t(x * 37 + y * 67 + z * 101 + mip * 137 + format.bytes * 13);
           source[layout.offset + z * layout.slice_pitch + y * layout.row_pitch + x] = value;
           auto& target = expected[array ? (z + 1) * mips + mip : mip];
-          uint32_t slice = volume ? z + 1 : 0;
+          uint32_t slice = volume ? z + first_slice : 0;
           target[(slice * h + y) * w * format.bytes + x] = value;
         }
       }
@@ -153,7 +155,7 @@ void CheckFormat(D3D11Device& owner, DrawContext& draws, BufferCache& buffers,
     if (volume) {
       desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D;
       desc.Texture3D.MipSlice = mip;
-      desc.Texture3D.FirstWSlice = 1;
+      desc.Texture3D.FirstWSlice = first_slice;
       desc.Texture3D.WSize = planes;
     } else if (array) {
       desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
@@ -319,9 +321,15 @@ int main(int argc, char** argv) {
     BufferCache buffers(*owner);
     TextureUpload uploader(*owner, draws);
     Result result;
-    for (const auto& format : formats)
-      for (uint32_t dimension = 1; dimension <= 3; ++dimension)
+    for (const auto& format : formats) {
+      for (uint32_t dimension = 1; dimension <= 3; ++dimension) {
         CheckFormat(*owner, draws, buffers, uploader, format, dimension, result);
+        if (dimension == 3) {
+          CheckFormat(*owner, draws, buffers, uploader, format, dimension, result, 0);
+          CheckFormat(*owner, draws, buffers, uploader, format, dimension, result, 2);
+        }
+      }
+    }
     CheckPacked(*owner, draws, buffers, uploader, result);
     uploader.Clear();
     CheckDebugMessages(*owner);
@@ -332,6 +340,7 @@ int main(int argc, char** argv) {
         "  \"software\":" + std::string(owner->features().software ? "true" : "false") + ",\n";
     report += "  \"exact_bytes\":" + std::to_string(result.bytes) + ",\n";
     report += "  \"native_format_families\":10,\n  \"dimensions\":3,\n  \"mip_levels\":2,\n";
+    report += "  \"volume_subview_origins\":3,\n";
     report += "  \"uploads\":" + std::to_string(result.uploads) + ",\n";
     report += "  \"rejected_layouts\":" + std::to_string(result.negatives) + "\n}\n";
     std::fputs(report.c_str(), stdout);

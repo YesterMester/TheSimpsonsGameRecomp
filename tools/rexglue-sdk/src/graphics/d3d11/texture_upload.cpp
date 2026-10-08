@@ -129,6 +129,19 @@ bool TextureUpload::Upload(ID3D11ShaderResourceView* source, ID3D11UnorderedAcce
     error = "The DX11 texture upload exceeds the native destination view";
     return false;
   }
+  // The shader below writes mip-relative volume coordinates. Bind the whole
+  // mip so the view's FirstWSlice is not also applied to destination_z.
+  ComPtr<ID3D11UnorderedAccessView> volume_view;
+  if (three_d && dest_desc.Texture3D.FirstWSlice) {
+    auto full_desc = dest_desc;
+    full_desc.Texture3D.FirstWSlice = 0;
+    full_desc.Texture3D.WSize = UINT32_MAX;
+    if (NativeError(device_.device()->CreateUnorderedAccessView(dest_resource.Get(), &full_desc,
+                                                                volume_view.GetAddressOf()),
+                    "DX11 texture upload volume view", error))
+      return false;
+    destination = volume_view.Get();
+  }
   uint64_t key = uint64_t(layout.packed_source) << 40 | uint64_t(dest_desc.ViewDimension) << 32 |
                  uint32_t(dest_desc.Format);
   auto found = kernels_.find(key);

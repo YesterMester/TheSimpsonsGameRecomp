@@ -77,7 +77,7 @@ instead of building a separate renderer next to it. Stages, in order:
    yet write the memory directly from the render target. The EDRAM buffer dump and compute
    resolve remain only as the fallback for unsupported cases (MSAA sources, exponent bias,
    gamma, non-bitwise-equivalent formats).
-3. **Render targets as surfaces** - done, except copy-free resolves. Host render targets are
+3. **Render targets as surfaces** - done. Host render targets are
    the size of what the game draws to (`native_rt_size_by_use`: the rows of EDRAM tiles a
    target is drawn to, grown with a copy when more are needed) instead of covering the whole
    2048-tile EDRAM period: the main color and depth targets are 1280x720 (they were 1280x2048),
@@ -96,8 +96,9 @@ instead of building a separate renderer next to it. Stages, in order:
    before. Held back copies are now recorded only in an open submission. Live 2x recordings of
    the title, Springfield and the pause menu have no frame reversals with it on (438, 32 and
    388 before the fix), and replays of four captured scenes are bit-identical with and without
-   it. It is still off by default. Static frame replays alone do not catch this kind of
-   regression; check live recordings (frame order) too.
+   it. The launcher turns it on (settings version 4 replaces the old stored default once).
+   Static frame replays alone do not catch this kind of regression; check live recordings
+   (frame order) too.
 4. **Geometry without emulation tricks** - in progress. Rectangle lists, quad lists and point
    sprites without geometry shaders are exact (`vulkan_geometry_shader_primitives = false`, used
    automatically on GPUs without them, such as Mali); quads are split like the geometry

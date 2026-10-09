@@ -147,7 +147,10 @@ class LauncherPatches(unittest.TestCase):
     def test_saved_settings_keep_native_paths_and_visual_choices(self):
         self.app.GAME_TOML = self.app.GAMEDATA / "simpsons.toml"
         self.app.capture_keys = lambda: {}
-        self.app.GAME_TOML.write_text("native_resolve_copy_free = false\nnative_buffer_write_watches = false\n")
+        self.app.GAME_TOML.write_text(
+            "native_resolve_copy_free = false\nnative_buffer_write_watches = false\n"
+            f"{self.app.SETTINGS_BEGIN}\n{self.app.SETTINGS_VERSION_MARKER} "
+            f"{self.app.SETTINGS_VERSION}\n{self.app.SETTINGS_END}\n")
         self.app.write_settings({"gpu": "d3d11", "ink_outlines": "soft",
                                  "ink_outline_color": "FF8000", "ink_outline_strength": 0.8,
                                  "eye_shading": "original", "audio_maxqframes": 16})
@@ -159,6 +162,24 @@ class LauncherPatches(unittest.TestCase):
         self.assertIn("native_resolve_copy_free = false", text)
         self.assertIn("native_buffer_write_watches = false", text)
 
+    def test_copy_free_resolves_turn_on_once(self):
+        self.app.GAME_TOML = self.app.GAMEDATA / "simpsons.toml"
+        self.app.capture_keys = lambda: {}
+        with mock.patch.object(self.app, "PLAT", "Linux"):
+            # Written by an older launcher: the old default is replaced.
+            self.app.GAME_TOML.write_text("# Linux runtime defaults\nnative_resolve_copy_free = false\n")
+            self.app.write_settings({})
+            text = self.app.GAME_TOML.read_text()
+            self.assertIn("native_resolve_copy_free = true", text)
+            self.assertNotIn("native_resolve_copy_free = false", text)
+            # Turned off again afterwards: that choice stays.
+            self.app.GAME_TOML.write_text(text.replace("native_resolve_copy_free = true",
+                                                       "native_resolve_copy_free = false"))
+            self.app.write_settings({})
+            text = self.app.GAME_TOML.read_text()
+            self.assertIn("native_resolve_copy_free = false", text)
+            self.assertNotIn("native_resolve_copy_free = true", text)
+
     def test_runtime_defaults_on_linux_and_windows(self):
         self.app.GAME_TOML = self.app.GAMEDATA / "simpsons.toml"
         self.app.capture_keys = lambda: {}
@@ -169,7 +190,7 @@ class LauncherPatches(unittest.TestCase):
                 text = self.app.GAME_TOML.read_text()
                 self.assertIn(f"# {platform} runtime defaults", text)
                 self.assertIn("native_index_buffers = true", text)
-                self.assertIn("native_resolve_copy_free = false", text)
+                self.assertIn("native_resolve_copy_free = true", text)
                 # A saved value stays.
                 self.assertIn("native_vertex_buffers = false", text)
                 self.assertNotIn("native_vertex_buffers = true", text)

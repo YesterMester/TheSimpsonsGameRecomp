@@ -229,7 +229,7 @@ def set_capture(enable):
     return True, "Capture disarmed."
 
 
-SETTINGS_VERSION = 3
+SETTINGS_VERSION = 4
 SETTINGS_VERSION_MARKER = "# settings_version ="
 SETTINGS_DEFAULT_MIGRATIONS = (
     # The v1 migration moved everyone from "none" to the then-new FXAA default.
@@ -241,6 +241,13 @@ SETTINGS_DEFAULT_MIGRATIONS = (
     # old "fsi" hand patch; move them over once, and the Renderer setting can
     # still pick "fsi" deliberately afterwards.
     (3, "render_target_path_vulkan", "fsi"),
+)
+# The same for the runtime defaults kept outside the managed block (see
+# write_settings): a stored value still equal to the default it supersedes is
+# dropped once, and the new default is added in its place.
+RUNTIME_DEFAULT_MIGRATIONS = (
+    # v4 turned on copy-free resolves, whose old-frame flicker kept them off.
+    (4, "native_resolve_copy_free", "false"),
 )
 
 # key -> (type, default, needs_restart)
@@ -370,7 +377,7 @@ RUNTIME_DEFAULTS = {
     "native_resolve_buffer_texture_first": True,
     "native_buffer_write_watches": False,
     "native_vertex_cache_check_order": False,
-    "native_resolve_copy_free": False,
+    "native_resolve_copy_free": True,
     "frame_pacing_vblank_lock": False,
 }
 # Sleeping in timer queues between deadlines was checked against the audio
@@ -466,8 +473,19 @@ def write_settings(new_values):
                      else float(v) if typ == "float" else int(v))
     lines = []
     if GAME_TOML.exists():
+        text = GAME_TOML.read_text(encoding="utf-8")
+        file_version = 0
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith(SETTINGS_VERSION_MARKER):
+                try:
+                    file_version = int(s[len(SETTINGS_VERSION_MARKER):].strip())
+                except ValueError:
+                    pass
+        superseded = {key: value for version, key, value in RUNTIME_DEFAULT_MIGRATIONS
+                      if file_version < version}
         in_block = False
-        for line in GAME_TOML.read_text(encoding="utf-8").splitlines():
+        for line in text.splitlines():
             s = line.strip()
             if s == SETTINGS_BEGIN:
                 in_block = True
@@ -482,6 +500,9 @@ def write_settings(new_values):
                     key in SETTINGS_SCHEMA or key in DERIVED_KEYS or key in LEGACY_KEYS
                     or key in ("draw_telemetry", "perf_log_csv", "shader_inventory_csv",
                                "pipeline_inventory_json", "trace_gpu_prefix")):
+                continue
+            if ("=" in s and not s.startswith("#") and key in superseded
+                    and s.partition("=")[2].strip() == superseded[key]):
                 continue
             lines.append(line)
         while lines and not lines[-1].strip():

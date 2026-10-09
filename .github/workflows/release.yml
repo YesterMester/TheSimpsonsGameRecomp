@@ -41,6 +41,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Check the shader set matches the translator
+        run: python3 tools/native-renderer/check_translated_set.py
       - name: Build the shader set
         run: |
           sudo apt-get update

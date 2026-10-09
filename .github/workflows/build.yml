@@ -26,6 +26,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check launcher patches and saved settings
         run: python3 tools/bench/launcher_patch_check.py
+      # A translator change makes the game ignore the shipped shader set until
+      # it is rebuilt on a machine with the game (build_translated_set.sh).
+      - name: Check the shader set matches the translator
+        run: |
+          python3 tools/native-renderer/check_translated_set.py ||
+            echo "::warning title=Shader set::The shipped translated shader set no longer matches the shader translator; rebuild it with tools/native-renderer/build_translated_set.sh"
       - name: Install clang-20 + build deps
         run: |
           wget -q https://apt.llvm.org/llvm.sh

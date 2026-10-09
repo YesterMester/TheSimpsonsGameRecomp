@@ -367,8 +367,10 @@ instead of building a separate renderer next to it. Stages, in order:
 - Every episode was started from a new game (the launcher's start-episode patch, applied to
   a hard-linked copy of the game data) and played for about three minutes at 2x, logging
   every resolve, render target transfer and vertex stream that leaves the native paths.
-  13 of the 18 episodes reached gameplay; Bartman Begins, Enter the Cheatrix, Bargain Bin,
-  Rhymes with Complaining and Meet Thy Player were still in their intro videos.
+  13 of the 18 episodes reached gameplay in that time; six-minute runs of the other five got
+  Bartman Begins, Enter the Cheatrix and Rhymes with Complaining past their intro videos too
+  (first-viewing videos can't be skipped). Bargain Bin and Meet Thy Player were still in
+  their intros.
 - Every draw in every episode used native vertex streams. The only fallbacks were in The
   Day the Earth Stood Stupid, once: a depth target with a different format (D24S8 instead
   of D24FS8) appeared at EDRAM base 0, so the color target there took its data through

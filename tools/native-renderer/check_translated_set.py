@@ -18,6 +18,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SDK = ROOT / "tools" / "rexglue-sdk"
+# The configuration format VulkanPipelineCache::GetTranslatorConfiguration
+# writes; change both together.
+SET_FORMAT = "set_format=2"
 
 
 def translator_hash():
@@ -37,6 +40,7 @@ def main():
     archive = Path(sys.argv[1]) if len(sys.argv) > 1 else (
         ROOT / "tools/native-renderer/translated_shaders.tar.xz")
     recorded = set()
+    formats = set()
     with tarfile.open(archive) as tar:
         for member in tar:
             if member.name.endswith("translator_configuration.txt"):
@@ -44,7 +48,13 @@ def main():
                 match = re.search(r"translator_source=([0-9a-f]+)", text)
                 if match:
                     recorded.add(match.group(1))
+                match = re.search(r"\bset_format=\d+", text)
+                formats.add(match.group(0) if match else "no set_format")
     current = translator_hash()
+    if formats != {SET_FORMAT}:
+        print(f"{archive.name} has configurations in {', '.join(sorted(formats))}, the game "
+              f"expects {SET_FORMAT}: rebuild it with tools/native-renderer/build_translated_set.sh")
+        return 1
     if recorded != {current}:
         print(f"{archive.name} was made by translator {', '.join(sorted(recorded)) or 'unknown'}, "
               f"the sources are translator {current}: rebuild it with "

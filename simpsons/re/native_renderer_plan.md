@@ -378,3 +378,10 @@ instead of building a separate renderer next to it. Stages, in order:
   of the shaders were translated during play again (`aot_shaders=4 hit / 84 translated`).
   The set is rebuilt from the union of every shader storage (the executable's shaders, the
   player's cache and the census runs: 380 shaders, 508 recorded pipeline states).
+- The set's configuration key now holds only what the translated modules depend on (the
+  shared memory binding count instead of the exact storage buffer range; no features the
+  translator doesn't read or only asserts; sample interlock only for the interlocked render
+  target path). A set made on the Steam Deck is therefore served on any device with the same
+  float controls, image view swizzles, demote, sample rate shading, 2x MSAA support and
+  32-bit draw indices, not only on identical drivers. Rebuilding with the new key changed no
+  module; only the two configuration files differ.

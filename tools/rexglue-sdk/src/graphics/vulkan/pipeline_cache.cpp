@@ -1452,27 +1452,37 @@ std::filesystem::path VulkanPipelineCache::GetAotShaderRoot() const {
 }
 
 std::string VulkanPipelineCache::GetTranslatorConfiguration() const {
+  // Only what the translated modules depend on, so a set made on one device is
+  // served on every device that would translate the same modules: the shared
+  // memory binding count instead of the exact storage buffer range, no
+  // features the translator doesn't read (or only asserts), and sample
+  // interlock only for the interlocked render target path. set_format changes
+  // with the fields (tools/native-renderer/check_translated_set.py checks the
+  // shipped set for it).
   SpirvShaderTranslator::Features features(command_processor_.GetVulkanDevice());
-  return fmt::format(
-      "translator_source={} spirv_version={:X} max_storage_buffer_range={} "
-      "full_draw_index_uint32={} "
-      "vertex_pipeline_stores_and_atomics={} fragment_stores_and_atomics={} clip_distance={} "
-      "cull_distance={} image_view_format_swizzle={} signed_zero_inf_nan_preserve_float32={} "
-      "denorm_flush_to_zero_float32={} rounding_mode_rte_float32={} "
-      "fragment_shader_sample_interlock={} demote_to_helper_invocation={} "
-      "sample_rate_shading={} msaa_2x_attachments={} msaa_2x_no_attachments={} "
-      "render_target_path={}",
-      REX_SHADER_TRANSLATOR_HASH, features.spirv_version, features.max_storage_buffer_range,
-      int(features.full_draw_index_uint32), int(features.vertex_pipeline_stores_and_atomics),
-      int(features.fragment_stores_and_atomics), int(features.clip_distance),
-      int(features.cull_distance), int(features.image_view_format_swizzle),
+  bool fragment_shader_interlock =
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  std::string configuration = fmt::format(
+      "set_format=2 translator_source={} spirv_version={:X} shared_memory_bindings_log2={} "
+      "full_draw_index_uint32={} image_view_format_swizzle={} "
+      "signed_zero_inf_nan_preserve_float32={} denorm_flush_to_zero_float32={} "
+      "rounding_mode_rte_float32={} demote_to_helper_invocation={} sample_rate_shading={} "
+      "msaa_2x_attachments={} msaa_2x_no_attachments={} render_target_path={}",
+      REX_SHADER_TRANSLATOR_HASH, features.spirv_version,
+      SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
+          features.max_storage_buffer_range),
+      int(features.full_draw_index_uint32), int(features.image_view_format_swizzle),
       int(features.signed_zero_inf_nan_preserve_float32),
       int(features.denorm_flush_to_zero_float32), int(features.rounding_mode_rte_float32),
-      int(features.fragment_shader_sample_interlock), int(features.demote_to_helper_invocation),
-      int(features.sample_rate_shading), int(render_target_cache_.msaa_2x_attachments_supported()),
+      int(features.demote_to_helper_invocation), int(features.sample_rate_shading),
+      int(render_target_cache_.msaa_2x_attachments_supported()),
       int(render_target_cache_.msaa_2x_no_attachments_supported()),
-      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock ? "fsi"
-                                                                                       : "host");
+      fragment_shader_interlock ? "fsi" : "host");
+  if (fragment_shader_interlock) {
+    configuration += fmt::format(" fragment_shader_sample_interlock={}",
+                                 int(features.fragment_shader_sample_interlock));
+  }
+  return configuration;
 }
 
 std::filesystem::path VulkanPipelineCache::FindTranslatedShaderSet() const {

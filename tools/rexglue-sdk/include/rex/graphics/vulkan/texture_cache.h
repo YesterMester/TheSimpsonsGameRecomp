@@ -422,7 +422,7 @@ class VulkanTextureCache final : public TextureCache {
                               VkPipelineStageFlags guest_shader_pipeline_stages);
 
   bool Initialize();
-  bool InitializeScaledResolveBuffer();
+  bool InitializeScaledResolveBuffer(bool defer = true);
   void ShutdownScaledResolveBuffer();
 
   const HostFormatPair& GetHostFormatPair(TextureKey key) const;

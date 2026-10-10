@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/native_gpu_diagnostics.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/trace_writer.h>
 #include <rex/graphics/xenos.h>
@@ -76,6 +77,7 @@ enum class GammaRampType {
 
 class CommandProcessor {
  public:
+  NativeGpuDiagnostics& native_gpu_diagnostics() { return native_gpu_diagnostics_; }
   enum class SwapPostEffect {
     kNone,
     kFxaa,
@@ -260,6 +262,7 @@ class CommandProcessor {
   RegisterFile* register_file_ = nullptr;
 
   TraceWriter trace_writer_;
+  NativeGpuDiagnostics native_gpu_diagnostics_;
   enum class TraceState {
     kDisabled,
     kStreaming,

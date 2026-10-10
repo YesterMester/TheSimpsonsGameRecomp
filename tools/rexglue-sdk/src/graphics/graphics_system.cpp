@@ -55,6 +55,8 @@ std::atomic<uint64_t> g_vblank_interval_ticks{0};
 REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
 
 REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
+REXCVAR_DEFINE_INT32(trace_gpu_poll_interval_ms, 1000, "GPU",
+                     "Diagnostic file-trigger polling interval (1-1000 ms)");
 
 // Guest vblank rate used when vsync is off. 0 = follow the guest video mode's
 // refresh rate (the launcher's FPS target). The old hardcoded 1000 Hz costs a
@@ -216,7 +218,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           g_vblank_last_frame_time.store(chrono::Clock::QueryGuestTickCount(),
                                          std::memory_order_relaxed);
         }
-        // File-based frame trace trigger, checked about once a second. A
+        // File-based frame trace trigger, normally checked once a second. A
         // keybind can be swallowed by whatever sits between the compositor
         // and the game (and compact keyboards hide the F-row), but touching
         // a file next to the trace prefix works from any terminal or from
@@ -236,7 +238,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           uint64_t last_frame_time = g_vblank_last_frame_time.load(std::memory_order_relaxed);
           auto checks_start = std::chrono::steady_clock::now();
           if (checks_start >= next_trace_trigger_check) {
-            next_trace_trigger_check = checks_start + std::chrono::seconds(1);
+            next_trace_trigger_check = checks_start + std::chrono::milliseconds(
+                std::clamp(REXCVAR_GET(trace_gpu_poll_interval_ms), 1, 1000));
             rex::perf::FlushEventTrace();
             const std::string& trace_prefix = REXCVAR_GET(trace_gpu_prefix);
             if (!trace_prefix.empty()) {

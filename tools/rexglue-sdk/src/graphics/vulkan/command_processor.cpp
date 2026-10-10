@@ -25,6 +25,8 @@
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include <SPIRV/GlslangToSpv.h>
 #include <glslang/Public/ShaderLang.h>
 #include <rex/assert.h>
@@ -65,6 +67,35 @@
 // Interval in frames for the consolidated "[native]" telemetry line; 0 is off.
 // 300 is a good value for a play session - roughly one line every five seconds
 // at 60 fps, cheap enough to leave on for a whole bug-report session.
+// Colour grading of the final image, after gamma (and FXAA): applied by the
+// FXAA pass, or a pass of its own without FXAA. Defaults leave it off.
+REXCVAR_DEFINE_DOUBLE(color_saturation, 1.0, "GPU",
+                      "Colour saturation of the final image (1 = original, 0 = greyscale)")
+    .range(0.0, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_DOUBLE(color_vibrance, 0.0, "GPU",
+                      "Extra saturation for muted colours, leaving vivid ones almost as they are "
+                      "(0 = off)")
+    .range(-1.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_DOUBLE(color_contrast, 1.0, "GPU",
+                      "Contrast of the final image around mid-grey (1 = original)")
+    .range(0.5, 1.5)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_DOUBLE(color_brightness, 0.0, "GPU",
+                      "Brightness added to the final image (0 = original)")
+    .range(-0.25, 0.25)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// Smooth silhouettes for skinned meshes (the characters): their triangles are
+// curved as PN triangles from the world normals, more where the outline bends
+// and the triangle is big on screen.
+REXCVAR_DEFINE_STRING(character_tessellation, "off", "GPU",
+                      "Smooth tessellation of characters and other skinned meshes: off, low, "
+                      "medium or high (the most triangles where outlines curve)")
+    .allowed({"off", "low", "medium", "high"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(native_telemetry, 0, "GPU/Vulkan",
                      "Frames between native-path telemetry log lines (0 = off)");
 
@@ -367,6 +398,66 @@ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
     },
 };
 
+bool IsSwapColorGradeEnabled() {
+  return REXCVAR_GET(color_saturation) != 1.0 || REXCVAR_GET(color_vibrance) != 0.0 ||
+         REXCVAR_GET(color_contrast) != 1.0 || REXCVAR_GET(color_brightness) != 0.0;
+}
+
+// Inserts XeGrade (the colour grading settings, or nothing) into a swap
+// compute shader after its #version line.
+std::string WithSwapColorGrade(std::string source) {
+  std::string grade;
+  if (IsSwapColorGradeEnabled()) {
+    grade = fmt::format(
+        "const float xe_grade_saturation = {:.6f};\n"
+        "const float xe_grade_vibrance = {:.6f};\n"
+        "const float xe_grade_contrast = {:.6f};\n"
+        "const float xe_grade_brightness = {:.6f};\n",
+        REXCVAR_GET(color_saturation), REXCVAR_GET(color_vibrance), REXCVAR_GET(color_contrast),
+        REXCVAR_GET(color_brightness));
+    grade += R"(vec3 XeGrade(vec3 color) {
+  color = (color - 0.5) * xe_grade_contrast + 0.5 + xe_grade_brightness;
+  // Vibrance raises the saturation of muted colours more than of vivid ones,
+  // which keeps skin and the cel-shaded fills from clipping.
+  float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+  float chroma = clamp(max(color.r, max(color.g, color.b)) - min(color.r, min(color.g, color.b)),
+                       0.0, 1.0);
+  float saturation = xe_grade_saturation * (1.0 + xe_grade_vibrance * (1.0 - chroma));
+  return clamp(mix(vec3(luma), color, saturation), 0.0, 1.0);
+}
+)";
+  } else {
+    grade = "vec3 XeGrade(vec3 color) { return color; }\n";
+  }
+  size_t version_end = source.find('\n');
+  source.insert(version_end == std::string::npos ? source.size() : version_end + 1, grade);
+  return source;
+}
+
+// The FXAA pass's interface, grading only, for when FXAA is off.
+const char* GetSwapColorGradeComputeSource() {
+  return R"(#version 450
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform XeApplyGammaRampConstants {
+  uvec2 xe_fxaa_size;
+  vec2 xe_fxaa_size_inv;
+};
+
+layout(set = 0, binding = 0) uniform sampler2D xe_fxaa_source;
+layout(set = 1, binding = 0, rgb10_a2) writeonly uniform image2D xe_fxaa_dest;
+
+void main() {
+  uvec2 pixel = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(pixel, xe_fxaa_size))) {
+    return;
+  }
+  imageStore(xe_fxaa_dest, ivec2(pixel),
+             vec4(XeGrade(texelFetch(xe_fxaa_source, ivec2(pixel), 0).rgb), 1.0));
+}
+)";
+}
+
 const char* GetSwapFxaaComputeSource(bool extreme_quality) {
   return extreme_quality ? R"(#version 450
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
@@ -435,7 +526,7 @@ void main() {
     result = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
   }
 
-  imageStore(xe_fxaa_dest, ivec2(pixel), vec4(result, 1.0));
+  imageStore(xe_fxaa_dest, ivec2(pixel), vec4(XeGrade(result), 1.0));
 }
 )"
                          : R"(#version 450
@@ -505,7 +596,7 @@ void main() {
     result = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
   }
 
-  imageStore(xe_fxaa_dest, ivec2(pixel), vec4(result, 1.0));
+  imageStore(xe_fxaa_dest, ivec2(pixel), vec4(XeGrade(result), 1.0));
 }
 )";
 }
@@ -817,6 +908,7 @@ void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_
 }
 
 void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+  NativeGpuDiagnostics::ReadbackScope readback(native_gpu_diagnostics_);
   if (!BeginSubmission(true)) {
     return;
   }
@@ -947,6 +1039,7 @@ bool VulkanCommandProcessor::CompileGlslToSpirv(VkShaderStageFlagBits stage,
 }
 
 bool VulkanCommandProcessor::SetupContext() {
+  native_gpu_diagnostics_.Initialize("vulkan");
   if (!CommandProcessor::SetupContext()) {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
@@ -1219,6 +1312,21 @@ bool VulkanCommandProcessor::SetupContext() {
   if (!pipeline_cache_->Initialize()) {
     REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
     return false;
+  }
+  {
+    const std::string tessellation = REXCVAR_GET(character_tessellation);
+    uint32_t level = tessellation == "low"      ? 1
+                     : tessellation == "medium" ? 2
+                     : tessellation == "high"   ? 3
+                                                : 0;
+    if (level && !(guest_shader_vertex_stages_ & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) {
+      REXGPU_WARN("Character tessellation: the GPU has no tessellation shaders, staying off");
+      level = 0;
+    }
+    pipeline_cache_->SetSmoothTessellationLevel(level);
+    if (level) {
+      REXGPU_INFO("Character tessellation: {}", tessellation);
+    }
   }
 
   // Requires the transient descriptor set layouts.
@@ -2036,7 +2144,8 @@ bool VulkanCommandProcessor::SetupContext() {
   // FXAA compute pipelines, compiled to SPIR-V at runtime.
   std::vector<uint32_t> swap_fxaa_spirv;
   std::string swap_fxaa_compile_error;
-  if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, GetSwapFxaaComputeSource(false),
+  if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT,
+                          WithSwapColorGrade(GetSwapFxaaComputeSource(false)),
                           swap_fxaa_spirv, swap_fxaa_compile_error)) {
     REXGPU_WARN("Failed to compile FXAA compute shader to SPIR-V: {}", swap_fxaa_compile_error);
   } else {
@@ -2050,7 +2159,8 @@ bool VulkanCommandProcessor::SetupContext() {
 
   std::vector<uint32_t> swap_fxaa_extreme_spirv;
   std::string swap_fxaa_extreme_compile_error;
-  if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, GetSwapFxaaComputeSource(true),
+  if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT,
+                          WithSwapColorGrade(GetSwapFxaaComputeSource(true)),
                           swap_fxaa_extreme_spirv, swap_fxaa_extreme_compile_error)) {
     REXGPU_WARN("Failed to compile extreme FXAA compute shader to SPIR-V: {}",
                 swap_fxaa_extreme_compile_error);
@@ -2060,6 +2170,23 @@ bool VulkanCommandProcessor::SetupContext() {
         sizeof(uint32_t) * swap_fxaa_extreme_spirv.size());
     if (swap_fxaa_extreme_pipeline_ == VK_NULL_HANDLE) {
       REXGPU_WARN("Failed to create the extreme-quality FXAA compute pipeline");
+    }
+  }
+  if (IsSwapColorGradeEnabled()) {
+    std::vector<uint32_t> swap_color_grade_spirv;
+    std::string swap_color_grade_compile_error;
+    if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT,
+                            WithSwapColorGrade(GetSwapColorGradeComputeSource()),
+                            swap_color_grade_spirv, swap_color_grade_compile_error)) {
+      REXGPU_WARN("Failed to compile the colour grading compute shader to SPIR-V: {}",
+                  swap_color_grade_compile_error);
+    } else {
+      swap_color_grade_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+          vulkan_device, swap_fxaa_pipeline_layout_, swap_color_grade_spirv.data(),
+          sizeof(uint32_t) * swap_color_grade_spirv.size());
+      if (swap_color_grade_pipeline_ == VK_NULL_HANDLE) {
+        REXGPU_WARN("Failed to create the colour grading compute pipeline");
+      }
     }
   }
 
@@ -2105,6 +2232,7 @@ void VulkanCommandProcessor::ShutdownContext() {
     gpu_profiler_.FrameCompleted(frame);
   }
   gpu_profiler_.Shutdown();
+  native_gpu_diagnostics_.WriteReport(true);
   ShutdownOcclusionQueryResources();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
@@ -2162,6 +2290,8 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_fxaa_extreme_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_fxaa_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         swap_color_grade_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
@@ -2489,6 +2619,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
+  native_gpu_diagnostics_.Frame();
   SCOPE_profile_cpu_f("gpu");
   rex::perf::ScopedCounterTimer swap_timer(rex::perf::CounterId::kCpSwapUs);
 
@@ -2746,8 +2877,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         const VkDevice device = vulkan_device->device();
 
         uint32_t swap_frame_index = uint32_t(frame_current_ % kMaxFramesInFlight);
-        bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
-                        swap_post_effect == SwapPostEffect::kFxaaExtreme;
+        // The FXAA pass also grades the colours; without FXAA, grading has a
+        // pass of its own with the same interface. use_fxaa is whether either
+        // pass runs.
+        bool fxaa_effect = swap_post_effect == SwapPostEffect::kFxaa ||
+                           swap_post_effect == SwapPostEffect::kFxaaExtreme;
+        bool use_fxaa = fxaa_effect || swap_color_grade_pipeline_ != VK_NULL_HANDLE;
 
         // This is according to D3D::InitializePresentationParameters from a
         // game executable, which initializes the 256-entry table gamma ramp for
@@ -2786,8 +2921,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
         if (use_fxaa) {
           if (swap_apply_gamma_compute_pipeline == VK_NULL_HANDLE ||
-              swap_fxaa_pipeline_ == VK_NULL_HANDLE ||
-              swap_fxaa_extreme_pipeline_ == VK_NULL_HANDLE) {
+              (fxaa_effect && (swap_fxaa_pipeline_ == VK_NULL_HANDLE ||
+                               swap_fxaa_extreme_pipeline_ == VK_NULL_HANDLE))) {
             static bool fxaa_pipelines_unavailable_logged = false;
             if (!fxaa_pipelines_unavailable_logged) {
               if (swap_source_requires_compute_rb_swap) {
@@ -3065,7 +3200,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             deferred_command_buffer_.CmdVkPushConstants(
                 swap_fxaa_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(swap_fxaa_constants), &swap_fxaa_constants);
-            BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
+            BindExternalComputePipeline(!fxaa_effect ? swap_color_grade_pipeline_
+                                        : swap_post_effect == SwapPostEffect::kFxaaExtreme
                                             ? swap_fxaa_extreme_pipeline_
                                             : swap_fxaa_pipeline_);
             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
@@ -4211,6 +4347,10 @@ bool VulkanCommandProcessor::PrepareNativeVertexStreams(
     const PrimitiveProcessor::ProcessingResult& primitives) {
   native_vertex_descriptor_set_ = VK_NULL_HANDLE;
   auto fallback = [&](const char* reason) {
+    native_gpu_diagnostics_.RecordDependency(
+        NativeGpuDiagnostics::Dependency::kVertexFallback, 0,
+        fmt::format("vs={:016X}: {} ({} indices, base {:08X})", shader.ucode_data_hash(),
+                    reason, primitives.host_draw_vertex_count, primitives.guest_index_base));
     if (REXCVAR_GET(native_vertex_debug)) {
       static thread_local std::set<std::pair<uint64_t, std::string>> reported;
       if (reported.emplace(shader.ucode_data_hash(), reason).second) {
@@ -4428,6 +4568,7 @@ bool VulkanCommandProcessor::PrepareNativeVertexStreams(
   native_vertex_descriptor_set_ =
       TryCachedNativeVertexStreams(ranges.data(), range_count, snapshot_size);
   if (native_vertex_descriptor_set_ != VK_NULL_HANDLE) {
+    native_gpu_diagnostics_.RecordOperation(NativeGpuDiagnostics::Operation::kVertexStreams);
     return true;
   }
   const auto* vulkan_device = GetVulkanDevice();
@@ -4465,6 +4606,7 @@ bool VulkanCommandProcessor::PrepareNativeVertexStreams(
   write.pBufferInfo = buffer_infos.data();
   vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 1, &write, 0, nullptr);
   native_vertex_descriptor_set_ = descriptor_set;
+  native_gpu_diagnostics_.RecordOperation(NativeGpuDiagnostics::Operation::kVertexStreams);
   native_vertex_bytes_ += snapshot_size;
   static thread_local uint64_t native_vertex_draws = 0;
   static thread_local uint64_t native_vertex_bytes = 0;
@@ -4636,6 +4778,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
 
+  // Skinned triangles the pixel shader shades from the world position and
+  // normal can be smoothly tessellated, as patches of a triangle list.
+  bool triangle_patches = false;
+  if (pipeline_cache_->smooth_tessellation_level() && pixel_shader &&
+      !memexport_writes_possible &&
+      (prim_type == xenos::PrimitiveType::kTriangleList ||
+       prim_type == xenos::PrimitiveType::kTriangleStrip)) {
+    const SmoothTessellationLayout* smooth_layout = vertex_shader->GetSmoothTessellationLayout();
+    triangle_patches = smooth_layout && smooth_layout->skinned &&
+                       (interpolator_mask & (UINT32_C(1) << smooth_layout->position_interpolator)) &&
+                       (interpolator_mask & (UINT32_C(1) << smooth_layout->normal_interpolator));
+  }
+
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
   // in case of a sampler count overflow, and if that happens, all subsystem
@@ -4650,7 +4805,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // Process primitives.
     if (!primitive_processor_->Process(
             primitive_processing_result,
-            REXCVAR_GET(native_index_buffers) && !memexport_writes_possible)) {
+            REXCVAR_GET(native_index_buffers) && !memexport_writes_possible, triangle_patches)) {
       return draw_fail("primitive_processing");
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
@@ -4704,6 +4859,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
                                                   pixel_shader_translation)) {
       return draw_fail("shader_translation");
+    }
+    if (primitive_processing_result.triangle_patches) {
+      // Otherwise drawn as the plain triangle list it has become.
+      VkShaderModule smooth_control_shader, smooth_evaluation_shader;
+      primitive_processing_result.triangle_patches = pipeline_cache_->GetSmoothTessellationShaders(
+          *vertex_shader_translation, smooth_control_shader, smooth_evaluation_shader);
     }
 
     // Obtain the samplers. Note that the bindings don't depend on the shader
@@ -6180,6 +6341,7 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
 }
 
 void VulkanCommandProcessor::InitializeTrace() {
+  NativeGpuDiagnostics::ReadbackScope readback(native_gpu_diagnostics_);
   CommandProcessor::InitializeTrace();
   if (REXCVAR_GET(native_texture_uploads)) {
     texture_cache_->InvalidateCpuTextureInputsForTrace();
@@ -7488,29 +7650,33 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
   }
 
-  // Point size.
-  if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {
-    auto pa_su_point_minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
-    auto pa_su_point_size = regs.Get<reg::PA_SU_POINT_SIZE>();
-    float point_vertex_diameter_min = float(pa_su_point_minmax.min_size) * (2.0f / 16.0f);
-    float point_vertex_diameter_max = float(pa_su_point_minmax.max_size) * (2.0f / 16.0f);
-    float point_constant_diameter_x = float(pa_su_point_size.width) * (2.0f / 16.0f);
-    float point_constant_diameter_y = float(pa_su_point_size.height) * (2.0f / 16.0f);
-    dirty |= system_constants_.point_vertex_diameter_min != point_vertex_diameter_min;
-    dirty |= system_constants_.point_vertex_diameter_max != point_vertex_diameter_max;
-    dirty |= system_constants_.point_constant_diameter[0] != point_constant_diameter_x;
-    dirty |= system_constants_.point_constant_diameter[1] != point_constant_diameter_y;
-    system_constants_.point_vertex_diameter_min = point_vertex_diameter_min;
-    system_constants_.point_vertex_diameter_max = point_vertex_diameter_max;
-    system_constants_.point_constant_diameter[0] = point_constant_diameter_x;
-    system_constants_.point_constant_diameter[1] = point_constant_diameter_y;
-    // 2 because 1 in the NDC is half of the viewport's axis, 0.5 for diameter
-    // to radius conversion to avoid multiplying the per-vertex diameter by an
-    // additional constant in the shader.
-    // The viewport is in rasterization pixels, which include samples of
-    // multisampled surfaces kept single-sampled.
-    uint32_t point_rasterization_scale_x, point_rasterization_scale_y;
-    GetDrawRasterizationScale(point_rasterization_scale_x, point_rasterization_scale_y);
+  // Point size. Smoothly tessellated triangles use the conversion to NDC as
+  // well, with a scale of 1 for host pixels, to size their tessellation.
+  bool point_list = vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList;
+  if (point_list || primitive_processing_result.triangle_patches) {
+    uint32_t point_rasterization_scale_x = 1, point_rasterization_scale_y = 1;
+    if (point_list) {
+      auto pa_su_point_minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
+      auto pa_su_point_size = regs.Get<reg::PA_SU_POINT_SIZE>();
+      float point_vertex_diameter_min = float(pa_su_point_minmax.min_size) * (2.0f / 16.0f);
+      float point_vertex_diameter_max = float(pa_su_point_minmax.max_size) * (2.0f / 16.0f);
+      float point_constant_diameter_x = float(pa_su_point_size.width) * (2.0f / 16.0f);
+      float point_constant_diameter_y = float(pa_su_point_size.height) * (2.0f / 16.0f);
+      dirty |= system_constants_.point_vertex_diameter_min != point_vertex_diameter_min;
+      dirty |= system_constants_.point_vertex_diameter_max != point_vertex_diameter_max;
+      dirty |= system_constants_.point_constant_diameter[0] != point_constant_diameter_x;
+      dirty |= system_constants_.point_constant_diameter[1] != point_constant_diameter_y;
+      system_constants_.point_vertex_diameter_min = point_vertex_diameter_min;
+      system_constants_.point_vertex_diameter_max = point_vertex_diameter_max;
+      system_constants_.point_constant_diameter[0] = point_constant_diameter_x;
+      system_constants_.point_constant_diameter[1] = point_constant_diameter_y;
+      // 2 because 1 in the NDC is half of the viewport's axis, 0.5 for diameter
+      // to radius conversion to avoid multiplying the per-vertex diameter by an
+      // additional constant in the shader.
+      // The viewport is in rasterization pixels, which include samples of
+      // multisampled surfaces kept single-sampled.
+      GetDrawRasterizationScale(point_rasterization_scale_x, point_rasterization_scale_y);
+    }
     float point_screen_diameter_to_ndc_radius_x =
         (/* 0.5f * 2.0f * */ float(point_rasterization_scale_x)) /
         std::max(viewport_info.xy_extent[0], uint32_t(1));

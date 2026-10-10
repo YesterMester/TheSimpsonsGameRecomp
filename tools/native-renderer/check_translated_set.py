@@ -31,6 +31,8 @@ def translator_hash():
         [str(SDK / "src/graphics/format/ucode.cpp"),
          str(SDK / "include/rex/graphics/format/ucode.h"),
          str(SDK / "include/rex/graphics/xenos.h")])
+    # Separate host tessellation stages do not change translated guest shaders.
+    inputs = [p for p in inputs if Path(p).stem != "smooth_tessellation"]
     lines = "".join(f"{Path(p).name}:{hashlib.sha256(Path(p).read_bytes()).hexdigest()}\n"
                     for p in inputs)
     return hashlib.sha256(lines.encode()).hexdigest()[:16]

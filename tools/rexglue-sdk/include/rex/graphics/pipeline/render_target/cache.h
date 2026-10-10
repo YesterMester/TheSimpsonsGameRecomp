@@ -522,6 +522,14 @@ class RenderTargetCache {
   // sizing host render targets by use can make sure they cover the rows.
   virtual void EnsureRenderTargetTileRows([[maybe_unused]] RenderTargetKey key,
                                           [[maybe_unused]] uint32_t tile_rows) {}
+
+  // Native resolves may materialize an alias in the requested surface format
+  // before reading it, using the same ownership transfers as a draw.
+  RenderTarget* GetOrCreateRenderTarget(RenderTargetKey key);
+  // Updates ownership and appends the transfers needed for the change.
+  void ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
+                       uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
+                       const Transfer::Rectangle* resolve_clear_cutout = nullptr);
   // The render target with the key if it has been created, nullptr otherwise.
   RenderTarget* FindRenderTarget(RenderTargetKey key) const;
 
@@ -696,8 +704,6 @@ class RenderTargetCache {
     return xenos::GetStorageColorFormat(format);
   }
 
-  RenderTarget* GetOrCreateRenderTarget(RenderTargetKey key);
-
   // Checks if changing ownership of the range to the specified render target
   // would require transferring data - primarily for barrier placement on the
   // pixel shader interlock path (where transfers do not involve copying, but
@@ -707,12 +713,6 @@ class RenderTargetCache {
   bool WouldOwnershipChangeRequireTransfers(RenderTargetKey dest,
                                             uint32_t start_tiles_base_relative,
                                             uint32_t length_tiles) const;
-  // Updates ownership_ranges_, adds the transfers needed for the ownership
-  // change to transfers_append_out if it's not null.
-  void ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
-                       uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
-                       const Transfer::Rectangle* resolve_clear_cutout = nullptr);
-
   // If failed to create, may contain nullptr to prevent attempting to create a
   // render target twice.
   std::unordered_map<RenderTargetKey, RenderTarget*, RenderTargetKey::Hasher> render_targets_;

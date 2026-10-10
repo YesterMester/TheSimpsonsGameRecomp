@@ -55,6 +55,25 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
   return shader_module_;
 }
 
+const SmoothTessellationLayout* VulkanShader::GetSmoothTessellationLayout() const {
+  assert_true(is_ucode_analyzed());
+  std::call_once(smooth_tessellation_layout_once_, [this]() {
+    has_smooth_tessellation_layout_ =
+        type() == xenos::ShaderType::kVertex &&
+        FindSmoothTessellationLayout(ucode_disassembly(), smooth_tessellation_layout_);
+    if (has_smooth_tessellation_layout_) {
+      REXGPU_INFO(
+          "Smooth tessellation: vertex shader {:016X} writes the world position to "
+          "interpolator {} and the normal to {} (clip c{}, world c{}{})",
+          ucode_data_hash(), smooth_tessellation_layout_.position_interpolator,
+          smooth_tessellation_layout_.normal_interpolator, smooth_tessellation_layout_.clip_constant,
+          smooth_tessellation_layout_.world_constant,
+          smooth_tessellation_layout_.skinned ? ", skinned" : "");
+    }
+  });
+  return has_smooth_tessellation_layout_ ? &smooth_tessellation_layout_ : nullptr;
+}
+
 VulkanShader::VulkanShader(const ui::vulkan::VulkanDevice* const vulkan_device,
                            const xenos::ShaderType shader_type, const uint64_t ucode_data_hash,
                            const uint32_t* const ucode_dwords, const size_t ucode_dword_count,

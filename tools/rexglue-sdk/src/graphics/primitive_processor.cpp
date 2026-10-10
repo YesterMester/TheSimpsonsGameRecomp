@@ -300,9 +300,11 @@ void PrimitiveProcessor::ClearPerFrameCache() {
   std::memset(cache_buckets_non_empty_l2_, 0, sizeof(cache_buckets_non_empty_l2_));
 }
 
-bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_indices) {
+bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_indices,
+                                 bool triangle_patches) {
   SCOPE_profile_cpu_f("gpu");
   result_out.native_index_snapshot = nullptr;
+  result_out.triangle_patches = false;
 
   const RegisterFile& regs = register_file_;
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
@@ -431,6 +433,22 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
             uint32_t(guest_primitive_type));
         assert_always();
         return false;
+    }
+  }
+
+  // Indexed triangles to be drawn as patches: lists as they are, strips
+  // converted on the CPU below. The converted indices keep the guest's raw
+  // values, so 32-bit ones need hosts that read all 32 bits.
+  bool triangle_list_patches = false;
+  bool triangle_strip_patches = false;
+  if (triangle_patches && host_vertex_shader_type == Shader::HostVertexShaderType::kVertex &&
+      vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA &&
+      (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16 ||
+       full_32bit_vertex_indices_used_)) {
+    if (guest_primitive_type == xenos::PrimitiveType::kTriangleList) {
+      triangle_list_patches = true;
+    } else if (guest_primitive_type == xenos::PrimitiveType::kTriangleStrip) {
+      triangle_strip_patches = true;
     }
   }
 
@@ -658,7 +676,73 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
         guest_index_format == xenos::IndexFormat::kInt16
             ? UINT16_MAX
             : GpuSwap(xenos::kVertexIndexMask, guest_index_endian);
-    if (host_primitive_type != guest_primitive_type) {
+    if (triangle_strip_patches &&
+        shared_memory_.IsRangeGpuWritten(guest_index_base, guest_index_buffer_needed_bytes)) {
+      // The CPU copy of the indices may be stale - draw the strip as it is.
+      triangle_strip_patches = false;
+    }
+    if (triangle_strip_patches) {
+      // Not cached: the converted copy is also the CPU snapshot the native
+      // vertex path scans for the vertex range, and these strips are small.
+      host_primitive_type = xenos::PrimitiveType::kTriangleList;
+      trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes);
+      const void* guest_indices_ptr = memory_.TranslatePhysical(guest_index_base);
+      single_primitive_ranges_.clear();
+      uint32_t host_index_count;
+      size_t host_index_size;
+      if (guest_index_format == xenos::IndexFormat::kInt16) {
+        auto guest_indices = static_cast<const uint16_t*>(guest_indices_ptr);
+        if (guest_primitive_reset_enabled &&
+            IsResetUsed(guest_indices, guest_draw_vertex_count,
+                        uint16_t(guest_primitive_reset_index_guest_endian))) {
+          host_index_count = GetMultiPrimitiveHostIndexCountAndRanges(
+              GetTriangleStripListIndexCount, guest_indices, guest_draw_vertex_count,
+              uint16_t(guest_primitive_reset_index_guest_endian), single_primitive_ranges_);
+        } else {
+          host_index_count = GetTriangleStripListIndexCount(guest_draw_vertex_count);
+          single_primitive_ranges_.emplace_back(0, guest_draw_vertex_count, host_index_count);
+        }
+        host_index_size = sizeof(uint16_t);
+        native_index_snapshot_.resize(host_index_size * host_index_count);
+        ConvertSinglePrimitiveRanges(
+            reinterpret_cast<uint16_t*>(native_index_snapshot_.data()), guest_indices,
+            guest_primitive_type, PassthroughIndexTransform(), single_primitive_ranges_.cbegin(),
+            single_primitive_ranges_.cend());
+      } else {
+        auto guest_indices = static_cast<const uint32_t*>(guest_indices_ptr);
+        if (guest_primitive_reset_enabled && IsResetUsed(guest_indices, guest_draw_vertex_count,
+                                                         guest_primitive_reset_index_guest_endian,
+                                                         guest_index_mask_guest_endian)) {
+          host_index_count = GetMultiPrimitiveHostIndexCountAndRanges(
+              GetTriangleStripListIndexCount, guest_indices, guest_draw_vertex_count,
+              guest_primitive_reset_index_guest_endian, guest_index_mask_guest_endian,
+              single_primitive_ranges_);
+        } else {
+          host_index_count = GetTriangleStripListIndexCount(guest_draw_vertex_count);
+          single_primitive_ranges_.emplace_back(0, guest_draw_vertex_count, host_index_count);
+        }
+        host_index_size = sizeof(uint32_t);
+        native_index_snapshot_.resize(host_index_size * host_index_count);
+        ConvertSinglePrimitiveRanges(
+            reinterpret_cast<uint32_t*>(native_index_snapshot_.data()), guest_indices,
+            guest_primitive_type, PassthroughIndexTransform(), single_primitive_ranges_.cbegin(),
+            single_primitive_ranges_.cend());
+      }
+      cacheable.host_draw_vertex_count = host_index_count;
+      cacheable.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
+      cacheable.host_primitive_reset_enabled = false;
+      if (host_index_count) {
+        void* host_indices = RequestHostConvertedIndexBufferForCurrentFrame(
+            guest_index_format, host_index_count, false, guest_index_base,
+            cacheable.host_index_buffer_handle);
+        if (!host_indices) {
+          return false;
+        }
+        std::memcpy(host_indices, native_index_snapshot_.data(),
+                    host_index_size * host_index_count);
+        result_out.native_index_snapshot = native_index_snapshot_.data();
+      }
+    } else if (host_primitive_type != guest_primitive_type) {
       // Already converting to a different index type - primitive reset is
       // performed during conversion here. Also doing the endian swap here for
       // hosts not supporting 32-bit indices because indirection is only used
@@ -1016,6 +1100,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
   result_out.host_shader_index_endian = cacheable.host_shader_index_endian;
   result_out.host_primitive_reset_enabled = cacheable.host_primitive_reset_enabled;
   result_out.host_index_buffer_handle = cacheable.host_index_buffer_handle;
+  result_out.triangle_patches = triangle_list_patches || triangle_strip_patches;
   return true;
 }
 

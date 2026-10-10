@@ -1556,7 +1556,12 @@ bool VulkanTextureCache::LoadTextureDataFromCpuImpl(Texture& texture, bool load_
   if (!CanLoadTextureDataFromCpu(texture, load_base, load_mips)) {
     return false;
   }
-  return LoadTextureDataImpl(texture, load_base, load_mips, true);
+  bool loaded = LoadTextureDataImpl(texture, load_base, load_mips, true);
+  if (loaded) {
+    command_processor_.native_gpu_diagnostics().RecordOperation(
+        NativeGpuDiagnostics::Operation::kCpuTextureUpload);
+  }
+  return loaded;
 }
 
 bool VulkanTextureCache::CanLoadTextureDataFromNativeGpu(const Texture& texture, bool load_base,
@@ -1574,11 +1579,22 @@ bool VulkanTextureCache::CanLoadTextureDataFromNativeGpu(const Texture& texture,
 
 bool VulkanTextureCache::LoadTextureDataFromNativeGpuImpl(Texture& texture, bool load_base,
                                                           bool load_mips) {
-  return LoadTextureDataImpl(texture, load_base, load_mips, false, true);
+  bool loaded = LoadTextureDataImpl(texture, load_base, load_mips, false, true);
+  if (loaded) {
+    command_processor_.native_gpu_diagnostics().RecordOperation(
+        NativeGpuDiagnostics::Operation::kGpuTextureUpload);
+  }
+  return loaded;
 }
 
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
+  command_processor_.native_gpu_diagnostics().RecordDependency(
+      NativeGpuDiagnostics::Dependency::kTextureFallback,
+      (load_base ? texture.GetGuestBaseSize() : 0) + (load_mips ? texture.GetGuestMipsSize() : 0),
+      fmt::format("base {:08X}, {}x{}, format {}, scaled {}", texture.key().base_page << 12,
+                  texture.key().GetWidth(), texture.key().GetHeight(),
+                  uint32_t(texture.key().format), bool(texture.key().scaled_resolve)));
   if (SharedMemory::CensusEnabled()) {
     // Diagnostics: what native data there is where a texture uses the mirror.
     static uint32_t logged = 0;
@@ -2662,11 +2678,26 @@ VulkanTextureCache::VulkanTextureCache(const RegisterFile& register_file,
       command_processor_(command_processor),
       guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {}
 
-bool VulkanTextureCache::InitializeScaledResolveBuffer() {
+bool VulkanTextureCache::InitializeScaledResolveBuffer(bool defer) {
   assert_true(IsDrawResolutionScaled());
 
   uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * uint64_t(draw_resolution_scale_y());
   scaled_resolve_buffer_size_ = uint64_t(SharedMemory::kBufferSize) * scale_area;
+
+  if (defer) {
+    // Native resources don't need this address space, even when the driver
+    // supports sparse buffers. Create it only for an actual legacy consumer.
+    scaled_resolve_buffer_deferred_ = true;
+    scaled_resolve_buffer_sparse_ = false;
+    scaled_resolve_sparse_granularity_log2_ = UINT32_MAX;
+    scaled_resolve_last_usage_write_ = false;
+    scaled_resolve_last_written_range_ = {0, 0};
+    return true;
+  }
+  command_processor_.native_gpu_diagnostics().RecordDependency(
+      NativeGpuDiagnostics::Dependency::kScaledMirrorWrite, 0,
+      "allocate the scaled resolve mirror");
+  scaled_resolve_buffer_deferred_ = false;
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -2707,6 +2738,8 @@ bool VulkanTextureCache::InitializeScaledResolveBuffer() {
           std::max(uint32_t(6), size_log2 - scaled_resolve_sparse_granularity_log2_);
       scaled_resolve_sparse_allocated_.resize(size_t(1) << (allocation_count_log2 - uint32_t(6)));
       scaled_resolve_buffer_sparse_ = true;
+      command_processor_.native_gpu_diagnostics().RecordAllocation(
+          NativeGpuDiagnostics::Allocation::kScaledMirror, scaled_resolve_buffer_size_, 0);
     } else {
       dfn.vkDestroyBuffer(device, scaled_resolve_buffer_, nullptr);
       scaled_resolve_buffer_ = VK_NULL_HANDLE;
@@ -2783,13 +2816,18 @@ bool VulkanTextureCache::GetScaledResolveRange(uint32_t start_unscaled, uint32_t
 
 bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scaled,
                                                             uint64_t length_scaled) {
+  if (scaled_resolve_buffer_deferred_ && !scaled_resolve_buffer_ &&
+      !InitializeScaledResolveBuffer(false)) {
+    return false;
+  }
   if (scaled_resolve_buffer_deferred_) {
     scaled_resolve_buffer_deferred_ = false;
+    VkDeviceSize resident_size = 0;
     if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
             command_processor_.GetVulkanDevice(), scaled_resolve_buffer_size_,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
             scaled_resolve_buffer_, scaled_resolve_buffer_memory_.emplace_back(),
-            &scaled_resolve_buffer_memory_type_)) {
+            &scaled_resolve_buffer_memory_type_, &resident_size)) {
       scaled_resolve_buffer_memory_.pop_back();
       REXGPU_ERROR(
           "VulkanTextureCache: Failed to create a scaled resolve buffer with "
@@ -2799,6 +2837,8 @@ bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scale
     }
     REXGPU_INFO("VulkanTextureCache: created the {} MB scaled resolve buffer when first needed",
                 scaled_resolve_buffer_size_ >> 20);
+    command_processor_.native_gpu_diagnostics().RecordAllocation(
+        NativeGpuDiagnostics::Allocation::kScaledMirror, scaled_resolve_buffer_size_, resident_size);
   }
   if (scaled_resolve_buffer_ == VK_NULL_HANDLE) {
     return false;
@@ -2835,6 +2875,8 @@ bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scale
           "scaled resolve buffer");
       return false;
     }
+    command_processor_.native_gpu_diagnostics().RecordAllocation(
+        NativeGpuDiagnostics::Allocation::kScaledMirror, 0, memory_allocate_info.allocationSize);
     scaled_resolve_buffer_memory_.push_back(allocation_memory);
 
     VkSparseMemoryBind bind;
@@ -2877,6 +2919,10 @@ void VulkanTextureCache::GetScaledResolveUsageMasks(VkPipelineStageFlags& stage_
 }
 
 void VulkanTextureCache::UseScaledResolveBufferForRead(std::pair<uint32_t, uint32_t> read_range) {
+  command_processor_.native_gpu_diagnostics().RecordDependency(
+      NativeGpuDiagnostics::Dependency::kScaledMirrorRead, read_range.second,
+      fmt::format("{:08X}+{} at {}", read_range.first, read_range.second,
+                  SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
   const void* census_trigger_previous = SharedMemory::CensusTrigger();
   if (SharedMemory::CensusEnabled()) {
     SharedMemory::CensusRecord(__builtin_return_address(0), SharedMemory::kCensusKindScaledRead,
@@ -2919,6 +2965,10 @@ void VulkanTextureCache::UseScaledResolveBufferForRead(std::pair<uint32_t, uint3
 
 void VulkanTextureCache::UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                                         uint64_t written_length_scaled) {
+  command_processor_.native_gpu_diagnostics().RecordDependency(
+      NativeGpuDiagnostics::Dependency::kScaledMirrorWrite, written_length_scaled,
+      fmt::format("{:X}+{} at {}", written_start_scaled, written_length_scaled,
+                  SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
   uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
   const void* census_trigger_previous = SharedMemory::CensusTrigger();
   if (SharedMemory::CensusEnabled()) {

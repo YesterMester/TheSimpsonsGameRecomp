@@ -345,6 +345,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer edram_buffer_ = VK_NULL_HANDLE;
+  bool EnsureEdramBuffer();
   EdramBufferUsage edram_buffer_usage_;
   // HAND PATCH: freshly allocated device-local memory contains garbage;
   // games (and the FSI path especially) can read EDRAM regions before ever
@@ -1092,6 +1093,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool EnsureNativeResolvePipelineLayouts();
   void ShutdownNativeResolve();
   VkPipeline GetNativeResolvePipeline(NativeResolveShader shader, VkFormat dest_format);
+  bool PrepareNativeResolveAliasSurface(const draw_util::ResolveInfo& resolve_info,
+                                       uint32_t dump_base, uint32_t dump_row_length_used,
+                                       uint32_t dump_rows, uint32_t dump_pitch);
   // Finds the host render target owning the whole resolve area and the textures
   // to write. Must be called before the memory range is marked as resolved.
   // memory_only plans a resolve of only the memory, without any textures.

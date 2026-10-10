@@ -11,7 +11,9 @@
  */
 
 #include <cstdint>
+#include <mutex>
 
+#include <rex/graphics/pipeline/shader/smooth_tessellation.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/vulkan/device.h>
@@ -51,6 +53,10 @@ class VulkanShader : public SpirvShader {
   void SetTextureBindingLayoutUserUID(size_t uid) { texture_binding_layout_user_uid_ = uid; }
   void SetSamplerBindingLayoutUserUID(size_t uid) { sampler_binding_layout_user_uid_ = uid; }
 
+  // For smooth tessellation, where an analyzed vertex shader keeps the world
+  // position and normal, looked for once; nullptr if it doesn't have them.
+  const SmoothTessellationLayout* GetSmoothTessellationLayout() const;
+
  protected:
   Translation* CreateTranslationInstance(uint64_t modification) override;
 
@@ -60,6 +66,10 @@ class VulkanShader : public SpirvShader {
   std::atomic_flag binding_layout_user_uids_set_up_ = ATOMIC_FLAG_INIT;
   size_t texture_binding_layout_user_uid_ = 0;
   size_t sampler_binding_layout_user_uid_ = 0;
+
+  mutable std::once_flag smooth_tessellation_layout_once_;
+  mutable bool has_smooth_tessellation_layout_ = false;
+  mutable SmoothTessellationLayout smooth_tessellation_layout_;
 };
 
 }  // namespace rex::graphics::vulkan

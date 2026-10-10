@@ -440,3 +440,68 @@ instead of building a separate renderer next to it. Stages, in order:
   every resolve with a native buffer through the buffer path cost 3.8 ms more (the
   full-screen resolves packed 15 MB of memory each). Live FPS in Eighty Bites is unchanged;
   the command processor's time per draw is the same or slightly lower.
+
+
+### Resolve-and-clear effects (2026-10-10)
+
+- Special attacks and other effects could turn the scene black for about 1.2 seconds while
+  the HUD remained visible. Seven captured black frames reproduce it through the native
+  render target path; the interlocked reference path renders their scenes correctly.
+- Some effect passes resolve the scene and clear the source in the same command. A copy-free
+  candidate was held until the next draw, after that clear, so even its eventual native copy
+  read the cleared image. Pending copies now finish before preparing either resolve clear,
+  including ownership transfers for an aliased depth clear. The ordinary post-processing
+  image exchanges remain enabled; this adds no emulation fallback.
+- The previous runtime fails the replay comparison by 3,567,332 pixels on one captured 2x
+  frame. With the fix, all seven failure traces and an ordinary scene match native copies
+  exactly at 1x and 2x (16 comparisons). A new live effect trace also matches at both scales;
+  its resolve log confirms the two full-screen resolve-and-clear passes were exercised.
+- A further 80-second live recording with repeated combos contains no scene blackouts.
+  This is a check of the reproduced Springfield effects, not full campaign qualification.
+- `tools/bench/copy_free_resolve_check.py` repeats supplied traces with native copies and
+  image exchanges, requires identical pixels and retains logs, images and a JSON report.
+  Use the same runtime as the replayer was built against. Traces contain game data and
+  remain outside the repository. For example:
+
+  ```sh
+  python3 tools/bench/copy_free_resolve_check.py /tmp/resolve-clear-check \
+    /path/to/effect.xtr /path/to/ordinary.xtr \
+    --replayer /path/to/trace_reference --require-exchange
+  ```
+
+  NumPy is required, as for `replay_ab.py`. A single playback is insufficient: textures
+  retained from earlier frames must exist for the deferred copy path to run. Live recordings
+  remain necessary to check frame order as well.
+
+### Character tessellation (2026-10-10)
+
+- Optional Vulkan PN triangles curve supported skinned meshes from their world positions and
+  normals. The shader analyzer proves the clip/world matrix relationship before adding the
+  host control and evaluation stages. Other shaders, GPU-written strips and unsupported
+  stage interfaces keep drawing normally. Off remains the default; Low, Medium and High are
+  available in the launcher. This does not finish native GPU coverage.
+- The evaluation shader uses clockwise tessellator ordering with Vulkan's upper-left domain
+  origin to preserve the original triangle's winding. Counter-clockwise ordering had rendered
+  back faces in place of front faces. Edge levels now depend only on their two endpoints,
+  including camera-plane checks, so a third vertex behind the camera cannot give neighbouring
+  patches different subdivision levels. Curved patches are clipped after evaluation rather
+  than rejected using a guessed screen-space margin.
+- Software Vulkan and the Deck replay the corrected High path without shader errors. Deck
+  comparisons exercise all three levels on Springfield characters and High in Eighty Bites
+  and Colossal Donut. The title frame remains pixel-identical with High and Off. These checks
+  do not qualify the full campaign or native Windows drivers.
+- A 60-second live recording at High contains 1,792 frames with no detected scene blackouts
+  while running repeated combos. The live shader cache reports 87 prebuilt hits and no runtime
+  translations. Tessellation's helper stages still compile on first use; keeping the host-only
+  analyzer out of the guest translator hash preserves the shipped translated shader set.
+- `tools/bench/smooth_tessellation_layout_check.cpp` uses synthetic disassembly to check the
+  accepted position/normal layout and reject inconsistent matrices, conditional outputs,
+  overwritten registers and jumps across the transforms. It needs no game data:
+
+  ```sh
+  clang++ -std=c++23 -O2 -Itools/rexglue-sdk/include \
+    tools/bench/smooth_tessellation_layout_check.cpp \
+    tools/rexglue-sdk/src/graphics/pipeline/shader/smooth_tessellation.cpp \
+    -o /tmp/smooth-tessellation-check
+  /tmp/smooth-tessellation-check
+  ```

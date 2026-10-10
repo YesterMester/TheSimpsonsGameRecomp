@@ -18,11 +18,14 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <set>
+#include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -107,6 +110,18 @@ class VulkanPipelineCache {
   size_t aot_misses() const { return aot_misses_; }
   size_t pipelines_created() const { return pipelines_created_.load(std::memory_order_relaxed); }
   size_t pipeline_count() const { return pipelines_.size(); }
+
+  // Smooth tessellation level (1 to 3, 0 = off) for draws whose primitive
+  // processing returned triangle patches.
+  void SetSmoothTessellationLevel(uint32_t level) { smooth_tessellation_level_ = level; }
+  uint32_t smooth_tessellation_level() const { return smooth_tessellation_level_; }
+  // PN triangle control and evaluation shaders for a translated vertex shader
+  // (its interpolators and float constants) - false if it can't be smoothly
+  // tessellated, which the draw should then learn before configuring the
+  // pipeline. Level 0 means the current one.
+  bool GetSmoothTessellationShaders(const VulkanShader::VulkanTranslation& vertex_shader,
+                                    VkShaderModule& control_shader_out,
+                                    VkShaderModule& evaluation_shader_out, uint32_t level = 0);
 
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
@@ -206,12 +221,15 @@ class VulkanPipelineCache {
     xenos::StencilOp stencil_back_depth_fail_op : 3;     // 6
     xenos::CompareFunction stencil_back_compare_op : 3;  // 9
     uint32_t sample_rate_shading : 1;                    // 10
+    // Smooth tessellation level of a guest triangle list drawn as patches (PN
+    // triangles, the guest vertex shader staying the vertex shader), 0 if off.
+    uint32_t smooth_tessellation : 2;  // 12
 
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     // Including all the padding, for a stable hash.
-    static constexpr uint32_t kVersion = 0x20260228;
+    static constexpr uint32_t kVersion = 0x20261010;
     PipelineDescription() {
       Reset();
     }
@@ -280,6 +298,8 @@ class VulkanPipelineCache {
     // Non-guest stages for tessellation.
     VkShaderModule tessellation_vertex_shader = VK_NULL_HANDLE;
     VkShaderModule tessellation_control_shader = VK_NULL_HANDLE;
+    // Only for smooth tessellation, where the guest shader is the vertex shader.
+    VkShaderModule tessellation_evaluation_shader = VK_NULL_HANDLE;
     uint32_t tessellation_patch_control_points = 0;
     VkShaderModule geometry_shader = VK_NULL_HANDLE;
     // VK_NULL_HANDLE when dynamic rendering is used.
@@ -443,6 +463,18 @@ class VulkanPipelineCache {
   std::unordered_map<TessellationControlShaderKey, VkShaderModule,
                      TessellationControlShaderKey::Hasher>
       tessellation_control_shaders_;
+
+  uint32_t smooth_tessellation_level_ = 0;
+  // Smooth tessellation shaders by their GLSL source, VK_NULL_HANDLE if failed,
+  // and the pair for each vertex shader translation and level.
+  std::mutex smooth_tessellation_shaders_mutex_;
+  std::unordered_map<std::string, VkShaderModule> smooth_tessellation_shaders_;
+  struct SmoothTessellationShaderPair {
+    VkShaderModule control = VK_NULL_HANDLE;
+    VkShaderModule evaluation = VK_NULL_HANDLE;
+  };
+  std::map<std::tuple<uint64_t, uint64_t, uint32_t>, SmoothTessellationShaderPair>
+      smooth_tessellation_translations_;
 
   // Empty depth-only pixel shader for writing to depth buffer using fragment
   // shader interlock when no Xenos pixel shader provided.

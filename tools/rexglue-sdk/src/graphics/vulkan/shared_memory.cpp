@@ -82,6 +82,9 @@ bool VulkanSharedMemory::EnsureHostBuffer() {
 }
 
 bool VulkanSharedMemory::CreateBuffer() {
+  command_processor_.native_gpu_diagnostics().RecordDependency(
+      NativeGpuDiagnostics::Dependency::kMemoryMirror, 0, "allocate the guest-memory mirror");
+  uint64_t resident_size = 0;
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -189,6 +192,7 @@ bool VulkanSharedMemory::CreateBuffer() {
       return false;
     }
     buffer_memory_.push_back(buffer_memory);
+    resident_size = buffer_memory_allocate_info.allocationSize;
     if (dfn.vkBindBufferMemory(device, buffer_, buffer_memory, 0) != VK_SUCCESS) {
       REXGPU_ERROR("Shared memory: Failed to bind memory to the Vulkan buffer");
       DestroyBuffer();
@@ -198,6 +202,8 @@ bool VulkanSharedMemory::CreateBuffer() {
 
   // UploadRanges copies with CopyPagesForUpload.
   streamed_page_shadows_supported_ = true;
+  command_processor_.native_gpu_diagnostics().RecordAllocation(
+      NativeGpuDiagnostics::Allocation::kMemoryMirror, kBufferSize, resident_size);
 
   return true;
 }
@@ -249,6 +255,11 @@ bool VulkanSharedMemory::FlushGpuWrittenRange(uint32_t start, uint32_t length, b
 
 void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range,
                              std::pair<uint32_t, uint32_t> read_range) {
+  command_processor_.native_gpu_diagnostics().RecordDependency(
+      NativeGpuDiagnostics::Dependency::kMemoryMirror,
+      uint64_t(written_range.second) + read_range.second,
+      fmt::format("usage {} at {}", uint32_t(usage),
+                  DescribeCodeAddress(__builtin_return_address(0))));
   if (!EnsureHostBuffer()) {
     return;
   }
@@ -392,6 +403,8 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
     return false;
   }
   buffer_memory_.push_back(memory);
+  command_processor_.native_gpu_diagnostics().RecordAllocation(
+      NativeGpuDiagnostics::Allocation::kMemoryMirror, 0, memory_allocate_info.allocationSize);
 
   VkSparseMemoryBind bind;
   bind.resourceOffset = offset_allocations << host_gpu_memory_sparse_granularity_log2();

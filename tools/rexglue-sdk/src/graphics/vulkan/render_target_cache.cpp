@@ -118,6 +118,10 @@ REXCVAR_DEFINE_BOOL(native_resolve, true, "GPU/Vulkan",
                     "that sample them instead of reloading those textures from guest memory")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(native_resolve_surface_aliases, true, "GPU/Vulkan",
+                    "Resolve depth/color aliases through native surface transfers")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(native_resolve_image_copies, false, "GPU/Vulkan",
                     "Copy matching color resolves into separate native texture images")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -784,20 +788,6 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
           vulkan_device, 256, 1, &descriptor_set_layout_size,
           descriptor_set_layout_sampled_image_x2_);
 
-  // EDRAM contents reinterpretation buffer.
-  // 90 MB with 9x resolution scaling - within the minimum
-  // maxStorageBufferRange.
-  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          vulkan_device,
-          VkDeviceSize(xenos::kEdramSizeBytes *
-                       (draw_resolution_scale_x() * draw_resolution_scale_y())),
-          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-          ui::vulkan::util::MemoryPurpose::kDeviceLocal, edram_buffer_, edram_buffer_memory_)) {
-    REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the EDRAM buffer");
-    Shutdown();
-    return false;
-  }
   if (GetPath() == Path::kPixelShaderInterlock) {
     // The first operation will likely be drawing.
     edram_buffer_usage_ = EdramBufferUsage::kFragmentReadWrite;
@@ -843,22 +833,10 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     Shutdown();
     return false;
   }
-  VkDescriptorBufferInfo edram_storage_buffer_descriptor_buffer_info;
-  edram_storage_buffer_descriptor_buffer_info.buffer = edram_buffer_;
-  edram_storage_buffer_descriptor_buffer_info.offset = 0;
-  edram_storage_buffer_descriptor_buffer_info.range = VK_WHOLE_SIZE;
-  VkWriteDescriptorSet edram_storage_buffer_descriptor_write;
-  edram_storage_buffer_descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  edram_storage_buffer_descriptor_write.pNext = nullptr;
-  edram_storage_buffer_descriptor_write.dstSet = edram_storage_buffer_descriptor_set_;
-  edram_storage_buffer_descriptor_write.dstBinding = 0;
-  edram_storage_buffer_descriptor_write.dstArrayElement = 0;
-  edram_storage_buffer_descriptor_write.descriptorCount = 1;
-  edram_storage_buffer_descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  edram_storage_buffer_descriptor_write.pImageInfo = nullptr;
-  edram_storage_buffer_descriptor_write.pBufferInfo = &edram_storage_buffer_descriptor_buffer_info;
-  edram_storage_buffer_descriptor_write.pTexelBufferView = nullptr;
-  dfn.vkUpdateDescriptorSets(device, 1, &edram_storage_buffer_descriptor_write, 0, nullptr);
+  if (!native_rt_mode_ && !EnsureEdramBuffer()) {
+    Shutdown();
+    return false;
+  }
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1830,7 +1808,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       native_resolve_plan.targets[0].height >= native_resolve_plan.y1 &&
       GetNativeResolvePipeline(native_resolve_plan.shader, native_resolve_plan.targets[0].format) !=
           VK_NULL_HANDLE;
-  if (native_buffer_candidate && draw_resolution_scaled && !native_resolve_plan.memory_only &&
+  if (native_buffer_candidate && native_resolve_single_pass && draw_resolution_scaled &&
+      !native_resolve_plan.memory_only &&
       REXCVAR_GET(native_resolve_buffer_texture_first) &&
       REXCVAR_GET(native_resolve_scaled_lazy_memory) &&
       (native_resolve_plan.memory_flags & kNativeResolveFlagMemoryScaled) &&
@@ -1842,6 +1821,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     // native buffers hold memory there: other resolves to the same memory
     // (smaller ones writing into a larger one's buffer, for instance) build
     // on its bytes, which the texture alone would leave only in the mirror.
+    // Keep the compact buffer when a device splits guest memory into several
+    // bindings: the texture-only path can't bind the scaled output there.
     native_buffer_candidate = false;
   }
   // Textures smaller than the rectangle can't take the memory writes with
@@ -1886,20 +1867,16 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     uint32_t dest_range_unscaled = resolve_info.copy_dest_extent_start +
                                    resolve_info.copy_dest_extent_length -
                                    native_resolve_plan.dest_base;
-    uint64_t dest_base_scaled, dest_range_scaled, dest_use_start_scaled, dest_use_length_scaled;
-    VkDescriptorSet scaled_memory_descriptor_set = VK_NULL_HANDLE;
-    if (resolve_info.copy_dest_extent_start >= native_resolve_plan.dest_base &&
+    uint64_t dest_base_scaled = 0, dest_range_scaled = 0;
+    uint64_t dest_use_start_scaled = 0, dest_use_length_scaled = 0;
+    bool scaled_memory_range_valid =
+        resolve_info.copy_dest_extent_start >= native_resolve_plan.dest_base &&
         texture_cache.GetScaledResolveRange(native_resolve_plan.dest_base, dest_range_unscaled,
                                             bytes_per_block_log2, dest_base_scaled,
                                             dest_range_scaled) &&
         texture_cache.GetScaledResolveRange(
             resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
-            bytes_per_block_log2, dest_use_start_scaled, dest_use_length_scaled) &&
-        texture_cache.CommitScaledResolveRange(native_resolve_plan.dest_base, dest_range_unscaled,
-                                               bytes_per_block_log2)) {
-      scaled_memory_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
-          VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferGuestShaders);
-    }
+            bytes_per_block_log2, dest_use_start_scaled, dest_use_length_scaled);
     // The memory is written from the first target only if something reads it
     // before it's replaced. Color targets hold the raw bits the memory would;
     // depth targets hold converted depth (invertible) but no stencil, which is
@@ -1980,6 +1957,19 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           verify_stencil_capture = AcquireScaledStencilCapture(capture_size);
         }
       }
+    }
+    // Texture-owned results need neither a mirror allocation nor its
+    // descriptor. Wait until stencil preflight proves whether memory must
+    // actually be written before committing the legacy destination.
+    VkDescriptorSet scaled_memory_descriptor_set = VK_NULL_HANDLE;
+    if (!lazy_memory &&
+        !(REXCVAR_GET(native_resolve_debug_skip_scaled_memory) &&
+          !native_resolve_plan.memory_only) &&
+        scaled_memory_range_valid &&
+        texture_cache.CommitScaledResolveRange(native_resolve_plan.dest_base, dest_range_unscaled,
+                                               bytes_per_block_log2)) {
+      scaled_memory_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
+          VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferGuestShaders);
     }
     if (lazy_memory) {
       // Native buffers of earlier resolves this one fully replaces need no
@@ -2119,6 +2109,20 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     }
     copied = true;
   } else if (resolve_info.copy_dest_extent_length) {
+    if (command_processor_.native_gpu_diagnostics().enabled()) {
+      command_processor_.native_gpu_diagnostics().RecordDependency(
+          NativeGpuDiagnostics::Dependency::kResolveFallback, resolve_info.copy_dest_extent_length,
+          fmt::format(
+              "{} resolve to {:08X}, format {}, planned {}, compact candidate {}, single pass {}, "
+              "target {}x{}, rectangle {}x{}",
+              resolve_info.IsCopyingDepth() ? "depth" : "color", resolve_info.copy_dest_base,
+              uint32_t(resolve_info.copy_dest_info.copy_dest_format), native_resolve_planned,
+              native_buffer_candidate, native_resolve_single_pass,
+              native_resolve_planned ? native_resolve_plan.targets[0].width : 0,
+              native_resolve_planned ? native_resolve_plan.targets[0].height : 0,
+              native_resolve_planned ? native_resolve_plan.x1 : 0,
+              native_resolve_planned ? native_resolve_plan.y1 : 0));
+    }
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =
@@ -2299,6 +2303,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     g_stencil_nonzero_clears.fetch_add(1, std::memory_order_relaxed);
   }
   if (clear_depth || clear_color) {
+    // A resolve must preserve the pre-clear contents. A held back copy still
+    // reads the source render target, and either clear may alias its EDRAM.
+    // Complete it before preparing the clear's ownership transfers.
+    FlushPendingCopyFreeResolve();
     switch (GetPath()) {
       case Path::kHostRenderTargets: {
         Transfer::Rectangle clear_rectangle;
@@ -2370,6 +2378,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     cleared = true;
   }
 
+  if (copied && cleared && native_resolve_planned) {
+    command_processor_.native_gpu_diagnostics().RecordOperation(
+        NativeGpuDiagnostics::Operation::kResolve);
+  }
   return copied && cleared;
 }
 
@@ -3499,7 +3511,46 @@ void VulkanRenderTargetCache::GetEdramBufferUsageMasks(EdramBufferUsage usage,
   }
 }
 
+bool VulkanRenderTargetCache::EnsureEdramBuffer() {
+  if (edram_buffer_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  auto& diagnostics = command_processor_.native_gpu_diagnostics();
+  diagnostics.RecordDependency(NativeGpuDiagnostics::Dependency::kEdram, 0,
+                                "allocate the EDRAM compatibility buffer");
+  VkDeviceSize size = VkDeviceSize(xenos::kEdramSizeBytes) *
+                      draw_resolution_scale_x() * draw_resolution_scale_y();
+  VkDeviceSize resident_size = 0;
+  const auto* device = command_processor_.GetVulkanDevice();
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          device, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal, edram_buffer_, edram_buffer_memory_,
+          nullptr, &resident_size)) {
+    REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the EDRAM buffer");
+    return false;
+  }
+  diagnostics.RecordAllocation(NativeGpuDiagnostics::Allocation::kEdram, size, resident_size);
+  VkDescriptorBufferInfo info{edram_buffer_, 0, VK_WHOLE_SIZE};
+  VkWriteDescriptorSet write = {};
+  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write.dstSet = edram_storage_buffer_descriptor_set_;
+  write.dstBinding = 0;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  write.pBufferInfo = &info;
+  device->functions().vkUpdateDescriptorSets(device->device(), 1, &write, 0, nullptr);
+  return true;
+}
+
 void VulkanRenderTargetCache::UseEdramBuffer(EdramBufferUsage new_usage) {
+  command_processor_.native_gpu_diagnostics().RecordDependency(
+      NativeGpuDiagnostics::Dependency::kEdram, 0,
+      fmt::format("usage {} at {}", uint32_t(new_usage),
+                  SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
+  if (!EnsureEdramBuffer()) {
+    REX_FATAL("Unable to allocate the EDRAM compatibility buffer");
+  }
   // HAND PATCH: zero-initialize the EDRAM buffer the first time anything
   // uses it (uninitialized VRAM reads showed as green static in the
   // in-engine cutscenes / intro logos). Recorded through the deferred
@@ -6183,8 +6234,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     return;
   }
   if (render_target_transfers) {
-    // Reports EDRAM emulation still at work: each distinct pair of render
-    // targets data moves between because the guest reinterprets EDRAM.
+    // Surface reinterpretations sample native images. Only the preserved
+    // host-depth copy case needs the EDRAM buffer; UseEdramBuffer records that
+    // dependency separately, without limiting the cumulative count.
     static std::unordered_set<uint64_t> transfer_pairs_logged;
     for (uint32_t i = 0; i < render_target_count; ++i) {
       if (!render_targets[i] || transfer_pairs_logged.size() >= 64) {
@@ -6195,8 +6247,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         RenderTargetKey source_key = transfer.source->key();
         if (transfer_pairs_logged.insert((uint64_t(dest_key.key) << 32) | source_key.key).second) {
           REXGPU_INFO(
-              "[native-fallback] EDRAM transfer into the {} render target at {} (pitch {}, {}x "
+              "[{}] Surface transfer into the {} render target at {} (pitch {}, {}x "
               "MSAA, format {}) from the {} one at {} (pitch {}, {}x MSAA, format {})",
+              transfer.host_depth_source == render_targets[i] ? "native-fallback" : "native-surface-transfer",
               dest_key.is_depth ? "depth" : "color", uint32_t(dest_key.base_tiles),
               uint32_t(dest_key.pitch_tiles_at_32bpp), 1u << uint32_t(dest_key.msaa_samples),
               uint32_t(dest_key.resource_format), source_key.is_depth ? "depth" : "color",
@@ -10018,6 +10071,89 @@ void VulkanRenderTargetCache::RetireFramebuffersOfRenderTarget(RenderTargetKey k
   last_update_framebuffer_ = nullptr;
 }
 
+bool VulkanRenderTargetCache::PrepareNativeResolveAliasSurface(
+    const draw_util::ResolveInfo& resolve_info, uint32_t dump_base,
+    uint32_t dump_row_length_used, uint32_t dump_rows, uint32_t dump_pitch) {
+  if (!REXCVAR_GET(native_resolve_surface_aliases) || resolve_info.IsCopyingDepth() ||
+      native_resolve_rectangles_.size() != 1 || !dump_rows || !dump_pitch) {
+    return false;
+  }
+  const auto& rectangle = native_resolve_rectangles_.front();
+  auto* source = static_cast<VulkanRenderTarget*>(rectangle.render_target);
+  RenderTargetKey source_key = source->key();
+  const auto& edram_info = resolve_info.color_edram_info;
+  // This is a reinterpretation of the same 32-bit samples, not a depth
+  // resolve. Preserve both the depth bits and stencil byte through the native
+  // depth-to-color transfer shader before the ordinary color resolve.
+  if (!source_key.is_depth ||
+      source_key.GetDepthFormat() != xenos::DepthRenderTargetFormat::kD24S8 ||
+      source_key.original_resolution || source_key.msaa_samples != xenos::MsaaSamples::k1X ||
+      source_key.base_tiles != resolve_info.color_original_base ||
+      source_key.GetPitchTiles() != dump_pitch ||
+      rectangle.row_first || rectangle.rows != dump_rows || rectangle.row_first_start ||
+      rectangle.row_last_end != dump_row_length_used ||
+      edram_info.format != uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10) ||
+      resolve_info.copy_dest_info.copy_dest_exp_bias ||
+      !xenos::IsColorResolveFormatBitwiseEquivalent(
+          xenos::ColorRenderTargetFormat(edram_info.format),
+          xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format))) {
+    return false;
+  }
+  uint32_t start = (dump_base - uint32_t(source_key.base_tiles)) & (xenos::kEdramTileCount - 1);
+  uint64_t length = uint64_t(dump_rows - 1) * dump_pitch + dump_row_length_used;
+  if (length > xenos::kEdramTileCount || start + length > xenos::kEdramTileCount) {
+    return false;
+  }
+  RenderTargetKey dest_key = source_key;
+  dest_key.is_depth = 0;
+  dest_key.resource_format = uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10);
+  uint32_t needed_rows = uint32_t((start + length + dump_pitch - 1) / dump_pitch);
+  render_target_create_tile_rows_ = needed_rows;
+  auto* dest = static_cast<VulkanRenderTarget*>(GetOrCreateRenderTarget(dest_key));
+  render_target_create_tile_rows_ = 0;
+  if (!dest) {
+    return false;
+  }
+  EnsureRenderTargetTileRows(dest_key, needed_rows);
+  if (dest->tile_rows() < needed_rows) {
+    return false;
+  }
+
+  RenderPassKey pass_key;
+  pass_key.msaa_samples = xenos::MsaaSamples::k1X;
+  pass_key.depth_and_color_used = 0b10;
+  pass_key.color_0_view_format = dest_key.GetColorFormat();
+  pass_key.color_rts_use_transfer_formats = 1;
+  TransferShaderKey shader_key;
+  shader_key.dest_msaa_samples = xenos::MsaaSamples::k1X;
+  shader_key.dest_resource_format = dest_key.resource_format;
+  shader_key.source_msaa_samples = xenos::MsaaSamples::k1X;
+  shader_key.source_resource_format = source_key.resource_format;
+  shader_key.mode = TransferMode::kDepthToColor;
+  const RenderTarget* framebuffer_targets[1 + xenos::kMaxColorRenderTargets] = {};
+  framebuffer_targets[1] = dest;
+  // Validate every object before changing ownership. A failed transfer must
+  // leave the reference path able to read the original depth surface.
+  if (!GetTransferPipelines(TransferPipelineKey(pass_key, shader_key)) ||
+      !GetHostRenderTargetsFramebuffer(pass_key, dest_key.pitch_tiles_at_32bpp,
+                                       framebuffer_targets)) {
+    return false;
+  }
+  command_processor_.EndRenderPass();
+  std::vector<Transfer> transfers;
+  ChangeOwnership(dest_key, start, uint32_t(length), &transfers);
+  RenderTarget* targets[] = {dest};
+  PerformTransfersAndResolveClears(1, targets, &transfers, nullptr, nullptr);
+  last_update_framebuffer_ = nullptr;
+  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                 native_resolve_rectangles_);
+  command_processor_.native_gpu_diagnostics().RecordOperation(
+      NativeGpuDiagnostics::Operation::kAliasTransfer);
+  REXGPU_INFO("[native-resolve-alias] depth/stencil at {} reinterpreted as color without EDRAM",
+              uint32_t(source_key.base_tiles));
+  return true;
+}
+
 bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo& resolve_info,
                                                    VulkanTextureCache& texture_cache,
                                                    NativeResolvePlan& plan, bool memory_only) {
@@ -10072,6 +10208,8 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  native_resolve_rectangles_);
+  PrepareNativeResolveAliasSurface(resolve_info, dump_base, dump_row_length_used, dump_rows,
+                                   dump_pitch);
   // Diagnostics: why a resolve can't come from a single render target.
   auto log_unplanned = [&](const char* reason) {
     if (!SharedMemory::CensusEnabled()) {

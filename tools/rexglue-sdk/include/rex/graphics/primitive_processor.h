@@ -152,6 +152,9 @@ class PrimitiveProcessor {
     // Exact CPU copy of a native DMA index stream, valid until the next
     // Process call. Bounds scans must not read a write-combined GPU mapping.
     const void* native_index_snapshot;
+    // A triangle list (strips converted) that can be drawn as three-point
+    // patches, as requested for smooth tessellation.
+    bool triangle_patches;
     bool IsTessellated() const {
       return Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type);
     }
@@ -174,7 +177,10 @@ class PrimitiveProcessor {
   // memory).
   // native_dma_indices snapshots supported CPU index streams into a host
   // buffer for this draw, without uploading them to the guest memory mirror.
-  bool Process(ProcessingResult& result_out, bool native_dma_indices = false);
+  // triangle_patches asks for a triangle list that can be drawn as patches:
+  // indexed triangle lists stay as they are, indexed strips are converted.
+  bool Process(ProcessingResult& result_out, bool native_dma_indices = false,
+               bool triangle_patches = false);
 
   // Invalidates the cache within the range.
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
@@ -534,6 +540,38 @@ class PrimitiveProcessor {
     }
   }
 
+  // Triangle strips as triangle lists, every other triangle with its last two
+  // vertices swapped to keep the winding and the first (provoking) vertex, as
+  // the host draws strips: (v0, v1, v2), (v1, v3, v2), (v2, v3, v4), ...
+  // Degenerate triangles of joined strips stay, for the host to drop.
+  static constexpr uint32_t GetTriangleStripListIndexCount(uint32_t strip_index_count) {
+    return strip_index_count > 2 ? (strip_index_count - 2) * 3 : 0;
+  }
+  template <typename Index, typename IndexTransform>
+  static void TriangleStripToList(Index* dest, const Index* source, uint32_t source_index_count,
+                                  const IndexTransform& index_transform) {
+    if (source_index_count <= 2) {
+      // To match GetTriangleStripListIndexCount.
+      return;
+    }
+    Index index_previous_previous = index_transform(source[0]);
+    Index index_previous = index_transform(source[1]);
+    for (uint32_t i = 2; i < source_index_count; ++i) {
+      Index index_current = index_transform(source[i]);
+      if (i & 1) {
+        *(dest++) = index_previous_previous;
+        *(dest++) = index_current;
+        *(dest++) = index_previous;
+      } else {
+        *(dest++) = index_previous_previous;
+        *(dest++) = index_previous;
+        *(dest++) = index_current;
+      }
+      index_previous_previous = index_previous;
+      index_previous = index_current;
+    }
+  }
+
   static constexpr uint32_t GetLineLoopStripIndexCount(uint32_t loop_index_count) {
     // Even if 2 vertices are supplied, two lines are still drawn between them.
     // https://www.khronos.org/opengl/wiki/Primitive
@@ -621,6 +659,14 @@ class PrimitiveProcessor {
              ++range_it) {
           TriangleFanToList(dest_write_ptr, source + range_it->guest_offset,
                             range_it->guest_index_count, index_transform);
+          dest_write_ptr += range_it->host_index_count;
+        }
+        break;
+      case xenos::PrimitiveType::kTriangleStrip:
+        for (PrimitiveRangeIterator range_it = ranges_beginning; range_it != ranges_end;
+             ++range_it) {
+          TriangleStripToList(dest_write_ptr, source + range_it->guest_offset,
+                              range_it->guest_index_count, index_transform);
           dest_write_ptr += range_it->host_index_count;
         }
         break;

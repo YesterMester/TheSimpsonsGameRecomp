@@ -10,6 +10,7 @@ set(REXGRAPHICS_CORE_SOURCES
     register_file.cpp
     registers.cpp
     pipeline/shader/shader.cpp
+    pipeline/shader/smooth_tessellation.cpp
     format/ucode.cpp
     sampler_info.cpp
 )
@@ -19,6 +20,7 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     graphics_system.cpp
     command_processor.cpp
     native_records.cpp
+    native_gpu_diagnostics.cpp
     trace_writer.cpp
     pipeline/texture/extent.cpp
     pipeline/texture/util.cpp
@@ -154,6 +156,12 @@ add_library(rex::graphics ALIAS rexgraphics)
 file(GLOB REX_TRANSLATOR_HASH_INPUTS
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/shader/*.cpp
     ${REXGLUE_ROOT}/include/rex/graphics/pipeline/shader/*.h
+)
+# This analyses vertex layouts for separate host tessellation stages; it does
+# not change the guest shader translator or its exported modules.
+list(REMOVE_ITEM REX_TRANSLATOR_HASH_INPUTS
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/shader/smooth_tessellation.cpp
+    ${REXGLUE_ROOT}/include/rex/graphics/pipeline/shader/smooth_tessellation.h
 )
 list(APPEND REX_TRANSLATOR_HASH_INPUTS
     ${CMAKE_CURRENT_SOURCE_DIR}/format/ucode.cpp

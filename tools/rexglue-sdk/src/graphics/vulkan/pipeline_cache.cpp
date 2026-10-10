@@ -331,6 +331,252 @@ void main() {
   return source;
 }
 
+// Smooth tessellation: guest triangles drawn as three-point patches and curved
+// as PN triangles (Vlachos et al., "Curved PN Triangles", 2001) from the world
+// positions and normals the guest vertex shader writes to interpolators.
+// Everything else the vertex shader writes is interpolated linearly.
+
+// Members of the system constants used by the smooth tessellation shaders,
+// declared as scalars so explicit offsets need only 4-byte alignment.
+std::string GetSmoothTessellationSystemConstantsBlockGlsl() {
+  using SystemConstants = SpirvShaderTranslator::SystemConstants;
+  std::string source = fmt::format(
+      "layout(set = {}, binding = {}, std140) uniform XeSystemConstants {{\n",
+      uint32_t(SpirvShaderTranslator::kDescriptorSetConstants),
+      uint32_t(SpirvShaderTranslator::kConstantBufferSystem));
+  source += fmt::format("  layout(offset = {}) uint xe_flags;\n", offsetof(SystemConstants, flags));
+  for (uint32_t i = 0; i < 3; ++i) {
+    source += fmt::format("  layout(offset = {}) float xe_ndc_scale_{};\n",
+                          offsetof(SystemConstants, ndc_scale) + sizeof(float) * i, "xyz"[i]);
+  }
+  for (uint32_t i = 0; i < 3; ++i) {
+    source += fmt::format("  layout(offset = {}) float xe_ndc_offset_{};\n",
+                          offsetof(SystemConstants, ndc_offset) + sizeof(float) * i, "xyz"[i]);
+  }
+  for (uint32_t i = 0; i < 2; ++i) {
+    source += fmt::format(
+        "  layout(offset = {}) float xe_point_screen_diameter_to_ndc_radius_{};\n",
+        offsetof(SystemConstants, point_screen_diameter_to_ndc_radius) + sizeof(float) * i,
+        "xy"[i]);
+  }
+  source += "} xe_system_constants;\n";
+  return source;
+}
+
+std::string GetSmoothTessellationInterfaceGlsl(uint32_t interpolator_count, bool control) {
+  std::string source;
+  source += "in gl_PerVertex {\n  vec4 gl_Position;\n} gl_in[gl_MaxPatchVertices];\n";
+  source += control ? "out gl_PerVertex {\n  vec4 gl_Position;\n} gl_out[];\n"
+                    : "out gl_PerVertex {\n  vec4 gl_Position;\n};\n";
+  for (uint32_t i = 0; i < interpolator_count; ++i) {
+    source += fmt::format("layout(location = {0}) in vec4 xe_in_{0}[];\n", i);
+    source += fmt::format("layout(location = {0}) out vec4 xe_out_{0}{1};\n", i,
+                          control ? "[]" : "");
+  }
+  return source;
+}
+
+// The tessellation level of an edge grows with its length on screen and with
+// how much the normals at its ends differ: roughly sqrt(pixels * radians *
+// density), which keeps the curve within about a pixel. Shared edges get
+// exactly the same level in both triangles (precise, and symmetric in the two
+// ends), so the meshes stay closed.
+std::string GetSmoothTessellationControlShaderGlsl(uint32_t interpolator_count,
+                                                   uint32_t normal_location, uint32_t level) {
+  static const float kMaxLevels[] = {1.0f, 4.0f, 8.0f, 16.0f};
+  static const float kDensities[] = {0.0f, 0.25f, 0.5f, 1.0f};
+  level = std::min(level, uint32_t(3));
+  std::string source = "#version 450\n";
+  source += "layout(vertices = 3) out;\n";
+  source += GetSmoothTessellationSystemConstantsBlockGlsl();
+  source += GetSmoothTessellationInterfaceGlsl(interpolator_count, true);
+  source += fmt::format("const float kMaxLevel = {:.1f};\n", kMaxLevels[level]);
+  source += fmt::format("const float kDensity = {:.3f};\n", kDensities[level]);
+  source += fmt::format("#define XE_NORMAL xe_in_{}\n", normal_location);
+  source += R"(
+float XeEdgeLevel(vec3 normal_a, vec3 normal_b, vec2 screen_a, vec2 screen_b, bool on_screen) {
+  if (!on_screen) {
+    return 1.0;
+  }
+  precise float normal_lengths = dot(normal_a, normal_a) * dot(normal_b, normal_b);
+  precise float cosine = dot(normal_a, normal_b) * inversesqrt(max(normal_lengths, 1.0e-30));
+  // About the angle between the normals for small angles.
+  precise float bend = sqrt(2.0 * max(1.0 - cosine, 0.0));
+  precise float edge_length = distance(screen_a, screen_b);
+  precise float level = sqrt(edge_length * bend * kDensity);
+  return clamp(level, 1.0, kMaxLevel);
+}
+
+void main() {
+  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
+)";
+  for (uint32_t i = 0; i < interpolator_count; ++i) {
+    source += fmt::format("  xe_out_{0}[gl_InvocationID] = xe_in_{0}[gl_InvocationID];\n", i);
+  }
+  source += R"(
+  if (gl_InvocationID != 0) {
+    return;
+  }
+  vec4 p0 = gl_in[0].gl_Position;
+  vec4 p1 = gl_in[1].gl_Position;
+  vec4 p2 = gl_in[2].gl_Position;
+  // Strip connectors make no patch. Leave visibility to the clipper: the
+  // curved surface may extend beyond the original triangle's bounds.
+  if (p0 == p1 || p1 == p2 || p2 == p0) {
+    gl_TessLevelOuter[0] = 0.0;
+    gl_TessLevelOuter[1] = 0.0;
+    gl_TessLevelOuter[2] = 0.0;
+    gl_TessLevelInner[0] = 0.0;
+    return;
+  }
+  // Pixels per unit of the normalized device coordinates.
+  vec2 pixels = 0.5 / max(vec2(xe_system_constants.xe_point_screen_diameter_to_ndc_radius_x,
+                                xe_system_constants.xe_point_screen_diameter_to_ndc_radius_y),
+                           vec2(1.0e-9));
+  bool visible0 = p0.w > 1.0e-6;
+  bool visible1 = p1.w > 1.0e-6;
+  bool visible2 = p2.w > 1.0e-6;
+  vec2 s0 = visible0 ? p0.xy / p0.w * pixels : vec2(0.0);
+  vec2 s1 = visible1 ? p1.xy / p1.w * pixels : vec2(0.0);
+  vec2 s2 = visible2 ? p2.xy / p2.w * pixels : vec2(0.0);
+  vec3 n0 = XE_NORMAL[0].xyz;
+  vec3 n1 = XE_NORMAL[1].xyz;
+  vec3 n2 = XE_NORMAL[2].xyz;
+  // Outer level i is for the edge opposite vertex i. Its level depends only
+  // on that edge, including when the other vertex is behind the camera.
+  float level0 = XeEdgeLevel(n1, n2, s1, s2, visible1 && visible2);
+  float level1 = XeEdgeLevel(n2, n0, s2, s0, visible2 && visible0);
+  float level2 = XeEdgeLevel(n0, n1, s0, s1, visible0 && visible1);
+  gl_TessLevelOuter[0] = level0;
+  gl_TessLevelOuter[1] = level1;
+  gl_TessLevelOuter[2] = level2;
+  gl_TessLevelInner[0] = max(level0, max(level1, level2));
+}
+)";
+  return source;
+}
+
+// clip_constant and world_constant are indices in the vertex shader's float
+// constant buffer, of the rows making the clip position and the world position
+// from the same model-space vector.
+std::string GetSmoothTessellationEvaluationShaderGlsl(uint32_t interpolator_count,
+                                                      uint32_t position_location,
+                                                      uint32_t normal_location,
+                                                      uint32_t clip_constant,
+                                                      uint32_t world_constant,
+                                                      uint32_t float_constant_count) {
+  std::string source = "#version 450\n";
+  // With Vulkan's upper-left domain origin, cw preserves the input triangle's
+  // vertex order under the (u, v, w) -> (vertex 0, 1, 2) mapping below.
+  source += "layout(triangles, fractional_odd_spacing, cw) in;\n";
+  source += GetSmoothTessellationSystemConstantsBlockGlsl();
+  source += fmt::format(
+      "layout(set = {}, binding = {}, std140) uniform XeFloatConstants {{\n"
+      "  vec4 xe_float_constants[{}];\n"
+      "}};\n",
+      uint32_t(SpirvShaderTranslator::kDescriptorSetConstants),
+      uint32_t(SpirvShaderTranslator::kConstantBufferFloatVertex),
+      std::max(float_constant_count, uint32_t(1)));
+  source += GetSmoothTessellationInterfaceGlsl(interpolator_count, false);
+  source += fmt::format("#define XE_POSITION_IN xe_in_{}\n", position_location);
+  source += fmt::format("#define XE_POSITION_OUT xe_out_{}\n", position_location);
+  source += fmt::format("#define XE_NORMAL_IN xe_in_{}\n", normal_location);
+  source += fmt::format("#define XE_NORMAL_OUT xe_out_{}\n", normal_location);
+  source += fmt::format("const int kClipConstant = {};\n", clip_constant);
+  source += fmt::format("const int kWorldConstant = {};\n", world_constant);
+  // The position must be W rather than 1/W, with XY and Z not divided by it,
+  // for a displacement to stay linear.
+  source += fmt::format(
+      "const uint kPositionFormatMask = {}u;\nconst uint kPositionFormatLinear = {}u;\n",
+      uint32_t(SpirvShaderTranslator::kSysFlag_XYDividedByW |
+               SpirvShaderTranslator::kSysFlag_ZDividedByW |
+               SpirvShaderTranslator::kSysFlag_WNotReciprocal),
+      uint32_t(SpirvShaderTranslator::kSysFlag_WNotReciprocal));
+  source += R"(
+vec3 XeNormalize(vec3 v) {
+  return v * inversesqrt(max(dot(v, v), 1.0e-30));
+}
+
+// The midpoint normal of an edge for the quadratic normal patch.
+vec3 XeEdgeNormal(vec3 p_a, vec3 n_a, vec3 p_b, vec3 n_b) {
+  vec3 edge = p_b - p_a;
+  float v = 2.0 * dot(edge, n_a + n_b) / max(dot(edge, edge), 1.0e-30);
+  return XeNormalize(n_a + n_b - v * edge);
+}
+
+void main() {
+  precise vec3 b = gl_TessCoord;
+)";
+  for (uint32_t i = 0; i < interpolator_count; ++i) {
+    source += fmt::format(
+        "  xe_out_{0} = b.x * xe_in_{0}[0] + b.y * xe_in_{0}[1] + b.z * xe_in_{0}[2];\n", i);
+  }
+  source += R"(
+  precise vec4 position = b.x * gl_in[0].gl_Position + b.y * gl_in[1].gl_Position +
+                          b.z * gl_in[2].gl_Position;
+
+  vec3 p0 = XE_POSITION_IN[0].xyz;
+  vec3 p1 = XE_POSITION_IN[1].xyz;
+  vec3 p2 = XE_POSITION_IN[2].xyz;
+  vec3 n0 = XeNormalize(XE_NORMAL_IN[0].xyz);
+  vec3 n1 = XeNormalize(XE_NORMAL_IN[1].xyz);
+  vec3 n2 = XeNormalize(XE_NORMAL_IN[2].xyz);
+  // Each edge's inner control points: the points at a third of the edge,
+  // projected onto the tangent plane of the nearer corner. They depend only on
+  // the edge's ends, so shared edges curve the same way in both triangles.
+  vec3 b210 = (2.0 * p0 + p1 - dot(p1 - p0, n0) * n0) / 3.0;
+  vec3 b120 = (2.0 * p1 + p0 - dot(p0 - p1, n1) * n1) / 3.0;
+  vec3 b021 = (2.0 * p1 + p2 - dot(p2 - p1, n1) * n1) / 3.0;
+  vec3 b012 = (2.0 * p2 + p1 - dot(p1 - p2, n2) * n2) / 3.0;
+  vec3 b102 = (2.0 * p2 + p0 - dot(p0 - p2, n2) * n2) / 3.0;
+  vec3 b201 = (2.0 * p0 + p2 - dot(p2 - p0, n0) * n0) / 3.0;
+  vec3 e = (b210 + b120 + b021 + b012 + b102 + b201) / 6.0;
+  vec3 b111 = e + (e - (p0 + p1 + p2) / 3.0) * 0.5;
+  float u = b.x, v = b.y, w = b.z;
+  vec3 curved = p0 * (u * u * u) + p1 * (v * v * v) + p2 * (w * w * w) +
+                b210 * (3.0 * u * u * v) + b120 * (3.0 * u * v * v) +
+                b201 * (3.0 * u * u * w) + b021 * (3.0 * v * v * w) +
+                b102 * (3.0 * u * w * w) + b012 * (3.0 * v * w * w) +
+                b111 * (6.0 * u * v * w);
+  vec3 displacement = curved - (u * p0 + v * p1 + w * p2);
+
+  // World displacement to clip space: both come from one model-space vector,
+  // the world position through the rows c[world...world+2] and the clip
+  // position through c[clip...clip+3].
+  mat3 world_rows = transpose(mat3(xe_float_constants[kWorldConstant].xyz,
+                                   xe_float_constants[kWorldConstant + 1].xyz,
+                                   xe_float_constants[kWorldConstant + 2].xyz));
+  vec3 model = vec3(0.0);
+  if ((xe_system_constants.xe_flags & kPositionFormatMask) == kPositionFormatLinear &&
+      abs(determinant(world_rows)) > 1.0e-24) {
+    model = inverse(world_rows) * displacement;
+  } else {
+    displacement = vec3(0.0);
+  }
+  vec4 clip = vec4(dot(xe_float_constants[kClipConstant].xyz, model),
+                   dot(xe_float_constants[kClipConstant + 1].xyz, model),
+                   dot(xe_float_constants[kClipConstant + 2].xyz, model),
+                   dot(xe_float_constants[kClipConstant + 3].xyz, model));
+  // The guest to host viewport transformation the vertex shader applied.
+  clip.xyz = clip.xyz * vec3(xe_system_constants.xe_ndc_scale_x,
+                             xe_system_constants.xe_ndc_scale_y,
+                             xe_system_constants.xe_ndc_scale_z) +
+             vec3(xe_system_constants.xe_ndc_offset_x, xe_system_constants.xe_ndc_offset_y,
+                  xe_system_constants.xe_ndc_offset_z) * clip.w;
+  gl_Position = position + clip;
+  XE_POSITION_OUT.xyz += displacement;
+
+  // Quadratic normals, so the shading follows the curve.
+  vec3 n110 = XeEdgeNormal(p0, n0, p1, n1);
+  vec3 n011 = XeEdgeNormal(p1, n1, p2, n2);
+  vec3 n101 = XeEdgeNormal(p2, n2, p0, n0);
+  XE_NORMAL_OUT.xyz = XeNormalize(n0 * (u * u) + n1 * (v * v) + n2 * (w * w) + n110 * (u * v) +
+                                  n011 * (v * w) + n101 * (w * u));
+}
+)";
+  return source;
+}
+
 }  // namespace
 
 VulkanPipelineCache::VulkanPipelineCache(VulkanCommandProcessor& command_processor,
@@ -1249,6 +1495,13 @@ void VulkanPipelineCache::Shutdown() {
     }
   }
   tessellation_control_shaders_.clear();
+  for (const auto& smooth_tessellation_shader_pair : smooth_tessellation_shaders_) {
+    if (smooth_tessellation_shader_pair.second != VK_NULL_HANDLE) {
+      dfn.vkDestroyShaderModule(device, smooth_tessellation_shader_pair.second, nullptr);
+    }
+  }
+  smooth_tessellation_shaders_.clear();
+  smooth_tessellation_translations_.clear();
   for (const auto& geometry_shader_pair : geometry_shaders_) {
     if (geometry_shader_pair.second != VK_NULL_HANDLE) {
       dfn.vkDestroyShaderModule(device, geometry_shader_pair.second, nullptr);
@@ -2288,6 +2541,14 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
       }
     }
   }
+  // A triangle list curved as patches - the command processor checked the
+  // vertex shader with GetSmoothTessellationShaders.
+  if (primitive_processing_result.triangle_patches && smooth_tessellation_level_ && !tessellated &&
+      primitive_processing_result.host_primitive_type == xenos::PrimitiveType::kTriangleList &&
+      geometry_shader == PipelineGeometryShader::kNone) {
+    primitive_topology = PipelinePrimitiveTopology::kPatchList;
+    description_out.smooth_tessellation = smooth_tessellation_level_;
+  }
   description_out.geometry_shader = geometry_shader;
   description_out.primitive_topology = primitive_topology;
   description_out.primitive_restart = primitive_processing_result.host_primitive_reset_enabled;
@@ -2359,8 +2620,8 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
   } else {
     description_out.polygon_mode = PipelinePolygonMode::kFill;
   }
-  if (tessellated && REXCVAR_GET(vulkan_tessellation_wireframe) &&
-      device_properties.fillModeNonSolid) {
+  if ((tessellated || description_out.smooth_tessellation) &&
+      REXCVAR_GET(vulkan_tessellation_wireframe) && device_properties.fillModeNonSolid) {
     description_out.polygon_mode = PipelinePolygonMode::kLine;
   }
 
@@ -2418,6 +2679,12 @@ bool VulkanPipelineCache::ArePipelineRequirementsMet(const PipelineDescription& 
           ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT
           : VK_SHADER_STAGE_VERTEX_BIT;
   if (!(guest_shader_vertex_stages_ & vertex_shader_stage)) {
+    return false;
+  }
+  if (description.smooth_tessellation &&
+      (vertex_shader_stage != VK_SHADER_STAGE_VERTEX_BIT ||
+       description.primitive_topology != PipelinePrimitiveTopology::kPatchList ||
+       !(guest_shader_vertex_stages_ & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT))) {
     return false;
   }
 
@@ -2589,6 +2856,95 @@ VkShaderModule VulkanPipelineCache::GetTessellationControlShader(
   }
   tessellation_control_shaders_.emplace(key, shader_module);
   return shader_module;
+}
+
+bool VulkanPipelineCache::GetSmoothTessellationShaders(
+    const VulkanShader::VulkanTranslation& vertex_shader, VkShaderModule& control_shader_out,
+    VkShaderModule& evaluation_shader_out, uint32_t level) {
+  control_shader_out = VK_NULL_HANDLE;
+  evaluation_shader_out = VK_NULL_HANDLE;
+  if (!level) {
+    level = smooth_tessellation_level_;
+  }
+  if (!level || !(guest_shader_vertex_stages_ & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) {
+    return false;
+  }
+  const auto& shader = static_cast<const VulkanShader&>(vertex_shader.shader());
+  std::lock_guard<std::mutex> lock(smooth_tessellation_shaders_mutex_);
+  auto key = std::make_tuple(shader.ucode_data_hash(), vertex_shader.modification(), level);
+  auto translation_it = smooth_tessellation_translations_.find(key);
+  if (translation_it != smooth_tessellation_translations_.end()) {
+    control_shader_out = translation_it->second.control;
+    evaluation_shader_out = translation_it->second.evaluation;
+    return control_shader_out != VK_NULL_HANDLE && evaluation_shader_out != VK_NULL_HANDLE;
+  }
+  SmoothTessellationShaderPair& pair = smooth_tessellation_translations_[key];
+
+  // Only the interpolators and the position go to the next stage: no point
+  // parameters, and no clip or cull distances, which the evaluation shader
+  // doesn't write.
+  const SmoothTessellationLayout* layout = shader.GetSmoothTessellationLayout();
+  SpirvShaderTranslator::Modification modification(vertex_shader.modification());
+  uint32_t interpolator_mask = modification.vertex.interpolator_mask;
+  if (!layout ||
+      modification.vertex.host_vertex_shader_type != Shader::HostVertexShaderType::kVertex ||
+      modification.vertex.output_point_parameters || modification.vertex.user_clip_plane_count ||
+      modification.vertex.vertex_kill_and ||
+      !(interpolator_mask & (UINT32_C(1) << layout->position_interpolator)) ||
+      !(interpolator_mask & (UINT32_C(1) << layout->normal_interpolator))) {
+    return false;
+  }
+  // The rows are registers the shader reads, so they stay consecutive when the
+  // shader's float constants are packed.
+  const Shader::ConstantRegisterMap& constant_map = shader.constant_register_map();
+  uint32_t clip_constant = constant_map.GetPackedFloatConstantIndex(layout->clip_constant);
+  uint32_t world_constant = constant_map.GetPackedFloatConstantIndex(layout->world_constant);
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (clip_constant == UINT32_MAX || world_constant == UINT32_MAX ||
+        constant_map.GetPackedFloatConstantIndex(layout->clip_constant + i) != clip_constant + i ||
+        (i < 3 && constant_map.GetPackedFloatConstantIndex(layout->world_constant + i) !=
+                      world_constant + i)) {
+      return false;
+    }
+  }
+  uint32_t interpolator_count = rex::bit_count(interpolator_mask);
+  uint32_t position_location = rex::bit_count(
+      interpolator_mask & ((UINT32_C(1) << layout->position_interpolator) - 1));
+  uint32_t normal_location =
+      rex::bit_count(interpolator_mask & ((UINT32_C(1) << layout->normal_interpolator) - 1));
+
+  auto get_module = [&](VkShaderStageFlagBits stage, std::string source) {
+    auto it = smooth_tessellation_shaders_.find(source);
+    if (it != smooth_tessellation_shaders_.end()) {
+      return it->second;
+    }
+    VkShaderModule shader_module = VK_NULL_HANDLE;
+    std::vector<uint32_t> shader_spirv;
+    std::string compile_error;
+    if (command_processor_.CompileGlslToSpirv(stage, source, shader_spirv, compile_error)) {
+      shader_module = ui::vulkan::util::CreateShaderModule(command_processor_.GetVulkanDevice(),
+                                                           shader_spirv.data(),
+                                                           sizeof(uint32_t) * shader_spirv.size());
+      if (shader_module == VK_NULL_HANDLE) {
+        REXGPU_ERROR("VulkanPipelineCache: Failed to create a smooth tessellation shader module");
+      }
+    } else {
+      REXGPU_ERROR("VulkanPipelineCache: Failed to compile a smooth tessellation shader: {}",
+                   compile_error);
+    }
+    smooth_tessellation_shaders_.emplace(std::move(source), shader_module);
+    return shader_module;
+  };
+  pair.control = get_module(
+      VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+      GetSmoothTessellationControlShaderGlsl(interpolator_count, normal_location, level));
+  pair.evaluation = get_module(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                               GetSmoothTessellationEvaluationShaderGlsl(
+                                   interpolator_count, position_location, normal_location,
+                                   clip_constant, world_constant, constant_map.float_count));
+  control_shader_out = pair.control;
+  evaluation_shader_out = pair.evaluation;
+  return control_shader_out != VK_NULL_HANDLE && evaluation_shader_out != VK_NULL_HANDLE;
 }
 
 bool VulkanPipelineCache::GetGeometryShaderKey(
@@ -3793,6 +4149,17 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
     }
   }
 
+  VkShaderModule tessellation_evaluation_shader = VK_NULL_HANDLE;
+  if (description.smooth_tessellation) {
+    if (tessellated ||
+        !GetSmoothTessellationShaders(*vertex_shader, tessellation_control_shader,
+                                      tessellation_evaluation_shader,
+                                      description.smooth_tessellation)) {
+      return fail("smooth_tessellation_shaders_unavailable");
+    }
+    tessellation_patch_control_points = 3;
+  }
+
   VkShaderModule geometry_shader = VK_NULL_HANDLE;
   GeometryShaderKey geometry_shader_key;
   if (GetGeometryShaderKey(description.geometry_shader, vertex_shader_modification,
@@ -3842,6 +4209,7 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
   creation_arguments.pixel_shader = for_placeholder ? nullptr : pixel_shader;
   creation_arguments.tessellation_vertex_shader = tessellation_vertex_shader;
   creation_arguments.tessellation_control_shader = tessellation_control_shader;
+  creation_arguments.tessellation_evaluation_shader = tessellation_evaluation_shader;
   creation_arguments.tessellation_patch_control_points = tessellation_patch_control_points;
   creation_arguments.geometry_shader = geometry_shader;
   creation_arguments.render_pass = render_pass;
@@ -3907,6 +4275,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
   bool tessellated = description.primitive_topology == PipelinePrimitiveTopology::kPatchList;
+  bool smooth_tessellation = description.smooth_tessellation != 0;
 
   std::array<VkPipelineShaderStageCreateInfo, 5> shader_stages;
   uint32_t shader_stage_count = 0;
@@ -3916,7 +4285,31 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   if (!creation_arguments.vertex_shader->is_valid()) {
     return false;
   }
-  if (tessellated) {
+  if (smooth_tessellation) {
+    // The guest vertex shader, then the patch curved by the host's shaders.
+    if (creation_arguments.tessellation_control_shader == VK_NULL_HANDLE ||
+        creation_arguments.tessellation_evaluation_shader == VK_NULL_HANDLE ||
+        creation_arguments.tessellation_patch_control_points != 3) {
+      return false;
+    }
+    const VkShaderStageFlagBits stages[] = {VK_SHADER_STAGE_VERTEX_BIT,
+                                            VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                                            VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT};
+    const VkShaderModule modules[] = {creation_arguments.vertex_shader->shader_module(),
+                                      creation_arguments.tessellation_control_shader,
+                                      creation_arguments.tessellation_evaluation_shader};
+    for (uint32_t i = 0; i < 3; ++i) {
+      VkPipelineShaderStageCreateInfo& shader_stage = shader_stages[shader_stage_count++];
+      shader_stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+      shader_stage.pNext = nullptr;
+      shader_stage.flags = 0;
+      shader_stage.stage = stages[i];
+      shader_stage.module = modules[i];
+      assert_true(shader_stage.module != VK_NULL_HANDLE);
+      shader_stage.pName = "main";
+      shader_stage.pSpecializationInfo = nullptr;
+    }
+  } else if (tessellated) {
     if (creation_arguments.tessellation_vertex_shader == VK_NULL_HANDLE ||
         creation_arguments.tessellation_control_shader == VK_NULL_HANDLE ||
         !creation_arguments.tessellation_patch_control_points) {

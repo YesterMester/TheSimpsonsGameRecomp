@@ -3,9 +3,16 @@
 #include <algorithm>
 #include <unordered_set>
 
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
 #include <rex/graphics/d3d11/profile.h>
 #include <rex/graphics/d3d11/shared_memory.h>
 #include <rex/graphics/d3d11/texture_cache.h>
+
+REXCVAR_DEFINE_BOOL(d3d11_native_resolve_textures, true, "GPU/D3D11",
+                    "Copy resolved render targets straight into the textures that sample the "
+                    "result, instead of decoding them again from the resolved memory");
 
 namespace rex::graphics::d3d11 {
 
@@ -464,6 +471,11 @@ bool D3D11RenderTargetCache::Resolve(D3D11SharedMemory& shared_memory, D3D11Text
     return Fail("Unable to obtain native resolve register and rectangle data");
   if (!resolve.coordinate_info.width_div_8 || !resolve.height_div_8)
     return true;
+  // Textures sampling the destination must be found while their data still
+  // matches memory, before the resolved range is invalidated.
+  NativeResolveCopy native_copy;
+  if (resolve.copy_dest_extent_length && REXCVAR_GET(d3d11_native_resolve_textures))
+    PlanNativeResolveCopy(resolve, textures, native_copy);
   if (resolve.copy_dest_extent_length) {
     bool scaled = IsDrawResolutionScaled();
     draw_util::ResolveCopyShaderConstants constants;
@@ -541,6 +553,9 @@ bool D3D11RenderTargetCache::Resolve(D3D11SharedMemory& shared_memory, D3D11Text
     // pages from being replaced by a stale CPU upload. Both resolution copies
     // preserve neighboring bytes in partially written pages.
     textures.MarkRangeAsResolved(resolve.copy_dest_extent_start, resolve.copy_dest_extent_length);
+    // The textures sampling it get the render target's pixels directly, so
+    // they match the memory again without being decoded from it.
+    PerformNativeResolveCopy(native_copy, textures);
     written_address = resolve.copy_dest_extent_start;
     written_length = resolve.copy_dest_extent_length;
   }
@@ -548,6 +563,87 @@ bool D3D11RenderTargetCache::Resolve(D3D11SharedMemory& shared_memory, D3D11Text
   if ((resolve.IsClearingDepth() || resolve.IsClearingColor()) && !ResolveClear(resolve))
     return false;
   return true;
+}
+
+void D3D11RenderTargetCache::PlanNativeResolveCopy(const draw_util::ResolveInfo& resolve,
+                                                   D3D11TextureCache& textures,
+                                                   NativeResolveCopy& copy) {
+  copy.target_count = 0;
+  // A whole single-sampled color render target at the destination's origin,
+  // copied without conversion: only the 8_8_8_8 and 2_10_10_10 families, no
+  // exponent bias or gamma, and the destination texel layout the same.
+  const draw_util::ResolveEdramInfo& edram = resolve.color_edram_info;
+  if (resolve.IsCopyingDepth() || resolve.copy_dest_info.copy_dest_array ||
+      edram.msaa_samples != xenos::MsaaSamples::k1X || resolve.rect_x0 || resolve.rect_y0 ||
+      resolve.copy_dest_info.copy_dest_exp_bias ||
+      uint32_t(resolve.copy_dest_info.copy_dest_endian) > uint32_t(xenos::Endian::k16in32))
+    return;
+  auto guest_format = xenos::ColorRenderTargetFormat(edram.format);
+  if (guest_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA ||
+      !xenos::IsColorResolveFormatBitwiseEquivalent(
+          guest_format, xenos::ColorFormat(resolve.copy_dest_info.copy_dest_format)))
+    return;
+  uint32_t base, row_length, rows, pitch;
+  resolve.GetCopyEdramTileSpan(base, row_length, rows, pitch);
+  std::vector<ResolveCopyDumpRectangle> rectangles;
+  GetResolveCopyRectanglesToDump(base, row_length, rows, pitch, rectangles);
+  if (rectangles.size() != 1)
+    return;
+  const ResolveCopyDumpRectangle& rectangle = rectangles.front();
+  if (rectangle.row_first || rectangle.rows != rows || rectangle.row_first_start ||
+      rectangle.row_last_end != row_length)
+    return;
+  auto& source = *static_cast<NativeRenderTarget*>(rectangle.render_target);
+  RenderTargetKey key = source.key();
+  xenos::ColorRenderTargetFormat source_format = key.GetColorFormat();
+  if (key.is_depth || key.base_tiles != resolve.color_original_base ||
+      key.msaa_samples != xenos::MsaaSamples::k1X || key.GetPitchTiles() != edram.pitch_tiles ||
+      (source_format != xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+       source_format != xenos::ColorRenderTargetFormat::k_2_10_10_10 &&
+       source_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10))
+    return;
+  ID3D11Texture2D* image = source.surface->image();
+  if (!image)
+    return;
+  D3D11_TEXTURE2D_DESC image_desc;
+  image->GetDesc(&image_desc);
+  uint32_t scale_x = GetRenderTargetScaleX(key), scale_y = GetRenderTargetScaleY(key);
+  uint32_t x1 = uint32_t(resolve.coordinate_info.width_div_8) << xenos::kResolveAlignmentPixelsLog2;
+  uint32_t y1 = resolve.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
+  uint32_t dest_pitch = uint32_t(resolve.copy_dest_coordinate_info.pitch_aligned_div_32)
+                        << xenos::kTextureTileWidthHeightLog2;
+  D3D11TextureCache::NativeResolveTarget found[D3D11TextureCache::kMaxNativeResolveTargets];
+  uint32_t found_count = textures.FindNativeResolveTargets(
+      resolve.copy_dest_base_raw, dest_pitch,
+      xenos::TextureFormat(resolve.copy_dest_info.copy_dest_format),
+      xenos::Endian(resolve.copy_dest_info.copy_dest_endian), IsDrawResolutionScaled(), found);
+  for (uint32_t i = 0; i < found_count; ++i) {
+    // The whole texture must come from the copied rectangle.
+    if (found[i].width > x1 || found[i].height > y1 ||
+        found[i].width * scale_x > image_desc.Width ||
+        found[i].height * scale_y > image_desc.Height)
+      continue;
+    copy.targets[copy.target_count++] = found[i];
+  }
+  copy.source = image;
+  copy.scale_x = scale_x;
+  copy.scale_y = scale_y;
+  copy.red_blue_swapped = resolve.copy_dest_info.copy_dest_swap != 0;
+}
+
+void D3D11RenderTargetCache::PerformNativeResolveCopy(const NativeResolveCopy& copy,
+                                                      D3D11TextureCache& textures) {
+  for (uint32_t i = 0; i < copy.target_count; ++i) {
+    const auto& target = copy.targets[i];
+    D3D11_BOX box = {0, 0, 0, target.width * copy.scale_x, target.height * copy.scale_y, 1};
+    GpuSwitch(GpuCategory::kResolveCopies);
+    device_.context()->CopySubresourceRegion(target.resource, 0, 0, 0, 0, copy.source, 0, &box);
+    textures.EndNativeResolveWrite(target, copy.red_blue_swapped);
+    if (++native_resolve_copies_ <= 8 || !(native_resolve_copies_ & 4095)) {
+      REXGPU_INFO("[d3d11-native-resolve] {} resolves copied into the textures sampling them",
+                  native_resolve_copies_);
+    }
+  }
 }
 
 bool D3D11RenderTargetCache::ResolveClear(const draw_util::ResolveInfo& resolve) {

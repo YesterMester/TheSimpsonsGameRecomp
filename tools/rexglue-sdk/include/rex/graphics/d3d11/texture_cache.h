@@ -39,6 +39,28 @@ class D3D11TextureCache final : public TextureCache {
                            std::vector<TextureSwizzle>& swizzles, std::string& error);
   const std::string& last_error() const { return last_error_; }
 
+  // Native resolves: a texture that samples exactly the memory a resolve
+  // writes (its base level starts at the destination, a single tiled 2D level
+  // with the resolve's row pitch, the same format and endianness, data that
+  // currently matches memory) gets the render target's pixels copied in
+  // directly instead of being decoded again from the resolved memory.
+  struct NativeResolveTarget {
+    // Opaque texture reference, valid within the resolve it was found for.
+    void* texture = nullptr;
+    ID3D11Resource* resource = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  static constexpr uint32_t kMaxNativeResolveTargets = 4;
+  // Must be called before the resolve marks its range as resolved.
+  uint32_t FindNativeResolveTargets(uint32_t dest_base, uint32_t dest_pitch_texels,
+                                    xenos::TextureFormat format, xenos::Endian endian, bool scaled,
+                                    NativeResolveTarget* targets_out);
+  // After the range is marked as resolved and the target's base level written
+  // (with red and blue swapped if the resolve swaps them): the texture matches
+  // the memory again.
+  void EndNativeResolveWrite(const NativeResolveTarget& target, bool red_blue_swapped);
+
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
@@ -81,7 +103,12 @@ class D3D11TextureCache final : public TextureCache {
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> volume_slice_write;
     std::vector<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>> mip_views;
     std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> views;
+    // The base level holds red and blue in the other order (copied from a
+    // render target by a resolve that swaps them); sampling swaps them back.
+    bool content_red_blue_swapped = false;
   };
+  // A host swizzle with red and blue exchanged, for content_red_blue_swapped.
+  static uint32_t SwapRedBlueSwizzle(uint32_t swizzle);
   static const HostFormat host_formats_[64];
   static NativeFormat GetNativeFormat(TextureKey key);
   const ShaderProgram* GetLoadProgram(LoadShaderIndex index, bool scaled);

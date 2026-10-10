@@ -425,6 +425,8 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> D3D11TextureCache::RequestSwapT
   texture->MarkAsUsed();
   format = texture->key().format;
   swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(texture->key()));
+  if (texture->content_red_blue_swapped)
+    swizzle = SwapRedBlueSwizzle(swizzle);
   scaled = texture->key().scaled_resolve;
   width = texture->key().GetWidth() * (scaled ? draw_resolution_scale_x() : 1);
   height = texture->key().GetHeight() * (scaled ? draw_resolution_scale_y() : 1);
@@ -968,8 +970,59 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& common_te
         return false;
     }
   }
+  if (load_base)
+    texture.content_red_blue_swapped = false;
   texture.MarkAsUsed();
   return !Failed(device_.device()->GetDeviceRemovedReason(), "Native guest texture decode");
+}
+
+uint32_t D3D11TextureCache::SwapRedBlueSwizzle(uint32_t swizzle) {
+  uint32_t swapped = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t component = (swizzle >> (3 * i)) & 0b111;
+    if (component == xenos::XE_GPU_TEXTURE_SWIZZLE_R) {
+      component = xenos::XE_GPU_TEXTURE_SWIZZLE_B;
+    } else if (component == xenos::XE_GPU_TEXTURE_SWIZZLE_B) {
+      component = xenos::XE_GPU_TEXTURE_SWIZZLE_R;
+    }
+    swapped |= component << (3 * i);
+  }
+  return swapped;
+}
+
+uint32_t D3D11TextureCache::FindNativeResolveTargets(uint32_t dest_base,
+                                                     uint32_t dest_pitch_texels,
+                                                     xenos::TextureFormat format,
+                                                     xenos::Endian endian, bool scaled,
+                                                     NativeResolveTarget* targets_out) {
+  dest_base &= 0x1FFFFFFF;
+  if (dest_base & 0xFFF)
+    return 0;
+  uint32_t count = 0;
+  ForEachTextureWithBasePage(dest_base >> 12, [&](Texture& common) {
+    const TextureKey& key = common.key();
+    if (count >= kMaxNativeResolveTargets || key.format != format || key.endianness != endian ||
+        !key.tiled || key.dimension != xenos::DataDimension::k2DOrStacked ||
+        key.depth_or_array_size_minus_1 || key.signed_separate ||
+        bool(key.scaled_resolve) != scaled || (uint32_t(key.pitch) << 5) != dest_pitch_texels ||
+        key.mip_max_level || common.GetGuestMipsSize() || common.outdated_mask())
+      return;
+    auto& texture = static_cast<D3D11Texture&>(common);
+    NativeResolveTarget& target = targets_out[count++];
+    target.texture = &texture;
+    target.resource = texture.resource.Get();
+    target.width = key.GetWidth();
+    target.height = key.GetHeight();
+  });
+  return count;
+}
+
+void D3D11TextureCache::EndNativeResolveWrite(const NativeResolveTarget& target,
+                                              bool red_blue_swapped) {
+  auto& texture = *static_cast<D3D11Texture*>(target.texture);
+  texture.content_red_blue_swapped = red_blue_swapped;
+  texture.MarkAsUsed();
+  MarkTextureBaseWrittenByGpu(texture);
 }
 
 ID3D11ShaderResourceView* D3D11TextureCache::GetOrCreateView(
@@ -1058,6 +1111,8 @@ bool D3D11TextureCache::BuildShaderBindings(std::span<const DxbcShader::TextureB
       }
       texture.MarkAsUsed();
       swizzle = binding->host_swizzle;
+      if (texture.content_red_blue_swapped)
+        swizzle = SwapRedBlueSwizzle(swizzle);
     }
     if (swizzle != kIdentityTextureSwizzle)
       swizzles.push_back({i + 1, swizzle});

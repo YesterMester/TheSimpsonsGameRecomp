@@ -5,6 +5,7 @@
 
 #include <rex/graphics/d3d11/render_target_encoder.h>
 #include <rex/graphics/d3d11/resolve_copy.h>
+#include <rex/graphics/d3d11/texture_cache.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/util/dxbc_render_target_transfer.h>
 
@@ -64,6 +65,20 @@ class D3D11RenderTargetCache final : public RenderTargetCache {
         : RenderTarget(key), surface(std::move(surface)) {}
     std::unique_ptr<RenderTargetSurface> surface;
   };
+  // A resolve whose destination textures get the render target copied in
+  // directly (d3d11_native_resolve_textures).
+  struct NativeResolveCopy {
+    ID3D11Texture2D* source = nullptr;
+    D3D11TextureCache::NativeResolveTarget targets[D3D11TextureCache::kMaxNativeResolveTargets];
+    uint32_t target_count = 0;
+    uint32_t scale_x = 1;
+    uint32_t scale_y = 1;
+    bool red_blue_swapped = false;
+  };
+  void PlanNativeResolveCopy(const draw_util::ResolveInfo& resolve, D3D11TextureCache& textures,
+                             NativeResolveCopy& copy);
+  void PerformNativeResolveCopy(const NativeResolveCopy& copy, D3D11TextureCache& textures);
+  uint64_t native_resolve_copies_ = 0;
   const ShaderProgram* TransferProgram(DxbcRenderTargetTransferShader::TransferShaderKey key,
                                        RenderTargetKey destination);
   bool PerformTransfers(std::span<RenderTarget* const> destinations,

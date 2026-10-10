@@ -752,14 +752,21 @@ bool ConvertShaderBytecode(std::span<const uint8_t> source, const ShaderBytecode
         program_index = i;
       } else if (fourcc == uint32_t(dxbc::BlobHeader::FourCC::kShaderFeatureInfo)) {
         Require(size == 8, "Invalid shader feature information");
-      } else {
-        Require(fourcc == uint32_t(dxbc::BlobHeader::FourCC::kResourceDefinition) ||
-                    fourcc == uint32_t(dxbc::BlobHeader::FourCC::kInputSignature) ||
-                    fourcc == uint32_t(dxbc::BlobHeader::FourCC::kOutputSignature) ||
-                    fourcc == uint32_t(dxbc::BlobHeader::FourCC::kOutputSignatureForGS) ||
-                    fourcc == uint32_t(dxbc::BlobHeader::FourCC::kPatchConstantSignature) ||
-                    fourcc == uint32_t(dxbc::BlobHeader::FourCC::kStatistics),
-                "Unsupported DXBC chunk in the DX11 shader input");
+      } else if (fourcc != uint32_t(dxbc::BlobHeader::FourCC::kResourceDefinition) &&
+                 fourcc != uint32_t(dxbc::BlobHeader::FourCC::kInputSignature) &&
+                 fourcc != uint32_t(dxbc::BlobHeader::FourCC::kOutputSignature) &&
+                 fourcc != uint32_t(dxbc::BlobHeader::FourCC::kOutputSignatureForGS) &&
+                 fourcc != uint32_t(dxbc::BlobHeader::FourCC::kPatchConstantSignature) &&
+                 fourcc != uint32_t(dxbc::BlobHeader::FourCC::kStatistics)) {
+        char name[5] = {char(fourcc), char(fourcc >> 8), char(fourcc >> 16), char(fourcc >> 24),
+                        0};
+        for (char& c : name) {
+          if (c && (c < 0x20 || c > 0x7E)) {
+            c = '?';
+          }
+        }
+        throw std::runtime_error(std::string("Unsupported DXBC chunk ") + name +
+                                 " in the DX11 shader input");
       }
     }
     Require(program_index != SIZE_MAX, "DXBC container has no shader program");

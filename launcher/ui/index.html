@@ -531,6 +531,17 @@
             <option value="5">16×</option>
           </select>
         </div>
+        <div class="field">
+          <label>Character tessellation</label>
+          <select id="s-character_tessellation">
+            <option value="off">Off (original geometry)</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
+          <div class="hint">Experimental. Rounds supported character meshes on Vulkan. Higher levels
+            cost more GPU time. Restart needed.</div>
+        </div>
       </div>
       <h3>Ink outlines</h3>
       <div class="grid">
@@ -562,6 +573,38 @@
           <input type="text" id="s-ink_outline_color" maxlength="7" placeholder="RRGGBB, e.g. FF8000"
             style="margin-top:8px">
           <div class="hint" id="inkcolorhint">Any colour as RRGGBB hex. Restart needed.</div>
+        </div>
+      </div>
+      <h3>Colour</h3>
+      <div class="grid">
+        <div class="field">
+          <label>Look</label>
+          <select id="s-color_preset">
+            <option value="original">Original</option>
+            <option value="vivid">Vivid</option>
+            <option value="punchy">Punchy</option>
+            <option value="soft">Soft</option>
+            <option value="custom">Custom…</option>
+          </select>
+          <div class="hint">Grades the final image: Vivid brings out muted colours, Punchy adds
+            contrast too, Soft is gentler than the original. Vulkan only. Restart needed.</div>
+        </div>
+        <div class="field colorfield">
+          <label>Vibrance: <span id="color_vibrance_label">0.00</span></label>
+          <input type="range" id="s-color_vibrance" min="-0.5" max="1" step="0.05" value="0">
+          <div class="hint">Saturates muted colours more than vivid ones.</div>
+        </div>
+        <div class="field colorfield">
+          <label>Saturation: <span id="color_saturation_label">1.00</span></label>
+          <input type="range" id="s-color_saturation" min="0" max="2" step="0.05" value="1">
+        </div>
+        <div class="field colorfield">
+          <label>Contrast: <span id="color_contrast_label">1.00</span></label>
+          <input type="range" id="s-color_contrast" min="0.8" max="1.2" step="0.01" value="1">
+        </div>
+        <div class="field colorfield">
+          <label>Brightness: <span id="color_brightness_label">0.00</span></label>
+          <input type="range" id="s-color_brightness" min="-0.1" max="0.1" step="0.01" value="0">
         </div>
       </div>
       <h3>Frame rate</h3>
@@ -956,6 +999,7 @@ function syncSelectLabel(sel){
   const wrap = sel.closest(".customselect");
   if (!wrap) return;
   const opt = sel.options[sel.selectedIndex];
+  wrap.querySelector(".customselect-trigger").disabled = sel.disabled;
   wrap.querySelector(".customselect-trigger .label").textContent = opt ? opt.textContent : "";
 }
 function syncAllSelectLabels(){
@@ -1534,6 +1578,13 @@ let settingsLoaded = false, saveTimer = null, savePending = false;
 function updateSharpnessField(){
   $("#fsrsharpfield").classList.toggle("hidden", $("#s-present_effect").value !== "fsr");
 }
+const COLOR_KEYS = ["color_vibrance", "color_saturation", "color_contrast", "color_brightness"];
+const COLOR_PRESETS = {
+  original: {color_vibrance: 0, color_saturation: 1, color_contrast: 1, color_brightness: 0},
+  vivid: {color_vibrance: 0.35, color_saturation: 1.1, color_contrast: 1.05, color_brightness: 0},
+  punchy: {color_vibrance: 0.5, color_saturation: 1.15, color_contrast: 1.1, color_brightness: 0},
+  soft: {color_vibrance: -0.1, color_saturation: 0.95, color_contrast: 0.95, color_brightness: 0.02},
+};
 async function loadSettings(){
   const s = await api.get("/api/settings"); const v = s.values;
   $("#s-fullscreen").value = String(v.fullscreen);
@@ -1553,6 +1604,12 @@ async function loadSettings(){
   $("#s-ink_outline_color").value = savedInkColor;
   updateInkFields(true);
   $("#s-eye_shading").value = v.eye_shading || "clean";
+  $("#s-character_tessellation").value =
+      ["off", "low", "medium", "high"].includes(v.character_tessellation)
+          ? v.character_tessellation : "off";
+  updateVulkanGraphicsFields();
+  for (const key of COLOR_KEYS) $(`#s-${key}`).value = v[key] ?? COLOR_PRESETS.original[key];
+  updateColorFields(true);
   $("#s-present_effect").value = v.present_effect || "bilinear";
   $("#s-present_fsr_sharpness_reduction").value = String(Number(v.present_fsr_sharpness_reduction));
   $("#s-anisotropic_override").value = String(v.anisotropic_override);
@@ -1600,6 +1657,8 @@ function settingsValues(){
     ink_outline_strength: Number($("#s-ink_outline_strength").value),
     ink_outline_color: inkColorValue(),
     eye_shading: $("#s-eye_shading").value,
+    character_tessellation: $("#s-character_tessellation").value,
+    ...Object.fromEntries(COLOR_KEYS.map(key => [key, Number($(`#s-${key}`).value)])),
     present_effect: $("#s-present_effect").value,
     present_fsr_sharpness_reduction: Number($("#s-present_fsr_sharpness_reduction").value),
     anisotropic_override: Number($("#s-anisotropic_override").value),
@@ -1643,6 +1702,17 @@ document.querySelectorAll("#tab-settings select, #tab-settings input").forEach(e
   el.addEventListener("change", scheduleSave);
 });
 $("#s-present_effect").addEventListener("change", updateSharpnessField);
+function updateVulkanGraphicsFields(){
+  const gpu = $("#s-gpu").value;
+  const unavailable = gpu !== "" && gpu !== "vulkan";
+  for (const key of ["character_tessellation", "color_preset", ...COLOR_KEYS]) {
+    const field = $(`#s-${key}`);
+    field.disabled = unavailable;
+    syncSelectLabel(field);
+    if (unavailable) field.closest(".customselect")?.classList.remove("open");
+  }
+}
+$("#s-gpu").addEventListener("change", updateVulkanGraphicsFields);
 /* ink outlines: strength only for soft lines, no colour without lines; the
    colour is a preset or a custom RRGGBB, and the swatch shows what is set */
 let savedInkColor = "000000";
@@ -1677,6 +1747,28 @@ $("#s-ink_outline_color").addEventListener("input", () => {
   updateInkFields(false);
   if (/^#?[0-9A-Fa-f]{6}$/.test($("#s-ink_outline_color").value.trim())) scheduleSave();
 });
+/* colour grading: presets fill the sliders, which show Custom once moved */
+function updateColorFields(fromLoad){
+  if (fromLoad) {
+    const current = Object.fromEntries(COLOR_KEYS.map(key => [key, Number($(`#s-${key}`).value)]));
+    const match = Object.entries(COLOR_PRESETS).find(([, preset]) =>
+        COLOR_KEYS.every(key => Math.abs(preset[key] - current[key]) < 1e-6));
+    $("#s-color_preset").value = match ? match[0] : "custom";
+  }
+  const custom = $("#s-color_preset").value === "custom";
+  document.querySelectorAll(".colorfield").forEach(el => el.classList.toggle("hidden", !custom));
+  for (const key of COLOR_KEYS) {
+    $(`#${key}_label`).textContent = Number($(`#s-${key}`).value).toFixed(2);
+  }
+}
+$("#s-color_preset").addEventListener("change", () => {
+  const preset = COLOR_PRESETS[$("#s-color_preset").value];
+  if (preset) for (const key of COLOR_KEYS) $(`#s-${key}`).value = preset[key];
+  updateColorFields(false);
+});
+for (const key of COLOR_KEYS) {
+  $(`#s-${key}`).addEventListener("input", () => updateColorFields(false));
+}
 $("#s-mnk_sensitivity").addEventListener("input", e => {
   $("#senslabel").textContent = Number(e.target.value).toFixed(1);
 });

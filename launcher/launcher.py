@@ -286,6 +286,15 @@ SETTINGS_SCHEMA = {
     # artists' no-rim-shadow flag with a tolerance, "original" keeps the
     # speckled shadow of the Xbox 360 game. Patched when the game loads.
     "eye_shading": ("str", "clean", True),
+    # Smooth supported character meshes with Vulkan tessellation; off keeps
+    # the original geometry. Higher levels add more triangles near the camera.
+    "character_tessellation": ("str", "off", True),
+    # Colour grading of the final image after gamma and FXAA (vibrance raises
+    # muted colours more than vivid ones); all neutral by default.
+    "color_vibrance": ("float", 0.0, True),
+    "color_saturation": ("float", 1.0, True),
+    "color_contrast": ("float", 1.0, True),
+    "color_brightness": ("float", 0.0, True),
     # Frame rate in levels (0 = unlimited) and in menus (30 as made, 0 = the
     # same as in levels); simpsons/src/frame_pacing.cpp.
     "frame_rate": ("int", 60, True),

@@ -49,7 +49,9 @@ The game boots, plays its videos, saves and loads, and runs its levels. See
   that emulates the Xbox 360's EDRAM in the pixel shader.
 - Native vertex and index buffers, texture uploads and render target copies for supported
   resources, with the Vulkan renderer on Linux and Windows. Changed data gets its own copy so
-  later frames cannot overwrite an earlier draw.
+  later frames cannot overwrite an earlier draw. Resolved images go straight into textures, and
+  the GPU copy of the Xbox 360's memory is only created if something still needs it: in checks
+  of all 18 episodes, most never create it.
 - Experimental Direct3D 11 renderer for Windows 10/11, for GPUs without good Vulkan or
   Direct3D 12 support. Choose it in the launcher's settings.
 - Audio fixes for late mixer wakeups and concurrent decoder updates, with native audio thread
@@ -59,6 +61,7 @@ The game boots, plays its videos, saves and loads, and runs its levels. See
 - Render resolution scaling (supersampling), anisotropic filtering and FXAA.
 - Free camera and photo mode, with controller and keyboard controls, zoom and HUD hiding.
 - Original, soft or disabled ink outlines, custom outline colours and cleaner character eyes.
+- Optional character tessellation and colour grading on Vulkan, on Linux and Windows.
 - Start episode selection for new games, and intro logo skipping across language folders.
 - Precise game-clock reads and even Havok steps at 60 FPS, with optional timing and audio
   diagnostics for investigating slowdowns.
@@ -208,6 +211,19 @@ the expected game data first and leaves an unsupported image untouched. Clean ey
 outlines change shader microcode, so those variants are translated at runtime and can cause a
 first-use shader compilation pause. Black outlines retain the existing shader variants.
 
+**Character tessellation.** The launcher offers Off (the default), Low, Medium and High on
+Vulkan. It rounds supported skinned character meshes from their existing positions and normals,
+adding more triangles where an edge is large on screen or bends sharply. Higher levels cost more
+GPU time. Unsupported shaders and meshes keep their original geometry; it does not add detail
+to scenery or textures. This is experimental and has not been checked across the full campaign.
+The setting is `character_tessellation` and requires a restart.
+
+**Colour.** Vulkan offers Original (neutral), Vivid, Punchy, Soft and Custom looks. Custom exposes
+vibrance, saturation, contrast and brightness. Vibrance raises muted colours more than vivid
+ones. The settings are `color_vibrance`, `color_saturation`, `color_contrast` and `color_brightness`;
+they require a restart. Colour grading shares the FXAA pass when it is enabled; without FXAA it
+uses a separate pass. Original skips colour grading entirely.
+
 **Start episode.** The launcher's **Patches** tab can start a new game in any of the 18 episodes.
 Existing saves keep their progress. The launcher keeps `simpsons_gameflow.lua.original` beside
 the modified gameflow script; choosing Land of Chocolate restores it exactly. If another tool
@@ -240,8 +256,11 @@ arming rates and intervals to the existing timer diagnostics.
 - If videos show a black screen on Windows, switch the graphics backend to Vulkan in the
   launcher's settings.
 - The Direct3D 11 renderer is experimental. It has been tested through Proton on a Steam Deck,
-  not yet on Windows drivers, and it is slower than Vulkan at higher render scales: in the tested
-  Springfield scene on the Deck, about 55 FPS at 1x and 22 FPS at 2x.
+  not yet on Windows drivers. Through Proton, if the log reports an unsupported `SHDR` shader
+  chunk, install Microsoft's shader compiler with `protontricks <app id> d3dcompiler_47`: Wine's
+  own compiler produces shaders the renderer cannot use yet. Windows includes the right one.
+- Character tessellation is experimental. It has been checked at every setting in a few
+  episodes, not across the whole campaign or on Windows drivers.
 - Native rendering is still being completed. Unsupported resources and resolves use the
   existing fallback. On Windows, the native resource paths have been tested with the Windows
   build through Proton on a Steam Deck, not yet on Windows drivers.
@@ -354,10 +373,11 @@ The goal is for this to be the best way to play the game. In rough order:
   ahead of time for the tested Vulkan configurations, native replacements for expensive shaders,
   matching render-to-texture copies done natively, and render targets sized like native ones.
   Supported vertex and index data now uses native buffers, with unchanged copies retained and
-  changed data checked before reuse. Supported CPU textures upload directly, and matching color
-  resolves keep separate texture images. Next: cover the remaining formats and resource aliases,
-  move resource creation to the game's own loading paths, and remove the remaining EDRAM and
-  memory-mirror fallbacks. See the [renderer notes](simpsons/re/native_renderer_plan.md) for
+  changed data checked before reuse. Supported CPU textures upload directly, resolves copy
+  straight into textures, and the GPU copy of the Xbox 360's memory is only created when
+  something still needs it. Next: cover the remaining formats and resource aliases, move resource
+  creation to the game's own loading paths, and remove the remaining EDRAM and memory-mirror
+  fallbacks. See the [renderer notes](simpsons/re/native_renderer_plan.md) for
   coverage and validation. A native renderer is also what the features below build on.
 - **No slowdowns or stutters.** A steady 60 FPS everywhere, including at 2x internal resolution
   on the Steam Deck, with no shader compilation hitches.
@@ -366,9 +386,9 @@ The goal is for this to be the best way to play the game. In rough order:
   GPU work to reach them (on the Steam Deck, Springfield runs at about 85 FPS at 1x and 70 FPS at
   2x unlimited), and checking scripted sequences across the campaign.
 - **Direct3D 11.** A native Windows 10/11 renderer for older GPUs, experimental since 0.0.6.4.
-  Next: resolve directly into native textures as the Vulkan renderer does (the round trip through
-  the Xbox memory layout is what slows it at higher render scales), and testing on Windows
-  drivers. See the [DX11 renderer notes](simpsons/re/d3d11_renderer.md).
+  Resolves now copy straight into native textures, as on Vulkan, instead of going through the
+  Xbox memory layout. Next: testing on Windows drivers. See the
+  [DX11 renderer notes](simpsons/re/d3d11_renderer.md).
 - **Widescreen.** Wider aspect ratios such as 21:9 without stretching.
 - **Controller prompts.** Button icons that match the controller you have connected (Xbox,
   PlayStation, Nintendo, Steam Deck), or your keyboard keys, in every in-game prompt, menu and

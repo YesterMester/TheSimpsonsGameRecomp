@@ -1,93 +1,55 @@
 You need your own copy of The Simpsons Game for Xbox 360. No game content is included; the
 launcher installs the game from your own ISO.
 
-### Performance and renderer
+### Frame rates above 60
 
-- Vertex and index data can use native GPU buffers instead of scanning and uploading the Xbox memory mirror for every draw. Unchanged buffers are retained; changed data gets a fresh immutable copy, and old copies stay alive until the GPU finishes with them.
-- Changing vertex data can reuse its latest immutable copy within a frame. Every reuse still checks the source bytes. This reduced vertex upload traffic by about 55% in the tested 2x Springfield scene.
-- Verified index bounds are retained with their exact buffer version instead of scanning the same indices again. Native texture uploads also bypass the full memory mirror for supported CPU textures.
-- Native buffer reuse checks use Linux's optimized byte comparisons and explicit SIMD batches on Windows, where larger ranges use AVX2 in the regular package. NoAVX2 builds keep their compatible path. Every source byte still has to match before a GPU buffer is reused.
-- The title and menus recover their 30 FPS target in the tested 2x scene. Renderer CPU time there fell from 45.4 ms to 17.7 ms after removing the vertex/index residency scans. This is a menu measurement; it does not establish the same gain throughout gameplay.
-- Matching render target transfers use GPU image copies. Native resolves can keep their results in their own GPU buffers, let texture reads use them directly, and update the memory mirror when something actually needs it. A partial CPU write preserves the untouched GPU-written pages.
-- Matching full color resolves copy into separate texture images. Image ownership stays stable across frames. Partial updates and forced memory reloads preserve channel order, including 10-bit color.
-- Copy-free resolves stay off by default. That experimental shortcut caused the development build to alternate between old frames, including in menus. The other native renderer work remains enabled.
-- On Linux, the timer queue sleeps between deadlines instead of continuously spinning. This frees CPU time for the game and audio. It has been checked with sound enabled.
-- More shader programs can be extracted from the executable and compiled before play. The bake now includes common shader modifications without requiring a recorded pipeline for each one. Missing draw variants and other Vulkan device configurations still use runtime translation.
-- The native fullscreen search shader advances its constant-table address once per sample, matching the original program. The previous version advanced it twice and could sample the wrong offsets.
-- Renderer comparisons cover menus, level arrival, Springfield and super burp at 1x and 2x. The compared images are identical. Full-game native GPU coverage is still unfinished.
-- The latest live Springfield checks average 59.5 FPS at 1x and 54.4–56.8 FPS at 2x on the Deck. These are short scene checks, not a full-game benchmark or proof of a consistent gameplay gain.
+- The launcher's *Frame rate in levels* setting offers 30, 60 (the default), 90, 120, 144, 165, 240 and Unlimited. 30 and 60 keep the game's own vblank timing; the other rates count each frame in fractional vblanks and pace frames with a precise limiter, so game time follows real time at every rate.
+- Havok physics keeps 1/59.94 s steps, 60 per second, at any rate. Background loading keeps at least the game's own frame period, so loading screens finish when frames are uncapped.
+- Menus, the title screen and the pause menu run their frame-counted logic (input repeat, timers, credits) at the 30 FPS they were made for, and by default are drawn at 30 too (*Frame rate in menus*). UI movies no longer run 1-4% slow.
+- Pick your display's refresh rate: a fixed-refresh display never shows the extra frames, and Unlimited drops them unevenly.
 
-### Frame timing
+### Graphics options
 
-- Game time runs at the right speed. Every read of the game's clock rounded a little time away and took a lock, and the game reads it constantly, so its time ran about 0.5% slow, with frames and vblanks at 59.65 Hz instead of 59.94. The clock is now computed from a fixed base without rounding or locking. Windows and Linux keep the full integer result when scaling that clock.
-- A frame that finishes just after its vblank is shown right away instead of a whole frame later. The game held every late frame for the next vblank, because showing it immediately would tear on the console; the PC presents without tearing either way, so this removes a source of stutter.
-- `tick_count_precise` reads the native millisecond clock directly, so late background timer updates cannot distort the game's frame time. Steady Havok stepping uses that clock's frame time instead of its smoothed copy, avoiding extra 8.3 ms physics steps at 60 FPS. Both are enabled by default; `physics_step` also offers Legacy and Original for comparison.
-- Windows requests a high-resolution timer again after audio initialization and opts out of Windows 11 timer throttling. This addresses the fork's reported game-speed drift at 30 FPS. These changes preserve the game's timebase and do not unlock rendering above 60 FPS.
+- Character tessellation (experimental, off by default): Low, Medium and High round the characters and other skinned meshes using their own positions and normals, adding triangles where an edge is large on screen or bends sharply. It works with Vulkan on Linux and Windows. Shaders and meshes it does not recognise keep their original geometry. Its helper shaders compile on first use.
+- Colour: Original (unchanged), Vivid, Punchy, Soft and Custom, with vibrance, saturation, contrast and brightness. Vibrance raises muted colours more than vivid ones. It shares the FXAA pass when FXAA is on and is skipped entirely at Original. Vulkan only.
+- Both settings are in the launcher's Settings tab and need a restart.
 
-### Camera and visual settings
+### Renderer
 
-- Free camera and photo mode: press L3 + R3 or F6 to toggle the camera, then Y or F8 for photo mode. Move with the left stick or WASD, look with the right stick or arrow keys, move vertically with the triggers or Q/E and zoom with LB/RB or 1/3. Photo mode pauses the level and hides the HUD and subtitles. Leaving a level releases the camera and its input lock.
-- Ink outlines can be Hard (original), Soft or Off, with soft-line strength, colour presets and a custom `RRGGBB` colour. Characters' eyes can be Clean (the default) or Original. These settings require a restart. Clean eyes and coloured outlines change shader microcode and can cause a first-use shader compilation pause; black outlines retain the existing shader variants.
-- Image patches verify the expected game data before writing. An unsupported executable is left untouched, and a failed protection change cannot leave a partial patch.
+- Special attacks and other effects no longer turn the scene black for about a second. Some effect passes resolve the scene and clear it in the same command, and a held-back copy-free resolve read the image after the clear. Seven captured failure frames and a live effect trace now match exactly at 1x and 2x, and recordings of repeated combos show no blackouts.
+- Copy-free resolves are on by default. In 0.0.6.4 they were off because live 2x play could alternate between old and new frames; the swap now flushes held-back resolves after opening its submission. Replays are bit-identical and 0.57 ms faster per frame on the GPU at 2x. The launcher turns them on once for existing installs; a player who turns them off afterwards keeps that choice.
+- The GPU copy of the Xbox 360's memory is created only when something needs it. Resolves that share memory write into one native buffer, fresh resolves take their initial data from guest memory, and textures only partly covered by native buffers are assembled from them. In new games of all 18 episodes at 2x, 16 never create it. Replayed gameplay frames are pixel-identical, with 0.3 ms (2x) to 0.9 ms (1x) less GPU time.
+- The rare frames where a depth buffer owned memory that a colour resolve read (seen in Eighty Bites and The Day the Earth Stood Stupid) now go through a native depth-to-colour transfer, keeping the depth and stencil bits, instead of the EDRAM emulation.
+- The shipped translated shader set matches the current translator again; in 0.0.6.4 its hash no longer matched, so about 95% of shaders were translated during play. It also serves more GPUs now: the configuration it checks holds only what the modules depend on, so a set made on the Steam Deck works on most desktop GPUs. In Springfield at 2x all 262 shaders come from it. Release builds stop if the set does not match the translator.
+- Retained vertex and index data is checked by hash instead of byte for byte, and found through a flat table: on the Deck at 1x in Springfield the GPU command thread drops from about 9.2 to 8.2 ms per frame.
+
+### CPU performance
+
+- Linux builds use the default code model and ThinLTO, and Windows builds use ThinLTO. On the Deck at 1x in Springfield with an unlimited frame rate, the code model change alone took the average from 90.0 to 91.9 FPS and the 1% lows from 67.3 to 69.5 FPS.
+- The game's memset and memcpy, the renderer's shader constant copies and the XDK's write-combined copies use the host's routines, and indirect calls are no longer counted in release builds: the main thread drops from about 10.45 to 10.0 ms per frame at 1x in Springfield.
+- At 30 and 60 FPS the game's frame limiter sleeps until shortly before its deadline instead of spinning. On the Deck at 2x and 60 FPS the APU drops from its 15 W limit to about 14.3 W and frames over 18 ms from about 41 to 29 in 1500.
 
 ### Direct3D 11 renderer (experimental, Windows)
 
-- Windows builds now include an experimental Direct3D 11 renderer for GPUs without good Vulkan or Direct3D 12 drivers. Choose *Direct3D 11 (experimental)* in the launcher's graphics backend setting, or set `gpu = "d3d11"`. Automatic still uses Vulkan, with Direct3D 12 as the fallback. It needs a feature level 11.0 GPU; vertex memexport needs 11.1.
-- It runs the game's own draws natively: shaders, textures, render targets and MSAA, depth, ownership transfers between render targets, tiled resolves, higher render scales, gamma and the launcher's FXAA, CAS and FSR1 settings.
-- Tested on a Steam Deck through Proton: the intro videos, menus, saves and Springfield at 1x and 2x, with movement, camera, pause and all presentation effects. It has not been tested on Windows drivers yet.
-- Performance in the tested Springfield scene on the Deck: about 55 FPS at 1x and 22 FPS at 2x, where 2x started at 13 FPS. At 2x it is limited by the GPU, because resolves still go through the Xbox memory layout; Vulkan resolves directly into textures. The title screen holds its 30 FPS.
-- Before this release, the work per frame was cut by uploading only the vertex data each draw reads, keeping state between draws instead of resetting it, updating constants in place, copying register blocks in bulk, writing depth and stencil in one pass and using the same depth settings as the other renderers.
-- Scaled resolve views are retained with their GPU allocation instead of being created again for each read or write. The cache is bounded; growing an allocation creates fresh views while earlier draws keep their original data.
-- Draws that discard rasterization keep their vertex work running and leave pixels untouched. Their stream-output setup now uses an explicit declaration, with vertex execution and unchanged render targets checked together.
-- Multisample helpers declare the native sample count and initialize unused load coordinates. Volume uploads bind the whole mip before applying a slice offset, keeping writes inside their intended slices on Windows and Proton.
-
-### Audio
-
-- Late mixer wakeups no longer trigger a burst of calls to the game's mixer. Requests for audio frames keep a steady schedule, stay at least half a frame apart, and wait with a high-resolution timer, so Windows' millisecond sleep granularity cannot slow the game's audio. With the Windows build on the Deck through Proton, normal play, four competing CPU workers, pause and resume ran without underruns with the 16- and 32-frame queues.
-- SDL writes, semaphore wakeups and diagnostic logging no longer hold the audio queue lock. A failed SDL write returns its consumed queue credit so a device error cannot permanently reduce the queue.
-- Audio queue settings are clamped before conversion to an unsigned value, so negative values no longer select the largest queue.
-- The scalar stereo downmix puts the rear left and right channels on their correct sides, matching the x64 path.
-- Decoder commits and mixer setters now publish only the fields they own. A delayed decode can no longer rewind a newer mixer read position or overwrite another audio update. Output positions publish their PCM samples before the mixer reads them.
-- Cancelled or already completed decode work is checked again after taking its context lock, preventing an older worker from claiming the same voice later.
-- The audio worker, decoder and game's DAC mixer request native audio scheduling. On Linux, the desktop priority service can grant it without running the game as root. Non-audio RenderWare workers retain their usual scheduling.
-- Mixer status queries read their own context word instead of copying the whole audio context.
-- In the tested 2x Springfield scene with four competing CPU workers, the 16-frame queue went from 119 underruns and 16 silent mixer blocks to zero of both. Normal play and pause/resume also pass. The minimum 4-frame queue can still underrun under this load. The Windows build was checked through Proton, as above, but not yet on Windows itself.
-- Optional audio diagnostics now report callback rate, time spent in the callback, wait lateness and queue depth. `audio_dump_file` records submitted six-channel PCM frames and companion monotonic timestamps for debugging; it is off by default. Physics step and hazard-damage logging is also available with `physics_log`.
+- Resolves of whole single-sampled colour render targets copy straight into the textures that read them, instead of being decoded again from the Xbox memory layout. Under Proton the first level renders the same with it on and off.
+- Under Proton, if the log reports an unsupported `SHDR` shader chunk, install Microsoft's `d3dcompiler_47` with protontricks; Wine's own compiler produces shaders the renderer cannot use yet. Windows includes the right one.
 
 ### Windows
 
-- Windows saves vector registers into the game's native setjmp storage with aligned stores. That storage is now always 16-byte aligned; an unaligned buffer crashed the Direct3D 11 test build at startup.
+- Windows packages now use the native renderer paths and the translated shader set, like Linux. In 2x Springfield runs through Proton on a Steam Deck this averaged 68.9 and 68.7 FPS against 63.1 and 63.6 with the previous Windows settings, with 1% lows of 51.6 and 52.5 against 39.0 and 37.3. With ThinLTO, 1x runs averaged 78.0 FPS against 76.2 and 76.7. Windows drivers themselves are still untested.
+
+### Linux
+
+- A crash or forced quit no longer leaves the game's memory file in /dev/shm, where enough of them made the next start fail with SIGBUS.
 
 ### Launcher
 
-- The graphics backend setting has a *Direct3D 11 (experimental)* choice on Windows.
-- New Linux runtime defaults also reach existing installs when the launcher writes their settings. Saved overrides, display settings and audio queue size are preserved.
-- Includes the launcher and runtime security fixes from 0.0.6.3.
-- The Patches tab can choose the starting episode for a new game from all 18 episodes. Existing saves keep their progress. The original gameflow script is backed up and restored byte for byte; external edits and ambiguous scripts are preserved instead of overwritten. Episode-specific progress requirements still need campaign testing.
-- Intro skipping supports the installed language folders and mixed-case movie names. Conflicting active and disabled copies are detected before renaming files.
-- Patch controls keep their selection while the launcher refreshes. Invalid custom outline colours keep the last valid saved colour. Free camera and photo mode keys can be rebound.
-- Failed game starts return the operating system's error to the Play tab and close their diagnostic output, instead of breaking the request with “Failed to fetch”. Save monitoring starts only after the game process starts.
-
-### Contributors
-
-- Thanks to [Frank Kitzing (frankyfife)](https://github.com/frankyfife) for the camera and photo mode, outline and eye controls, episode selection, multilingual intro skipping, Windows timing and guest-address fixes, Havok stepping and audio/physics diagnostics in [#43](https://github.com/YesterMester/TheSimpsonsGameRecomp/pull/43). His work is credited in the README and commit history.
+- New settings: level and menu frame rates, character tessellation and colour. FXAA's description explains that at 2x and above it costs about 1 ms a frame on the Deck for an image that is already supersampled.
 
 ### Known issues
 
-- Native GPU coverage is incomplete. Unsupported resource, shader and resolve cases still use the existing fallback.
-- At 2x, frame drops remain in busy areas. Further CPU and GPU performance work is needed.
-- The Direct3D 11 renderer is experimental: it is slower than Vulkan at higher render scales, has not been tested on Windows drivers, and in-engine cutscenes and most of the campaign have not been checked with it.
-- Under synthetic CPU saturation, the Windows build through Proton can still produce occasional silent mixer blocks despite having no output queue underruns. Native Windows audio needs further load testing.
-- Menus and the title screen run at 30 FPS, as the game's menus were made for. Rendering them at higher frame rates is planned.
-- Frame rate settings above 60 do not add frames, because the game's frame scheduler tops out at 60 FPS, and they make frame pacing less even. 60 is recommended. Proper 120 FPS and unlimited rendering remain future work.
-- At 60 FPS some scripted sequences can misbehave. Frank reported completing the affected "Lisa the Tree Hugger" section with the timing fixes, but the whole campaign still needs testing. If random deaths happen, switch to 30 for that section.
-- In-game prompts still show controller buttons. Press F1 to see which key each one is on.
-- Keyboard and mouse has been tested much less on Windows than on Linux and the Steam Deck. The new native resource defaults are qualified on Linux/Vulkan; Windows validation remains separate.
-
-### Installing
-
-- Windows: extract the zip and run `simpsons-launcher.exe`.
-- Linux and Steam Deck: extract the archive and run `Play.sh`.
-- CPU without AVX2 (most CPUs from before 2013): use the package ending in `-NoAVX2` instead.
-- In the launcher's Install tab, select your Xbox 360 ISO, then press Play.
-- Existing installs can update from the launcher's About tab.
+- Native GPU coverage is still incomplete. Unsupported resources and resolves use the existing fallback.
+- Character tessellation is experimental. It has been checked at every setting in a few episodes, not across the whole campaign or on Windows drivers.
+- Above 30 FPS some scripted sequences may still misbehave; switch to 30 if one does. The whole campaign has not been played at the higher rates.
+- The Direct3D 11 renderer is experimental and has not been tested on Windows drivers.
+- The minimum 4-frame audio queue can still underrun under heavy CPU load.

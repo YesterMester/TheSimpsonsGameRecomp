@@ -53,7 +53,13 @@ class VulkanSharedMemory : public SharedMemory {
     native_resolve_memory_flusher_ = std::move(flusher);
   }
 
-  VkBuffer buffer() const { return buffer_; }
+  // Creates the buffer if it's still deferred (gpu_memory_mirror_on_demand).
+  VkBuffer buffer() {
+    EnsureHostBuffer();
+    return buffer_;
+  }
+  bool EnsureHostBuffer() override;
+  bool host_buffer_created() const { return buffer_ != VK_NULL_HANDLE; }
 
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
@@ -74,6 +80,10 @@ class VulkanSharedMemory : public SharedMemory {
   TraceWriter& trace_writer_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
 
+  bool CreateBuffer();
+  void DestroyBuffer();
+  // The buffer is created only when something first uses the mirror.
+  bool buffer_deferred_ = false;
   VkBuffer buffer_ = VK_NULL_HANDLE;
   uint32_t buffer_memory_type_;
   // Single for non-sparse, every allocation so far for sparse.

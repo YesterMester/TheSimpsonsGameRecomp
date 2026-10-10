@@ -16,7 +16,9 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -121,6 +123,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool UseNativeResolveBufferRange(uint32_t address, uint32_t length,
                                    VkDescriptorBufferInfo& buffer_info, bool scaled = false);
   bool CanUseNativeResolveBufferRange(uint32_t address, uint32_t length, bool scaled);
+  // Whether a texture source not inside any one native resolve buffer can be
+  // assembled from those overlapping it and guest memory (with no other
+  // GPU-written data in it), and assembling it in a temporary buffer for the
+  // current submission.
+  bool CanComposeNativeResolveRange(uint32_t address, uint32_t length, bool scaled,
+                                    SharedMemory& shared_memory);
+  bool ComposeNativeResolveRange(uint32_t address, uint32_t length, bool scaled,
+                                 SharedMemory& shared_memory, VkDescriptorBufferInfo& buffer_info);
+  // Diagnostics: the native resolve buffers overlapping the range.
+  std::string DescribeNativeResolveBuffers(uint32_t address, uint32_t length, bool scaled);
   bool FlushNativeResolveMemory(uint32_t address, uint32_t length, bool scaled);
 
   Path GetPath() const override { return path_; }
@@ -1082,8 +1094,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipeline GetNativeResolvePipeline(NativeResolveShader shader, VkFormat dest_format);
   // Finds the host render target owning the whole resolve area and the textures
   // to write. Must be called before the memory range is marked as resolved.
+  // memory_only plans a resolve of only the memory, without any textures.
   bool PrepareNativeResolve(const draw_util::ResolveInfo& resolve_info,
-                            VulkanTextureCache& texture_cache, NativeResolvePlan& plan);
+                            VulkanTextureCache& texture_cache, NativeResolvePlan& plan,
+                            bool memory_only = false);
   bool TryNativeResolveImageCopy(VulkanTextureCache& texture_cache, const NativeResolvePlan& plan);
   // Records the texture writes (and with write_memory, the guest memory writes
   // in the first target's draw), and marks the textures as up to date - must be
@@ -1103,14 +1117,51 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                               const NativeResolvePlan& plan, VulkanSharedMemory& shared_memory,
                               VulkanTextureCache& texture_cache, bool source_original_resolution);
   struct NativeResolveBuffer;
+  // A part of a composed texture source: from a native buffer, or (null) guest
+  // memory.
+  struct ComposedSource {
+    NativeResolveBuffer* buffer;
+    uint32_t address;
+    uint32_t length;
+  };
+  bool GetComposedNativeResolveSources(uint32_t address, uint32_t length, bool scaled,
+                                       SharedMemory& shared_memory,
+                                       std::vector<ComposedSource>& sources_out);
+  // Records assembling the range from the sources at the offset of the buffer
+  // (the source barriers included, the destination's are the caller's).
+  bool RecordComposedNativeResolveRange(const std::vector<ComposedSource>& sources,
+                                        uint32_t address, bool scaled,
+                                        SharedMemory& shared_memory,
+                                        VkBuffer destination_buffer,
+                                        VkDeviceSize destination_offset);
   NativeResolveBuffer* AcquireNativeResolveBuffer(VkDeviceSize size);
   NativeResolveBuffer* FindNativeResolveBufferRange(uint32_t address, uint32_t length, bool scaled);
-  bool PrepareNativeResolveMemoryForWrite(uint32_t address, uint32_t length);
+  // Whether a resolve of the range to the base can write into the valid native
+  // buffer of a larger resolve (or of several) holding the range (see
+  // TryNativeResolveBuffer).
+  bool IsInValidNativeResolveBuffer(uint32_t address, uint32_t length, uint32_t base, bool scaled);
+  // Whether a native buffer other resolves build on overlaps the range: one
+  // still holding data (valid or with memory pending) of another extent, or one
+  // shared by resolves of several extents.
+  bool OverlapsLiveNativeResolveBuffer(uint32_t address, uint32_t length, bool scaled);
+  // Before a resolve writes the range: earlier native resolve results that
+  // only partly overlap it are copied to the mirror first, except those of
+  // the buffer the resolve writes into, which keeps them itself.
+  bool PrepareNativeResolveMemoryForWrite(uint32_t address, uint32_t length,
+                                          const NativeResolveBuffer* writing_into = nullptr);
   bool WriteBackNativeResolveBuffer(NativeResolveBuffer& buffer);
+  // Records copying guest memory bytes into the buffer (in the current
+  // submission, barriers are the caller's).
+  bool UploadGuestMemoryToBuffer(uint32_t address, uint32_t length, VkBuffer buffer,
+                                 VkDeviceSize offset);
   void ClearNativeResolveBuffers();
   // Uses the same global critical region as the shared-memory write watches.
   rex::thread::global_critical_region native_resolve_buffers_critical_region_;
   std::vector<std::unique_ptr<NativeResolveBuffer>> native_resolve_buffers_;
+  // Resolve destinations (bases) that resolves of several extents write - such
+  // as a bloom chain downsampling into the same memory. Their results always
+  // stay in native buffers, which the others build on.
+  std::unordered_set<uint32_t> multi_extent_resolve_bases_;
   uint64_t native_resolve_buffer_bytes_ = 0;
   bool native_resolve_memory_flushing_ = false;
 
@@ -1337,6 +1388,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t edram_snapshot_download_buffer_memory_type_ = UINT32_MAX;
   VkDeviceSize edram_snapshot_download_buffer_memory_size_ = 0;
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> edram_snapshot_restore_pool_;
+  // Guest memory bytes for native resolve buffers (UploadGuestMemoryToBuffer).
+  std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> native_resolve_upload_pool_;
   void ResetTraceDownload();
 
   // For pixel (fragment) shader interlock.

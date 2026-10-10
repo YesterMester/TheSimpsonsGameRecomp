@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -95,6 +96,22 @@ class SharedMemory {
   // which pages count as streamed (see RequestRanges).
   void OnGuestFrameEnd();
 
+  // Diagnostics (shared_memory_census): records a use of the mirror by the
+  // code at the return address caller, with a kind (1 + the backend's usage,
+  // or one of the kinds below for the scaled resolve buffer and copies of
+  // native resolve results into either).
+  static constexpr uint32_t kCensusKindScaledRead = 16;
+  static constexpr uint32_t kCensusKindScaledWrite = 17;
+  static constexpr uint32_t kCensusKindWriteBack = 18;
+  static constexpr uint32_t kCensusKindScaledWriteBack = 19;
+  static bool CensusEnabled();
+  static void CensusRecord(const void* caller, uint32_t kind, uint64_t bytes);
+  // The code a copy of native resolve results into a mirror is attributed to
+  // (set around the call that makes the copy happen).
+  static const void*& CensusTrigger();
+  // Diagnostics: the function at a code address, with the offset into it.
+  static std::string DescribeCodeAddress(const void* address);
+
   // For the trace player, which reports the memory it writes with exact
   // invalidations (no write faults): counts the writes as write faults, so
   // pages the trace rewrites every frame become streamed like in the game.
@@ -133,6 +150,9 @@ class SharedMemory {
   }
 
  protected:
+  // Creates the host GPU buffer if the implementation creates it only when
+  // first needed. Called before anything uses the mirror.
+  virtual bool EnsureHostBuffer() { return true; }
   // Native GPU resources may hold newer bytes than the compatibility mirror.
   // Called before requesting or overwriting a mirror range.
   virtual bool FlushGpuWrittenRange(uint32_t /*start*/, uint32_t /*length*/,
@@ -182,6 +202,7 @@ class SharedMemory {
   // overall bounds of pages to be uploaded.
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+  static void CensusLog();
   // For UploadRanges, after MakeRangeValid: copies guest pages to the upload
   // buffer, remembering what streamed pages were uploaded with (see
   // streamed_page_shadows_).

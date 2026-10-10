@@ -388,3 +388,55 @@ instead of building a separate renderer next to it. Stages, in order:
   float controls, image view swizzles, demote, sample rate shading, 2x MSAA support and
   32-bit draw indices, not only on identical drivers. Rebuilding with the new key changed no
   module; only the two configuration files differ.
+
+### Guest memory mirror (2026-10-09)
+
+- The last emulation stores on Vulkan are the GPU copy of guest memory (`SharedMemory`, a
+  512 MB sparse buffer) and, at resolution scale 2, the texture cache's scaled resolve
+  buffer (2 GB sparse). `shared_memory_census` (off by default) logs every caller of either
+  every 600 frames, with `[mirror-texture]`, `[mirror-resolve-initial]` and
+  `[mirror-resolve-write]` lines naming what still falls back.
+- The first census (2x) found the main copy touched only by one texture load per level
+  start, but the scaled buffer busy every frame wherever several resolves share memory. In
+  Eighty Bites a bloom chain resolves 640x360, then 320x184 twice, to 04B94000: the smaller
+  resolves got buffers of their own, so the larger one's buffer was copied to the scaled
+  buffer (to keep the bytes the smaller ones don't cover) and rebuilt from it next frame,
+  about 1,400 times in three minutes. Colossal Donut adds a 1280x720 resolve to the same
+  base.
+- Resolves now write into the native buffer of a larger resolve with the same base that
+  holds their range; marking the range as GPU-written no longer copies that buffer out
+  (`PrepareNativeResolveMemoryForWrite` takes it out of the pending set while it's written);
+  a resolve whose texture is smaller than its rectangle (320x180 vs 320x184) writes the
+  memory into that buffer with a memory-only pass before the texture-only one; and bases that
+  get resolves of several extents (remembered once seen) keep their resolves in the buffers
+  instead of texture-first. A buffer of only same-extent resolves is dropped without a copy
+  when a texture-first resolve replaces it.
+- The rest of the fallbacks were initial contents and partial coverage: resolves to memory
+  no GPU work has written take the bytes around the rectangle from guest memory (zero when
+  scaled, where nothing at the higher resolution exists); textures and resolves only partly
+  covered by native buffers are assembled from them and such fresh memory. The native
+  resolve buffer budget (`native_resolve_buffer_mb`) is now per scale pixel: at 2x every
+  full-screen target is 15 MB, so ten of them exceeded the old 128 MB and pushed resolves
+  back to the scaled buffer.
+- Both stores are now created only when something first uses them: the main copy always
+  (`gpu_memory_mirror_on_demand`), the scaled buffer when the GPU lacks sparse binding (it
+  would otherwise be a 2 GB allocation at startup).
+- Particle draws that index a few vertices past their stream's declared size (vertices 0..3
+  of a stream sized for three) now get native snapshots of guest memory too. The translated
+  fetch doesn't bound such reads, so the mirror path read whatever the mirror held there.
+- Result (census of all 18 episodes at 2x): 16 never touch either store and never create the
+  main copy. The other two (Eighty Bites, The Day the Earth Stood Stupid) hit the same rare
+  event during play: a 1280x2048 D24S8 depth target appears at EDRAM base 0 and takes over
+  the rows of the color target there, so the next front buffer resolves read from the depth
+  target (`[native-resolve-unplanned] ... source render target key differs, sources [depth
+  base 0 ...]`) and go through the EDRAM emulation for a few frames. Ownership is taken by
+  rows down to the draw's estimated maximum Y, so even a small pass with a full-screen
+  viewport claims the whole target. At 1x the bloom chain had used the main copy every frame
+  (a 1x resolve with a texture smaller than its rectangle went through the EDRAM copy); the
+  memory-only pass now covers 1x too.
+- Gameplay traces of Eighty Bites and Colossal Donut replay pixel-identical with the changes
+  on and off (`tools/bench/replay_ab.py`, cvars switching the new paths off), with 0.3-0.4 ms
+  less GPU time per frame at 2x and about 0.9 ms (17%) less at 1x. A first version that sent
+  every resolve with a native buffer through the buffer path cost 3.8 ms more (the
+  full-screen resolves packed 15 MB of memory each). Live FPS in Eighty Bites is unchanged;
+  the command processor's time per draw is the same or slightly lower.

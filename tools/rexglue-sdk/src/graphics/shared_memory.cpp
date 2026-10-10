@@ -14,8 +14,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <string>
+#include <vector>
 #include <utility>
 
+#include <fmt/format.h>
 #include <rex/assert.h>
 #include <rex/bit.h>
 #include <rex/cvar.h>
@@ -26,6 +29,15 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/perf/counter.h>
+
+#if REX_PLATFORM_LINUX
+#include <cxxabi.h>
+#include <dlfcn.h>
+#endif
+
+REXCVAR_DEFINE_BOOL(shared_memory_census, false, "GPU",
+                    "Log which code uses the guest memory mirror on the GPU and how much it "
+                    "uploads, every 600 frames (diagnostics)");
 
 REXCVAR_DEFINE_BOOL(gpu_stream_dynamic_pages, true, "GPU",
                     "Upload vertex and index data in pages the game rewrites every frame on "
@@ -170,6 +182,12 @@ void SharedMemory::ShutdownCommon() {
 }
 
 void SharedMemory::OnGuestFrameEnd() {
+  if (REXCVAR_GET(shared_memory_census)) {
+    static uint32_t census_frames = 0;
+    if (++census_frames % 600 == 0) {
+      CensusLog();
+    }
+  }
   bool enabled = REXCVAR_GET(gpu_stream_dynamic_pages);
   if (!enabled && !streamed_pages_active_) {
     return;
@@ -614,11 +632,145 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   watch_range_first_free_ = range;
 }
 
+namespace {
+// shared_memory_census: callers of the guest memory mirror, keyed by return
+// address and kind (0 for requests, 1 + VulkanSharedMemory::Usage for uses).
+struct CensusSlot {
+  std::atomic<uint64_t> key{0};
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> bytes{0};
+  std::atomic<uint64_t> uploaded{0};
+};
+constexpr size_t kCensusSlots = 512;
+CensusSlot g_census[kCensusSlots];
+// The requester the next upload is attributed to.
+thread_local CensusSlot* g_census_current = nullptr;
+// RequestRange's own caller, for the RequestRanges it forwards to.
+thread_local const void* g_census_caller = nullptr;
+
+CensusSlot* CensusSlotFor(const void* caller, uint32_t kind) {
+  // User-space addresses leave the top byte free for the kind.
+  uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(caller)) ^ (uint64_t(kind + 1) << 56);
+  size_t index = size_t((key ^ (key >> 29)) * 0x9E3779B97F4A7C15ull >> 55) % kCensusSlots;
+  for (size_t i = 0; i < kCensusSlots; ++i) {
+    CensusSlot& slot = g_census[(index + i) % kCensusSlots];
+    uint64_t current = slot.key.load(std::memory_order_relaxed);
+    if (current == key) {
+      return &slot;
+    }
+    if (!current) {
+      if (slot.key.compare_exchange_strong(current, key) || current == key) {
+        return &slot;
+      }
+    }
+  }
+  return nullptr;
+}
+}  // namespace
+
+const void*& SharedMemory::CensusTrigger() {
+  static thread_local const void* trigger = nullptr;
+  return trigger;
+}
+
+std::string SharedMemory::DescribeCodeAddress(const void* address) {
+  std::string name = fmt::format("{}", address);
+#if REX_PLATFORM_LINUX
+  Dl_info info;
+  if (dladdr(address, &info) && info.dli_sname) {
+    int status = 0;
+    char* demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+    name = fmt::format("{}+{:#x}", demangled && !status ? demangled : info.dli_sname,
+                       reinterpret_cast<uintptr_t>(address) -
+                           reinterpret_cast<uintptr_t>(info.dli_saddr));
+    std::free(demangled);
+  }
+#endif
+  return name;
+}
+
+bool SharedMemory::CensusEnabled() {
+  return REXCVAR_GET(shared_memory_census);
+}
+
+void SharedMemory::CensusRecord(const void* caller, uint32_t kind, uint64_t bytes) {
+  if (CensusSlot* slot = CensusSlotFor(caller, kind)) {
+    slot->calls.fetch_add(1, std::memory_order_relaxed);
+    slot->bytes.fetch_add(bytes, std::memory_order_relaxed);
+  }
+}
+
+void SharedMemory::CensusLog() {
+  struct Line {
+    uint64_t key, calls, bytes, uploaded;
+  };
+  std::vector<Line> lines;
+  for (CensusSlot& slot : g_census) {
+    uint64_t calls = slot.calls.exchange(0, std::memory_order_relaxed);
+    if (calls) {
+      lines.push_back({slot.key.load(std::memory_order_relaxed), calls,
+                       slot.bytes.exchange(0, std::memory_order_relaxed),
+                       slot.uploaded.exchange(0, std::memory_order_relaxed)});
+    }
+  }
+  std::sort(lines.begin(), lines.end(), [](const Line& a, const Line& b) {
+    return a.calls > b.calls;
+  });
+  REXGPU_INFO("[mirror-census] {} callers in the last 600 frames", lines.size());
+  for (const Line& line : lines) {
+    uint32_t kind = uint32_t(line.key >> 56) - 1;
+    std::string name = DescribeCodeAddress(
+        reinterpret_cast<const void*>(uintptr_t(line.key & ((uint64_t(1) << 56) - 1))));
+    std::string label = kind >= kCensusKindScaledRead
+                            ? std::string(kind == kCensusKindScaledRead    ? "scaled-read"
+                                          : kind == kCensusKindScaledWrite ? "scaled-write"
+                                          : kind == kCensusKindWriteBack   ? "writeback"
+                                                                           : "scaled-writeback")
+                        : kind ? fmt::format("use{}", kind - 1)
+                               : std::string("request");
+    REXGPU_INFO("[mirror-census] {} {:7} calls {:12} bytes {:10} uploaded  {}", label, line.calls,
+                line.bytes, line.uploaded, name.substr(0, 160));
+  }
+}
+
 bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
                                  bool allow_streamed) {
   rex::perf::ScopedCounterTimer upload_timer(rex::perf::CounterId::kCpUploadUs);
+  g_census_current = nullptr;
+  // Attributes copies of native resolve results into the mirror to the
+  // requester (see CensusTrigger).
+  struct CensusTriggerScope {
+    const void* previous = nullptr;
+    bool set = false;
+    void Set(const void* caller) {
+      previous = CensusTrigger();
+      CensusTrigger() = caller;
+      set = true;
+    }
+    ~CensusTriggerScope() {
+      if (set) {
+        CensusTrigger() = previous;
+      }
+    }
+  } census_trigger;
+  if (REXCVAR_GET(shared_memory_census) && ranges && count) {
+    uint64_t requested = 0;
+    for (size_t i = 0; i < count; ++i) {
+      requested += ranges[i].second;
+    }
+    const void* caller = g_census_caller ? g_census_caller : __builtin_return_address(0);
+    census_trigger.Set(caller);
+    g_census_current = CensusSlotFor(caller, 0);
+    if (g_census_current) {
+      g_census_current->calls.fetch_add(1, std::memory_order_relaxed);
+      g_census_current->bytes.fetch_add(requested, std::memory_order_relaxed);
+    }
+  }
   if (ranges == nullptr || !count) {
     return true;
+  }
+  if (!EnsureHostBuffer()) {
+    return false;
   }
 
   // A single range needs no merging, so it skips the heap-allocated, sorted
@@ -862,6 +1014,14 @@ bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* m
       }
     }
   }
+  if (g_census_current) {
+    uint64_t uploaded_pages = 0;
+    for (const auto& upload_range : upload_ranges_) {
+      uploaded_pages += upload_range.second;
+    }
+    g_census_current->uploaded.fetch_add(uploaded_pages << page_size_log2_,
+                                         std::memory_order_relaxed);
+  }
   bool uploaded = UploadRanges(upload_ranges_);
   upload_allow_streamed_ = false;
   return uploaded;
@@ -970,7 +1130,10 @@ void SharedMemory::CopyPagesForUpload(uint32_t page_first, uint32_t page_count, 
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length, bool allow_streamed) {
   std::pair<uint32_t, uint32_t> range(start, length);
-  return RequestRanges(&range, 1, allow_streamed);
+  g_census_caller = __builtin_return_address(0);
+  bool result = RequestRanges(&range, 1, allow_streamed);
+  g_census_caller = nullptr;
+  return result;
 }
 
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(

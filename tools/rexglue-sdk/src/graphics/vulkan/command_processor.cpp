@@ -1276,35 +1276,15 @@ bool VulkanCommandProcessor::SetupContext() {
         "EDRAM");
     return false;
   }
-  VkDescriptorBufferInfo
-      shared_memory_descriptor_buffers_info[SharedMemory::kBufferSize / (128 << 20)];
-  uint32_t shared_memory_binding_range =
-      SharedMemory::kBufferSize >> shared_memory_binding_count_log2;
-  for (uint32_t i = 0; i < shared_memory_binding_count; ++i) {
-    VkDescriptorBufferInfo& shared_memory_descriptor_buffer_info =
-        shared_memory_descriptor_buffers_info[i];
-    shared_memory_descriptor_buffer_info.buffer = shared_memory_->buffer();
-    shared_memory_descriptor_buffer_info.offset = VkDeviceSize(shared_memory_binding_range) * i;
-    shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
-  }
-  VkWriteDescriptorSet write_descriptor_sets[2];
-  VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
-  write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  write_descriptor_set_shared_memory.pNext = nullptr;
-  write_descriptor_set_shared_memory.dstSet = shared_memory_and_edram_descriptor_set_;
-  write_descriptor_set_shared_memory.dstBinding = 0;
-  write_descriptor_set_shared_memory.dstArrayElement = 0;
-  write_descriptor_set_shared_memory.descriptorCount = shared_memory_binding_count;
-  write_descriptor_set_shared_memory.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  write_descriptor_set_shared_memory.pImageInfo = nullptr;
-  write_descriptor_set_shared_memory.pBufferInfo = shared_memory_descriptor_buffers_info;
-  write_descriptor_set_shared_memory.pTexelBufferView = nullptr;
-  VkDescriptorBufferInfo edram_descriptor_buffer_info;
+  shared_memory_descriptor_written_ = false;
   if (edram_fragment_shader_interlock) {
+    // Every draw uses the EDRAM in the set, so it must be complete from the
+    // start - the guest memory part included.
+    VkDescriptorBufferInfo edram_descriptor_buffer_info;
     edram_descriptor_buffer_info.buffer = render_target_cache_->edram_buffer();
     edram_descriptor_buffer_info.offset = 0;
     edram_descriptor_buffer_info.range = VK_WHOLE_SIZE;
-    VkWriteDescriptorSet& write_descriptor_set_edram = write_descriptor_sets[1];
+    VkWriteDescriptorSet write_descriptor_set_edram;
     write_descriptor_set_edram.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     write_descriptor_set_edram.pNext = nullptr;
     write_descriptor_set_edram.dstSet = shared_memory_and_edram_descriptor_set_;
@@ -1315,9 +1295,11 @@ bool VulkanCommandProcessor::SetupContext() {
     write_descriptor_set_edram.pImageInfo = nullptr;
     write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
     write_descriptor_set_edram.pTexelBufferView = nullptr;
+    dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_edram, 0, nullptr);
+    if (!EnsureSharedMemoryDescriptor()) {
+      return false;
+    }
   }
-  dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock),
-                             write_descriptor_sets, 0, nullptr);
 
   // Swap objects.
 
@@ -3866,6 +3848,64 @@ bool VulkanCommandProcessor::CanUseNativeResolveBufferRange(uint32_t address, ui
   return render_target_cache_->CanUseNativeResolveBufferRange(address, length, scaled);
 }
 
+bool VulkanCommandProcessor::CanComposeNativeResolveRange(uint32_t address, uint32_t length,
+                                                          bool scaled) const {
+  return render_target_cache_->CanComposeNativeResolveRange(address, length, scaled,
+                                                            *shared_memory_);
+}
+
+bool VulkanCommandProcessor::ComposeNativeResolveRange(uint32_t address, uint32_t length,
+                                                       bool scaled,
+                                                       VkDescriptorBufferInfo& buffer_info) {
+  return render_target_cache_->ComposeNativeResolveRange(address, length, scaled,
+                                                         *shared_memory_, buffer_info);
+}
+
+bool VulkanCommandProcessor::EnsureSharedMemoryDescriptor() {
+  if (shared_memory_descriptor_written_) {
+    return true;
+  }
+  // The set hasn't been bound before (draws with native vertex streams bind
+  // their own), so it can still be written.
+  VkBuffer shared_memory_buffer = shared_memory_->buffer();
+  if (shared_memory_buffer == VK_NULL_HANDLE) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  VkDescriptorBufferInfo
+      shared_memory_descriptor_buffers_info[SharedMemory::kBufferSize / (128 << 20)];
+  uint32_t shared_memory_binding_range = SharedMemory::kBufferSize / shared_memory_binding_count_;
+  for (uint32_t i = 0; i < shared_memory_binding_count_; ++i) {
+    VkDescriptorBufferInfo& shared_memory_descriptor_buffer_info =
+        shared_memory_descriptor_buffers_info[i];
+    shared_memory_descriptor_buffer_info.buffer = shared_memory_buffer;
+    shared_memory_descriptor_buffer_info.offset = VkDeviceSize(shared_memory_binding_range) * i;
+    shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
+  }
+  VkWriteDescriptorSet write_descriptor_set_shared_memory;
+  write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write_descriptor_set_shared_memory.pNext = nullptr;
+  write_descriptor_set_shared_memory.dstSet = shared_memory_and_edram_descriptor_set_;
+  write_descriptor_set_shared_memory.dstBinding = 0;
+  write_descriptor_set_shared_memory.dstArrayElement = 0;
+  write_descriptor_set_shared_memory.descriptorCount = shared_memory_binding_count_;
+  write_descriptor_set_shared_memory.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  write_descriptor_set_shared_memory.pImageInfo = nullptr;
+  write_descriptor_set_shared_memory.pBufferInfo = shared_memory_descriptor_buffers_info;
+  write_descriptor_set_shared_memory.pTexelBufferView = nullptr;
+  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 1,
+                                                    &write_descriptor_set_shared_memory, 0,
+                                                    nullptr);
+  shared_memory_descriptor_written_ = true;
+  return true;
+}
+
+std::string VulkanCommandProcessor::DescribeNativeResolveBuffers(uint32_t address,
+                                                                uint32_t length,
+                                                                bool scaled) const {
+  return render_target_cache_->DescribeNativeResolveBuffers(address, length, scaled);
+}
+
 void VulkanCommandProcessor::BindExternalGraphicsPipeline(VkPipeline pipeline,
                                                           bool keep_dynamic_depth_bias,
                                                           bool keep_dynamic_blend_constants,
@@ -4352,10 +4392,25 @@ bool VulkanCommandProcessor::PrepareNativeVertexStreams(
     }
     // Anything unproven, out of bounds or too large keeps the current path.
     // One MiB is a per-draw upload cap, not a limit on guest resource sizes.
+    // Reads past the fetch constant's size are taken from guest memory too:
+    // the translated fetch doesn't bound them (some particle draws in this
+    // game index a few vertices past a stream sized for three), so the only
+    // alternative read whatever the mirror happened to hold there.
     if (first_word < 0 || first_word >= 0xFFFFFF || end_word <= first_word ||
-        end_word > fetch.size ||
         uint64_t(fetch.address) * 4 + end_word * 4 > SharedMemory::kBufferSize ||
         uint64_t(snapshot_size) + (end_word - first_word) * 4 > (1u << 20)) {
+      if (REXCVAR_GET(native_vertex_debug)) {
+        static uint32_t logged = 0;
+        if (logged < 16) {
+          ++logged;
+          REXGPU_INFO(
+              "[native-vertex-fallback] vs={:016X}: vertex range words {}..{} of fetch {} "
+              "(size {} words at {:08X}), vertices {}..{}, stride {} words",
+              shader.ucode_data_hash(), first_word, end_word, binding.fetch_constant,
+              uint32_t(fetch.size), uint32_t(fetch.address) << 2, first_vertex, last_vertex,
+              binding.stride_words);
+        }
+      }
       return fallback("vertex range");
     }
     uint32_t address = uint32_t((int64_t(fetch.address) + first_word) * 4);
@@ -4916,6 +4971,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
+  if (!native_vertex_streams_active_ && !EnsureSharedMemoryDescriptor()) {
+    return draw_fail("shared_memory_descriptor");
+  }
   VkDescriptorSet vertex_memory_descriptor = native_vertex_streams_active_
                                                  ? native_vertex_descriptor_set_
                                                  : shared_memory_and_edram_descriptor_set_;

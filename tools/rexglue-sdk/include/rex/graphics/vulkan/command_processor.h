@@ -190,6 +190,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool UseNativeResolveBufferRange(uint32_t address, uint32_t length,
                                    VkDescriptorBufferInfo& buffer_info, bool scaled = false);
   bool CanUseNativeResolveBufferRange(uint32_t address, uint32_t length, bool scaled) const;
+  // A texture source assembled from native resolve buffers and guest memory.
+  bool CanComposeNativeResolveRange(uint32_t address, uint32_t length, bool scaled) const;
+  bool ComposeNativeResolveRange(uint32_t address, uint32_t length, bool scaled,
+                                 VkDescriptorBufferInfo& buffer_info);
+  // Diagnostics: the native resolve buffers overlapping the range.
+  std::string DescribeNativeResolveBuffers(uint32_t address, uint32_t length, bool scaled) const;
+  // Writes the guest memory part of the shared memory and EDRAM descriptor set
+  // (creating the GPU copy of guest memory) before the set is first bound.
+  bool EnsureSharedMemoryDescriptor();
 
   // Submission must be open to insert barriers. If no pipeline stages access
   // the resource in a synchronization scope, the stage masks should be 0 (top /
@@ -690,6 +699,8 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
+  // Whether its guest memory binding is written (EnsureSharedMemoryDescriptor).
+  bool shared_memory_descriptor_written_ = false;
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).

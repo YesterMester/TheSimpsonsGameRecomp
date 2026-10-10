@@ -512,6 +512,8 @@ class VulkanTextureCache final : public TextureCache {
   VkBuffer scaled_resolve_buffer_ = VK_NULL_HANDLE;
   uint64_t scaled_resolve_buffer_size_ = 0;
   bool scaled_resolve_buffer_sparse_ = false;
+  // Not created yet: without sparse binding it's created on first use.
+  bool scaled_resolve_buffer_deferred_ = false;
   uint32_t scaled_resolve_buffer_memory_type_ = UINT32_MAX;
   std::vector<VkDeviceMemory> scaled_resolve_buffer_memory_;
   uint32_t scaled_resolve_sparse_granularity_log2_ = UINT32_MAX;

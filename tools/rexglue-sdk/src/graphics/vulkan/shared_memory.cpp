@@ -28,6 +28,13 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(gpu_memory_mirror_on_demand, true, "GPU",
+                    "Create the GPU copy of guest memory only when something first needs it - "
+                    "with the native paths, normally never")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DECLARE(bool, shared_memory_census);
+
 namespace rex::graphics::vulkan {
 
 VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
@@ -45,6 +52,36 @@ VulkanSharedMemory::~VulkanSharedMemory() {
 bool VulkanSharedMemory::Initialize() {
   InitializeCommon();
 
+  // The first usage will likely be uploading.
+  last_usage_ = Usage::kTransferDestination;
+  last_written_range_ = std::make_pair<uint32_t, uint32_t>(0, 0);
+
+  upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
+      command_processor_.GetVulkanDevice(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      rex::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize, size_t(1)
+                                                                           << page_size_log2()));
+
+  if (REXCVAR_GET(gpu_memory_mirror_on_demand)) {
+    buffer_deferred_ = true;
+    return true;
+  }
+  return CreateBuffer();
+}
+
+bool VulkanSharedMemory::EnsureHostBuffer() {
+  if (!buffer_deferred_) {
+    return buffer_ != VK_NULL_HANDLE;
+  }
+  buffer_deferred_ = false;
+  if (!CreateBuffer()) {
+    return false;
+  }
+  REXGPU_INFO("Shared memory: created the GPU copy of guest memory, first needed by {}",
+              DescribeCodeAddress(__builtin_return_address(0)));
+  return true;
+}
+
+bool VulkanSharedMemory::CreateBuffer() {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -110,7 +147,7 @@ bool VulkanSharedMemory::Initialize() {
     buffer_create_info.flags &= ~sparse_flags;
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) != VK_SUCCESS) {
       REXGPU_ERROR("Shared memory: Failed to create the {} MB Vulkan buffer", kBufferSize >> 20);
-      Shutdown();
+      DestroyBuffer();
       return false;
     }
     VkMemoryRequirements buffer_memory_requirements;
@@ -121,7 +158,7 @@ bool VulkanSharedMemory::Initialize() {
       REXGPU_ERROR(
           "Shared memory: Failed to get a device-local Vulkan memory type for "
           "the buffer");
-      Shutdown();
+      DestroyBuffer();
       return false;
     }
     VkMemoryAllocateInfo buffer_memory_allocate_info;
@@ -148,13 +185,13 @@ bool VulkanSharedMemory::Initialize() {
           "Shared memory: Failed to allocate {} MB of memory for the Vulkan "
           "buffer",
           kBufferSize >> 20);
-      Shutdown();
+      DestroyBuffer();
       return false;
     }
     buffer_memory_.push_back(buffer_memory);
     if (dfn.vkBindBufferMemory(device, buffer_, buffer_memory, 0) != VK_SUCCESS) {
       REXGPU_ERROR("Shared memory: Failed to bind memory to the Vulkan buffer");
-      Shutdown();
+      DestroyBuffer();
       return false;
     }
   }
@@ -162,16 +199,18 @@ bool VulkanSharedMemory::Initialize() {
   // UploadRanges copies with CopyPagesForUpload.
   streamed_page_shadows_supported_ = true;
 
-  // The first usage will likely be uploading.
-  last_usage_ = Usage::kTransferDestination;
-  last_written_range_ = std::make_pair<uint32_t, uint32_t>(0, 0);
-
-  upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
-      vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-      rex::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize, size_t(1)
-                                                                           << page_size_log2()));
-
   return true;
+}
+
+void VulkanSharedMemory::DestroyBuffer() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, buffer_);
+  for (VkDeviceMemory memory : buffer_memory_) {
+    dfn.vkFreeMemory(device, memory, nullptr);
+  }
+  buffer_memory_.clear();
 }
 
 void VulkanSharedMemory::Shutdown(bool from_destructor) {
@@ -210,11 +249,26 @@ bool VulkanSharedMemory::FlushGpuWrittenRange(uint32_t start, uint32_t length, b
 
 void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range,
                              std::pair<uint32_t, uint32_t> read_range) {
+  if (!EnsureHostBuffer()) {
+    return;
+  }
+  if (REXCVAR_GET(shared_memory_census)) {
+    auto range = usage == Usage::kRead ? read_range : written_range;
+    CensusRecord(__builtin_return_address(0), 1 + uint32_t(usage),
+                 range.second ? range.second : kBufferSize);
+  }
   auto access_range = usage == Usage::kRead ? read_range : written_range;
   if (!access_range.second) {
     access_range = {0, kBufferSize};
   }
-  if (!FlushGpuWrittenRange(access_range.first, access_range.second, usage != Usage::kRead)) {
+  const void* census_trigger_previous = CensusTrigger();
+  if (REXCVAR_GET(shared_memory_census)) {
+    CensusTrigger() = __builtin_return_address(0);
+  }
+  bool flushed =
+      FlushGpuWrittenRange(access_range.first, access_range.second, usage != Usage::kRead);
+  CensusTrigger() = census_trigger_previous;
+  if (!flushed) {
     REXGPU_ERROR("Shared memory: failed to make native GPU data visible to the mirror");
     return;
   }

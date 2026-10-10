@@ -419,6 +419,26 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   }
 
   TextureKey texture_key = texture.key();
+  if (SharedMemory::CensusEnabled()) {
+    // Diagnostics: the textures still loaded from the guest memory mirror.
+    static uint32_t logged = 0;
+    if (logged < 32) {
+      ++logged;
+      uint32_t base = texture_key.base_page << 12, mips = texture_key.mip_page << 12;
+      REXGPU_INFO(
+          "[mirror-texture] {} {}x{} {} fmt={} tiled={} scaled={} pitch={} base {:08X}+{:X} "
+          "(GPU-written {}) mips {:08X}+{:X} (GPU-written {}) load base={} mips={}",
+          texture_key.GetLogDimensionName(), texture_key.GetWidth(), texture_key.GetHeight(),
+          texture_key.GetDepthOrArraySize(), uint32_t(texture_key.format),
+          uint32_t(texture_key.tiled), uint32_t(texture_key.scaled_resolve),
+          uint32_t(texture_key.pitch) << 5, base, texture.GetGuestBaseSize(),
+          base_outdated && shared_memory().IsRangeGpuWritten(base, texture.GetGuestBaseSize()),
+          mips, texture.GetGuestMipsSize(),
+          mips_outdated && texture.GetGuestMipsSize() &&
+              shared_memory().IsRangeGpuWritten(mips, texture.GetGuestMipsSize()),
+          base_outdated, mips_outdated);
+    }
+  }
   if (base_outdated) {
     PendingSharedMemoryRange pending_range;
     pending_range.start = texture_key.base_page << 12;

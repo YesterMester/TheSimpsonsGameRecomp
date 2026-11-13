@@ -10,9 +10,14 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include <rex/assert.h>
@@ -27,9 +32,18 @@ class DeferredCommandBuffer {
  public:
   DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                         size_t initial_size_bytes = 1024 * 1024);
+  ~DeferredCommandBuffer();
 
   void Reset();
+  // Records all the commands written since the last Reset into command_buffer.
   void Execute(VkCommandBuffer command_buffer);
+
+  // Records the commands into command_buffer on a worker thread while they're
+  // written, from the next one on, so FinishExecution only waits for the last
+  // ones. command_buffer must be begun, and not used elsewhere until then.
+  void BeginExecution(VkCommandBuffer command_buffer);
+  void FinishExecution();
+  bool executing() const { return executing_; }
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
@@ -667,11 +681,50 @@ class DeferredCommandBuffer {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+  // Makes the chunk at index able to hold size elements.
+  void EnsureChunk(size_t index, size_t size);
+  // Records the commands in [stream, stream_end).
+  void ExecuteRange(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                    const uintmax_t* stream_end);
+  // Lets the worker record everything before the current write position.
+  void PublishWritten();
+  void WorkerMain();
+  // The REX_CMD_STATS log, after recording a command buffer.
+  static void ReportCommandStats();
 
   const VulkanCommandProcessor& command_processor_;
 
-  // uintmax_t to ensure uint64_t and pointer alignment of all structures.
-  std::vector<uintmax_t> command_stream_;
+  // The commands, in chunks that never move, so the worker can read the
+  // complete ones while more are written. uintmax_t to ensure uint64_t and
+  // pointer alignment of all structures. A command doesn't span chunks: the
+  // one that doesn't fit in a chunk starts the next.
+  static constexpr size_t kChunkElements = size_t(1) << 16;
+  static constexpr size_t kMaxChunks = 4096;
+  std::vector<std::unique_ptr<uintmax_t[]>> chunks_;
+  // For each chunk, its capacity and, once writing has moved past it, the
+  // elements used, all in elements.
+  std::unique_ptr<size_t[]> chunk_capacities_;
+  std::unique_ptr<size_t[]> chunk_ends_;
+  size_t write_chunk_ = 0;
+  size_t write_offset_ = 0;
+
+  // Worker recording state. written_ packs the chunk (high 32 bits) and the
+  // offset in it (low 32 bits) before which all commands are complete.
+  bool executing_ = false;
+  uint32_t commands_since_wake_ = 0;
+  VkCommandBuffer execution_command_buffer_ = VK_NULL_HANDLE;
+  std::atomic<uint64_t> written_{0};
+  std::atomic<bool> finishing_{false};
+  std::atomic<bool> finished_{false};
+  // Incremented to wake the worker (std::atomic wait on it).
+  std::atomic<uint32_t> wake_{0};
+  std::mutex worker_mutex_;
+  std::condition_variable worker_cond_;
+  // The packed position the next job starts from (under worker_mutex_).
+  uint64_t execution_start_ = 0;
+  bool worker_job_ = false;
+  bool worker_stop_ = false;
+  std::thread worker_;
 };
 
 }  // namespace rex::graphics::vulkan

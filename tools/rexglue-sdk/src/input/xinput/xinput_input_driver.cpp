@@ -103,6 +103,19 @@ static void set_skip(uint32_t user_index) {
   last_invalid_time[user_index] = rex::chrono::Clock::QueryHostUptimeMillis();
 }
 
+std::vector<InputDevice> XinputInputDriver::GetDevices() {
+  std::vector<InputDevice> devices;
+  for (uint32_t index = 0; index < 4; ++index) {
+    X_INPUT_CAPABILITIES caps{};
+    if (GetCapabilities(index, 0, &caps) == X_ERROR_SUCCESS) {
+      devices.push_back({"xinput:" + std::to_string(index),
+                         "Xbox controller " + std::to_string(index + 1),
+                         DeviceKind::kGamepad, PromptStyle::kXbox, index});
+    }
+  }
+  return devices;
+}
+
 X_RESULT XinputInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
                                             X_INPUT_CAPABILITIES* out_caps) {
   DWORD skipper = should_skip(user_index);

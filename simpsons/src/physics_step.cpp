@@ -47,6 +47,8 @@
 
 #include "image_patch.h"
 #include "guest_memory.h"
+#include "modkit_game.h"
+#include "native_ragdoll_world.h"
 
 #include <algorithm>
 #include <atomic>
@@ -94,6 +96,13 @@ REX_EXTERN(__imp__sub_8299EAB8);
 REX_EXTERN(sub_8268FAA8);
 REX_EXTERN(__imp__sub_8268FAA8);
 
+// The Havok world the game last stepped, for the mod menu's gravity.
+std::atomic<uint32_t> g_havok_world{0};
+
+uint32_t HavokWorld() {
+  return g_havok_world.load(std::memory_order_relaxed);
+}
+
 namespace {
 
 // The step threshold and size T, 1/29.97 s as shipped.
@@ -117,6 +126,8 @@ constexpr int64_t kGapNs = 250'000'000;
 
 enum class Mode { kSteady, kLegacy, kOriginal };
 Mode g_mode = Mode::kOriginal;
+// The last step and its world travel together, including across level loads.
+std::atomic<uint64_t> g_keyframe_step{0};
 
 const char* ModeName() {
   switch (g_mode) {
@@ -282,6 +293,23 @@ void RunHazard(PPCContext& ctx, uint8_t* base, Hazard hazard, uint32_t frame_siz
 
 }  // namespace
 
+// Keyframed bodies must not correct their pose faster than Havok can step.
+// Otherwise a render frame shorter than the simulation step turns the pose
+// error into too much velocity. The next step overshoots, reverses the error
+// and can send an animated collider far away from its visible model.
+float HavokKeyframeStep(uint32_t world) {
+  if (!world) {
+    return 0.0f;  // detached bodies may be integrated by their caller
+  }
+  float step =
+      std::bit_cast<float>(g_mode == Mode::kOriginal ? kStepThresholdOriginal : kVblankStep);
+  const uint64_t observed = g_keyframe_step.load(std::memory_order_relaxed);
+  if (uint32_t(observed >> 32) == world) {
+    step = std::max(step, std::bit_cast<float>(uint32_t(observed)));
+  }
+  return step;
+}
+
 void ApplyPhysicsStepOptions(rex::memory::Memory* memory) {
   const std::string mode = REXCVAR_GET(physics_step);
   g_mode = Mode::kOriginal;
@@ -328,8 +356,15 @@ void HavokStep(PPCContext& ctx, uint8_t* base) {
 }
 
 REX_FUNC(sub_82AA2070) {
+  modkit_game::PhysicsStepped();
+  g_havok_world.store(ctx.r3.u32, std::memory_order_relaxed);
+  native_ragdoll::BeforeWorldStep(ctx, base, ctx.r3.u32);
+  const float step = float(ctx.f1.f64);
+  if (step > 0.0f && std::isfinite(step)) {
+    g_keyframe_step.store((uint64_t(ctx.r3.u32) << 32) | std::bit_cast<uint32_t>(step),
+                          std::memory_order_relaxed);
+  }
   if (t_in_step) {
-    const float step = float(ctx.f1.f64);
     StepStats& s = g_steps;
     s.min_step = s.steps ? std::min(s.min_step, step) : step;
     s.max_step = s.steps ? std::max(s.max_step, step) : step;

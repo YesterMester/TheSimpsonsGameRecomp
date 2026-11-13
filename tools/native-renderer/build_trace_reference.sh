@@ -6,12 +6,13 @@
 # flags come from the SDK's compile_commands.json so the tool always matches
 # the library it loads.
 #
-# usage: build_trace_reference.sh [output] [rpath]
+# usage: build_trace_reference.sh [output] [rpath] [runtime library directory]
 set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SDK=$ROOT/tools/rexglue-sdk
 OUT=${1:-$ROOT/tools/native-renderer/out/trace_reference}
 RPATH=${2:-$SDK/out/linux-amd64}
+RUNTIME=${3:-$SDK/out/linux-amd64}
 OBJ=$(mktemp -d)
 trap 'rm -rf "$OBJ"' EXIT
 
@@ -63,7 +64,7 @@ LD_PATH=""
 
 # Let LD_LIBRARY_PATH select the runtime for A/B runs.
 LD_LIBRARY_PATH=$HOME/simpsons-build-shim${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
-  "$CXX" $LD_PATH -o "$OUT" "$OBJ"/*.o -L"$SDK/out/linux-amd64" -lrexruntimerd \
+  "$CXX" $LD_PATH -o "$OUT" "$OBJ"/*.o -L"$RUNTIME" -lrexruntimerd \
   "$SDK/out/linux-amd64/libsnappyrd.a" \
   -Wl,-rpath,"$RPATH" -Wl,--enable-new-dtags -Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2
 echo "built $OUT (rpath $RPATH)"

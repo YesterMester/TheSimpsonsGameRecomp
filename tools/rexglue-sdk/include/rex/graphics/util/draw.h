@@ -330,6 +330,9 @@ struct MemExportRange {
 // constants from the registers, adding them to ranges_out.
 void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
                         std::vector<MemExportRange>& ranges_out);
+// A stream constant alone is not a bounds proof: the MAD must leave its
+// address, format and count unchanged. Validate the analyzed zero factors.
+bool CanUseNativeMemExports(const RegisterFile& regs, const Shader& shader);
 
 // HAND PATCH: shared verdict on a draw whose vertex shader statically touches
 // fetch constants of the "invalid" type (this game marks streamed / absent

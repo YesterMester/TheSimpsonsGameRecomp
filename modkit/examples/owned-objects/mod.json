@@ -1,0 +1,34 @@
+{
+  "id": "examples.owned-objects",
+  "name": "Owned objects",
+  "author": "",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "stateless",
+  "requires_operations": [
+    "system.try_call",
+    "players.controlled",
+    "world.status",
+    "world.catalog",
+    "world.spawn",
+    "world.owned",
+    "world.destroy",
+    "entities.transform",
+    "entities.move",
+    "entities.set_transform",
+    "assets.release_source",
+    "ui.register_page"
+  ],
+  "requires_events": [
+    "initialize",
+    "level.ready",
+    "level.unloading",
+    "code.reloaded",
+    "save.restored",
+    "ui.action",
+    "entity.removed"
+  ],
+  "description": "A commented native Options page for cloning, moving, rotating, scaling and retiring only this mod's loaded props."
+}

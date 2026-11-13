@@ -56,6 +56,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void Shutdown(bool from_destructor = false);
 
   void CompletedSubmissionUpdated();
+  void ClearCache() override;
   void BeginSubmission();
 
   Path GetPath() const override { return path_; }
@@ -70,6 +71,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool msaa_2x_supported() const { return msaa_2x_supported_; }
 
   void WriteEdramRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
+  bool EnsureEdramBuffer();
   void WriteEdramRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void WriteEdramUintPow2SRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                                        uint32_t element_size_bytes_pow2);
@@ -161,6 +163,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   //  copied to a different buffer - the same range may have ROV-owned color and
   //  host float32 depth at the same time).
   ID3D12Resource* edram_buffer_ = nullptr;
+  void UpdateEdramBufferDescriptors();
   D3D12_RESOURCE_STATES edram_buffer_state_;
   EdramBufferModificationStatus edram_buffer_modification_status_ =
       EdramBufferModificationStatus::kUnmodified;
@@ -198,6 +201,14 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       kResolveCopyShaders[size_t(draw_util::ResolveCopyShaderIndex::kCount)];
   ID3D12PipelineState* resolve_copy_pipelines_[size_t(draw_util::ResolveCopyShaderIndex::kCount)] =
       {};
+
+  // Direct color packing from the host image, without an EDRAM round trip.
+  std::array<bool, 4> native_color_copy_attempted_ = {};
+  ID3D12RootSignature* native_color_copy_root_signature_ = nullptr;
+  std::array<ID3D12PipelineState*, 4> native_color_copy_pipeline_ = {};
+  std::array<bool, 2> native_depth_copy_attempted_ = {};
+  ID3D12RootSignature* native_depth_copy_root_signature_ = nullptr;
+  std::array<ID3D12PipelineState*, 2> native_depth_copy_pipeline_ = {};
 
   // For traces.
   ID3D12Resource* edram_snapshot_download_buffer_ = nullptr;
@@ -391,6 +402,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       // swapping of 40-sample columns as opposed to the host render target -
       // this is done only for the color source).
       uint32_t host_depth_source_is_copy : 1;
+      uint32_t dest_original_resolution : 1;
+      uint32_t source_original_resolution : 1;
+      uint32_t host_depth_source_original_resolution : 1;
 
       // Last bits because this affects the root signature - after sorting, only
       // change it as fewer times as possible. Depth buffers have an additional
@@ -591,31 +605,21 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     }
   };
 
-  struct DirectResolvePushConstants {
-    draw_util::ResolveCopyShaderConstants resolve;
-    uint32_t source_base_tiles;
-    uint32_t source_pitch_tiles;
-    uint32_t dispatch_first_tile;
+  struct NativeResolveCopy {
+    D3D12RenderTarget* source = nullptr;
+    D3D12TextureCache::NativeResolveTarget targets[D3D12TextureCache::kMaxNativeResolveTargets];
+    uint32_t target_count = 0;
+    uint32_t scale_x = 1;
+    uint32_t scale_y = 1;
+    uint32_t color_packing = 0;
+    uint32_t source_layout = 0;
+    bool integer_source = false;
+    bool red_blue_swapped = false;
   };
 
-  struct DirectResolvePipelineKey {
-    DumpPipelineKey dump_pipeline_key;
-    draw_util::ResolveCopyShaderIndex copy_shader;
-    bool draw_resolution_scaled;
-
-    uint64_t packed() const {
-      return uint64_t(dump_pipeline_key.key) | (uint64_t(size_t(copy_shader)) << 32) |
-             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40);
-    }
-    struct Hasher {
-      size_t operator()(const DirectResolvePipelineKey& key) const {
-        return std::hash<uint64_t>{}(key.packed());
-      }
-    };
-    bool operator==(const DirectResolvePipelineKey& other_key) const {
-      return packed() == other_key.packed();
-    }
-  };
+  D3D12RenderTarget* SnapshotNativeHostDepth(D3D12RenderTarget& source);
+  std::deque<std::pair<uint64_t, std::unique_ptr<D3D12RenderTarget>>> native_depth_snapshots_;
+  uint64_t native_depth_snapshot_count_ = 0;
 
   // Returns:
   // - A pointer to 1 pipeline for writing color or depth (or stencil via
@@ -658,10 +662,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void SetCommandListRenderTargets(RenderTarget* const* depth_and_color_render_targets);
 
   ID3D12PipelineState* GetOrCreateDumpPipeline(DumpPipelineKey key);
-  ID3D12PipelineState* GetOrCreateDirectResolvePipeline(DirectResolvePipelineKey key);
-  bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
-                              draw_util::ResolveCopyShaderIndex copy_shader,
-                              bool draw_resolution_scaled);
+  bool GetOrCreateNativeResolvePipeline(bool depth, bool integer_source = false,
+                                        bool multisampled = false);
+  RenderTarget* PrepareNativeResolveAlias(const draw_util::ResolveInfo& resolve_info, uint32_t base,
+                                          uint32_t row_length, uint32_t rows, uint32_t pitch);
+  void PlanNativeResolveCopy(const draw_util::ResolveInfo& resolve_info,
+                             D3D12TextureCache& texture_cache, NativeResolveCopy& copy);
+  void PerformNativeResolveCopy(const NativeResolveCopy& copy, D3D12TextureCache& texture_cache);
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
@@ -730,7 +737,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<DumpInvocation> dump_invocations_;
-  std::vector<ResolveCopyDispatch> direct_resolve_dispatches_;
 
   ID3D12RootSignature* dump_root_signature_color_ = nullptr;
   ID3D12RootSignature* dump_root_signature_depth_ = nullptr;
@@ -738,14 +744,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // buffer. May be null if failed to create.
   std::unordered_map<DumpPipelineKey, ID3D12PipelineState*, DumpPipelineKey::Hasher>
       dump_pipelines_;
-  ID3D12RootSignature* direct_resolve_root_signature_color_ = nullptr;
-  ID3D12RootSignature* direct_resolve_root_signature_depth_ = nullptr;
-  std::unordered_map<DirectResolvePipelineKey, ID3D12PipelineState*,
-                     DirectResolvePipelineKey::Hasher>
-      direct_resolve_pipelines_;
-  uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
-  uint64_t direct_resolve_fallback_count_ = 0;
+  uint64_t native_color_pack_count_ = 0;
 
   // Parameter 0 - 2 root constants (red, green).
   ID3D12RootSignature* uint32_rtv_clear_root_signature_ = nullptr;

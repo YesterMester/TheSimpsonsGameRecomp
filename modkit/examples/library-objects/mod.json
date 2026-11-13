@@ -1,0 +1,36 @@
+{
+  "id": "examples.library-objects",
+  "name": "Library objects",
+  "author": "",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "stateless",
+  "description": "A commented native menu for inspecting original object variants, loading a cross-level source, spawning and releasing only this mod's claim.",
+  "requires_operations": [
+    "assets.search",
+    "assets.templates",
+    "assets.load_source",
+    "assets.source_status",
+    "assets.release_source",
+    "system.try_call",
+    "players.controlled",
+    "world.status",
+    "world.spawn",
+    "world.owned",
+    "world.destroy",
+    "ui.register_page",
+    "assets.source_streams",
+    "assets.cancel_source"
+  ],
+  "requires_events": [
+    "initialize",
+    "level.ready",
+    "level.unloading",
+    "code.reloaded",
+    "save.restored",
+    "frame",
+    "ui.action"
+  ]
+}

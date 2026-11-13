@@ -17,6 +17,7 @@
 #include <rex/ui/vulkan/immediate_drawer.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
+#include <rex/ui/graphics_backend.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_validation_enabled, false, "UI/Vulkan",
                     "Enable Vulkan validation layers")
@@ -88,12 +89,10 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
     bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
     bool prefer_fill_mode_non_solid = REXCVAR_GET(vulkan_prefer_fill_mode_non_solid);
-    if (with_gpu_emulation && physical_devices.size() > 1 &&
-        (prefer_geometry_shader || prefer_fragment_stores || prefer_vertex_stores ||
-         prefer_fill_mode_non_solid)) {
+    if (with_gpu_emulation && physical_devices.size() > 1) {
       struct PhysicalDeviceScore {
         VkPhysicalDevice physical_device;
-        uint32_t score;
+        GraphicsDevicePreference preference;
       };
       std::vector<PhysicalDeviceScore> scored_devices;
       scored_devices.reserve(physical_devices.size());
@@ -113,20 +112,22 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
         if (prefer_fill_mode_non_solid && supported_features.fillModeNonSolid) {
           ++score;
         }
-        scored_devices.push_back({physical_device, score});
+        VkPhysicalDeviceProperties properties;
+        ifn.vkGetPhysicalDeviceProperties(physical_device, &properties);
+        scored_devices.push_back({physical_device,
+                                  {properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU, score,
+                                   properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU}});
       }
 
       std::stable_sort(scored_devices.begin(), scored_devices.end(),
                        [](const PhysicalDeviceScore& a, const PhysicalDeviceScore& b) {
-                         return a.score > b.score;
+                         return PreferGraphicsDevice(a.preference, b.preference);
                        });
 
-      if (!scored_devices.empty() && scored_devices.front().score != scored_devices.back().score) {
-        physical_devices_ordered.clear();
-        physical_devices_ordered.reserve(scored_devices.size());
-        for (const PhysicalDeviceScore& scored_device : scored_devices) {
-          physical_devices_ordered.push_back(scored_device.physical_device);
-        }
+      physical_devices_ordered.clear();
+      physical_devices_ordered.reserve(scored_devices.size());
+      for (const PhysicalDeviceScore& scored_device : scored_devices) {
+        physical_devices_ordered.push_back(scored_device.physical_device);
       }
     }
 

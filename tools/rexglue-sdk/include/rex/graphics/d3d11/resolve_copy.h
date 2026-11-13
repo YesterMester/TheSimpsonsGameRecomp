@@ -18,13 +18,26 @@ class ResolveCopy {
             const draw_util::ResolveCopyShaderConstants& constants,
             ID3D11UnorderedAccessView* destination, uint32_t groups_x, uint32_t groups_y,
             bool scaled, std::string& error);
+  // Single-sampled bitwise-equivalent color resolves pack native image texels
+  // directly into the destination, without an intermediate EDRAM encoding.
+  bool CopyColorSurface(const RenderTargetSurface& source, const draw_util::ResolveInfo& resolve,
+                        ID3D11UnorderedAccessView* destination, bool scaled, std::string& error,
+                        uint32_t destination_address = 0);
+  bool CopyDepthSurface(const RenderTargetSurface& source, const draw_util::ResolveInfo& resolve,
+                        ID3D11UnorderedAccessView* destination, bool scaled, std::string& error,
+                        uint32_t destination_address = 0, bool round_float24 = false);
   void Clear();
 
  private:
+  bool CopySurface(const RenderTargetSurface& source, const draw_util::ResolveInfo& resolve,
+                   ID3D11UnorderedAccessView* destination, bool scaled, std::string& error,
+                   uint32_t destination_address, bool depth, bool round_float24);
   const ShaderProgram* Program(draw_util::ResolveCopyShaderIndex shader, bool scaled,
                                std::string& error);
   bool PrepareDepthCopy(ID3D11Buffer* destination, uint32_t first_word, uint32_t word_count,
                         std::string& error);
+  bool PrepareWordDestination(ID3D11Buffer* destination, uint32_t first_word, uint32_t word_count,
+                              std::string& error);
   ui::d3d11::D3D11Device& device_;
   DrawContext& draws_;
   ShaderCache shaders_;
@@ -35,6 +48,12 @@ class ResolveCopy {
       {};
   std::array<std::array<std::string, size_t(draw_util::ResolveCopyShaderIndex::kCount)>, 2> errors_;
   Microsoft::WRL::ComPtr<ID3D11ComputeShader> depth_copy_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11ComputeShader>, 4> color_copy_;
+  std::array<bool, 4> color_copy_attempted_ = {};
+  std::array<std::string, 4> color_copy_error_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11ComputeShader>, 2> surface_depth_copy_;
+  std::array<bool, 2> surface_depth_copy_attempted_ = {};
+  std::array<std::string, 2> surface_depth_copy_error_;
   Microsoft::WRL::ComPtr<ID3D11Buffer> depth_destination_buffer_;
   Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> depth_destination_;
   uint32_t depth_destination_first_word_ = 0, depth_destination_word_count_ = 0;

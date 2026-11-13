@@ -18,6 +18,18 @@
 
 namespace rex::graphics {
 
+spv::Id SpirvBuilder::createTriOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
+                                  spv::Id operand2, spv::Id operand3) {
+  // Before SPIR-V 1.4, selecting a vector requires a Boolean vector of the
+  // same width. Drivers accepting a scalar condition do not make it portable.
+  if (op_code == spv::OpSelect && getSpvVersion() < spv::Spv_1_4 && isVectorType(type_id) &&
+      isScalar(operand1)) {
+    operand1 = smearScalar(spv::NoPrecision, operand1,
+                           makeVectorType(makeBoolType(), getNumTypeComponents(type_id)));
+  }
+  return spv::Builder::createTriOp(op_code, type_id, operand1, operand2, operand3);
+}
+
 spv::Id SpirvBuilder::createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
                                    spv::Id operand2, spv::Id operand3, spv::Id operand4) {
   if (generatingOpCodeForSpecConst) {

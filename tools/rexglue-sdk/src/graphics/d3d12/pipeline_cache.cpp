@@ -505,7 +505,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         D3D12Shader* shader = static_cast<D3D12Shader*>(&translation->shader());
         shader->DestroyTranslation(translation->modification());
         if (shader->translations().empty()) {
-          shaders_.erase(shader->ucode_data_hash());
+          shaders_.erase({shader->ucode_data_hash(), shader->type()});
           delete shader;
         }
       }
@@ -563,7 +563,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
 
       PipelineRuntimeDescription pipeline_runtime_description;
-      auto vertex_shader_it = shaders_.find(pipeline_description.vertex_shader_hash);
+      auto vertex_shader_it =
+          shaders_.find({pipeline_description.vertex_shader_hash, xenos::ShaderType::kVertex});
       if (vertex_shader_it == shaders_.end()) {
         continue;
       }
@@ -577,7 +578,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
       D3D12Shader* pixel_shader;
       if (pipeline_description.pixel_shader_hash) {
-        auto pixel_shader_it = shaders_.find(pipeline_description.pixel_shader_hash);
+        auto pixel_shader_it =
+            shaders_.find({pipeline_description.pixel_shader_hash, xenos::ShaderType::kPixel});
         if (pixel_shader_it == shaders_.end()) {
           continue;
         }
@@ -801,7 +803,8 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint
 
 D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                                        uint32_t dword_count, uint64_t data_hash) {
-  auto it = shaders_.find(data_hash);
+  const ShaderCacheKey key{data_hash, shader_type};
+  auto it = shaders_.find(key);
   if (it != shaders_.end()) {
     // Shader has been previously loaded.
     return it->second;
@@ -810,7 +813,7 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint
   // We need to track it even if it fails translation so we know not to try
   // again.
   D3D12Shader* shader = new D3D12Shader(shader_type, data_hash, host_address, dword_count);
-  shaders_.emplace(data_hash, shader);
+  shaders_.emplace(key, shader);
   return shader;
 }
 
@@ -2060,7 +2063,10 @@ void PipelineCache::StorageWriteThread() {
         flush_pipelines = true;
       }
       if (!shader && !write_pipeline) {
-        storage_write_request_cond_.wait(lock);
+        // A flush is pending local work too. Complete it before sleeping,
+        // even when no later shader or pipeline request wakes this thread.
+        if (!flush_shaders && !flush_pipelines)
+          storage_write_request_cond_.wait(lock);
         continue;
       }
     }

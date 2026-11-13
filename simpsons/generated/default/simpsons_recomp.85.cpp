@@ -1,4 +1,5 @@
 #include "simpsons_init.h"
+#include <rex/ppc/barriers.h>
 
 DEFINE_REX_FUNC(sub_82C4A510) {
 	REX_FUNC_PROLOGUE();
@@ -1660,6 +1661,7 @@ DEFINE_REX_FUNC(sub_82C4B0D0) {
 	// stwbrx r4,0,r11
 	REX_MM_STORE_U32(ctx.r11.u32, __builtin_bswap32(ctx.r4.u32));
 	// eieio 
+	REX_PPC_EIEIO();
 	// blr 
 	return;
 }
@@ -1675,6 +1677,7 @@ DEFINE_REX_FUNC(sub_82C4B0E8) {
 	// stwbrx r4,0,r11
 	REX_MM_STORE_U32(ctx.r11.u32, __builtin_bswap32(ctx.r4.u32));
 	// eieio 
+	REX_PPC_EIEIO();
 	// blr 
 	return;
 }
@@ -1690,6 +1693,7 @@ DEFINE_REX_FUNC(sub_82C4B100) {
 	// stwbrx r4,0,r11
 	REX_MM_STORE_U32(ctx.r11.u32, __builtin_bswap32(ctx.r4.u32));
 	// eieio 
+	REX_PPC_EIEIO();
 	// blr 
 	return;
 }
@@ -1707,6 +1711,7 @@ DEFINE_REX_FUNC(sub_82C4B118) {
 	// stwbrx r10,0,r11
 	REX_MM_STORE_U32(ctx.r11.u32, __builtin_bswap32(ctx.r10.u32));
 	// eieio 
+	REX_PPC_EIEIO();
 	// blr 
 	return;
 }
@@ -1724,11 +1729,13 @@ DEFINE_REX_FUNC(sub_82C4B138) {
 	// stwx r10,0,r9
 	REX_MM_STORE_U32(ctx.r9.u32, ctx.r10.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// lis r10,768
 	ctx.r10.s64 = 50331648;
 	// stwx r10,0,r11
 	REX_MM_STORE_U32(ctx.r11.u32, ctx.r10.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// blr 
 	return;
 }
@@ -1822,6 +1829,7 @@ loc_82C4B198:
 	// stwbrx r11,0,r10
 	REX_MM_STORE_U32(ctx.r10.u32, __builtin_bswap32(ctx.r11.u32));
 	// eieio 
+	REX_PPC_EIEIO();
 loc_82C4B200:
 	// lwz r11,0(r26)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r26.u32 + 0);
@@ -1896,6 +1904,7 @@ loc_82C4B260:
 	// stwbrx r5,0,r11
 	REX_MM_STORE_U32(ctx.r11.u32, __builtin_bswap32(ctx.r5.u32));
 	// eieio 
+	REX_PPC_EIEIO();
 	// lwz r11,0(r8)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r8.u32 + 0);
 	// addi r9,r9,1
@@ -1997,11 +2006,13 @@ loc_82C4B308:
 	// stwx r30,0,r10
 	REX_MM_STORE_U32(ctx.r10.u32, ctx.r30.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// lis r10,768
 	ctx.r10.s64 = 50331648;
 	// stwx r10,0,r11
 	REX_MM_STORE_U32(ctx.r11.u32, ctx.r10.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// mr r3,r31
 	ctx.r3.u64 = ctx.r31.u64;
 	// bl 0x82c4b378
@@ -2385,6 +2396,7 @@ loc_82C4B5C0:
 	// stwbrx r11,0,r7
 	REX_MM_STORE_U32(ctx.r7.u32, __builtin_bswap32(ctx.r11.u32));
 	// eieio 
+	REX_PPC_EIEIO();
 	// lwz r11,0(r8)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r8.u32 + 0);
 	// addi r9,r9,1

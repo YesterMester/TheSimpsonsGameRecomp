@@ -1961,8 +1961,8 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
 
     {"xe_alpha_to_mask", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
     {"xe_edram_32bpp_tile_pitch_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
-    {"xe_edram_depth_base_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t),
-     sizeof(uint32_t)},
+    {"xe_edram_depth_base_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+    {"xe_native_memexport_base", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
 
     {"xe_color_exp_bias", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
 

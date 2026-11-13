@@ -12,6 +12,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <rex/graphics/packet_disassembler.h>
+#include <rex/graphics/native_gpu_calls.h>
+#include <rex/graphics/native_gpu_constants.h>
+#include <rex/graphics/native_gpu_state.h>
+#include <rex/graphics/native_gpu_coherency.h>
+#include <rex/graphics/native_gpu_program.h>
+#include <rex/graphics/native_gpu_predication.h>
+#include <rex/graphics/native_gpu_ports.h>
+#include <rex/graphics/native_gpu_sync.h>
+#include <rex/graphics/native_gpu_indirect.h>
+#include <rex/graphics/native_gpu_shader_reference.h>
+#include <rex/graphics/native_gpu_direct.h>
+#include <rex/graphics/native_gpu_presentation.h>
 #include <rex/graphics/xenos.h>
 
 namespace rex::graphics {
@@ -42,8 +54,14 @@ PacketCategory PacketDisassembler::GetPacketCategory(const uint8_t* base_ptr) {
       switch (opcode) {
         case PM4_DRAW_INDX:
         case PM4_DRAW_INDX_2:
+        case native_gpu_calls::kOpcode:
+        case native_gpu_calls::kBareDrawOpcode:
+        case native_gpu_direct::kOpcode:
+        case native_gpu_calls::kVerticesDrawOpcode:
+        case native_gpu_calls::kRangeDrawOpcode:
           return PacketCategory::kDraw;
         case PM4_XE_SWAP:
+        case native_gpu_presentation::kOpcode:
           return PacketCategory::kSwap;
         default:
           return PacketCategory::kGeneric;
@@ -121,6 +139,293 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
 
   bool result = true;
   switch (opcode) {
+    case native_gpu_direct::kOpcode: {
+      if (!native_gpu_direct::IsValidHeader(packet, count))
+        return false;
+      std::array<uint32_t, 4> payload{};
+      for (uint32_t i = 0; i < count; ++i)
+        payload[i] = memory::load_and_swap<uint32_t>(ptr + i * 4);
+      native_gpu_direct::Call call;
+      if (!native_gpu_direct::Decode(packet, {payload.data(), count}, call))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kDraw, "NATIVE_DIRECT_DRAW"};
+      out_info->type_info = &info;
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_VGT_DRAW_INITIATOR, call.control));
+      if (((call.control >> 6) & 3) == 0) {
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_VGT_DMA_BASE, call.index_base));
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_VGT_DMA_SIZE, call.index_size));
+      }
+      return true;
+    }
+    case native_gpu_shader_reference::kOpcode: {
+      if (!native_gpu_shader_reference::IsValidHeader(packet, count) ||
+          !native_gpu_shader_reference::Validate(
+              {memory::load_and_swap<uint32_t>(ptr), memory::load_and_swap<uint32_t>(ptr + 4)}))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kGeneric, "NATIVE_SHADER_REFERENCE"};
+      out_info->type_info = &info;
+      return true;
+    }
+    case native_gpu_indirect::kOpcode: {
+      if (!native_gpu_indirect::IsValidHeader(packet, count))
+        return false;
+      if (packet == native_gpu_indirect::kBufferHeader) {
+        const native_gpu_indirect::BufferCall call{memory::load_and_swap<uint32_t>(ptr),
+                                                  memory::load_and_swap<uint32_t>(ptr + 4)};
+        if (!native_gpu_indirect::ValidateBuffer(call))
+          return false;
+        static const PacketTypeInfo info = {PacketCategory::kGeneric, "NATIVE_COMMAND_BUFFER"};
+        out_info->type_info = &info;
+        return true;
+      }
+      const native_gpu_indirect::Call call{memory::load_and_swap<uint32_t>(ptr),
+                                           memory::load_and_swap<uint32_t>(ptr + 4),
+                                           memory::load_and_swap<uint32_t>(ptr + 8)};
+      native_gpu_indirect::TypedRange range{call.address, 0x4000 + call.index, call.count};
+      const bool typed = packet == native_gpu_indirect::kTypedHeader;
+      if (typed ? !native_gpu_indirect::DecodeTyped({call.address, call.index, call.count}, range)
+                : !native_gpu_indirect::Validate(call))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kGeneric,
+                                          "NATIVE_INDIRECT_ALU_CONSTANTS"};
+      static const PacketTypeInfo typed_info = {PacketCategory::kGeneric,
+                                                "NATIVE_INDIRECT_TYPED_CONSTANTS"};
+      out_info->type_info = typed ? &typed_info : &info;
+      for (uint32_t i = 0; i < range.count; ++i) {
+        uint32_t value = 0xDEADBEEF;
+        if (disasm_membase) {
+          const uint32_t source = (range.address + i * 4) & (disasm_memsize - 1);
+          if (uint64_t(source) + 4 <= disasm_memsize)
+            value = memory::load_and_swap<uint32_t>(disasm_membase + source);
+        }
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(range.first_register + i, value));
+      }
+      return true;
+    }
+    case native_gpu_sync::kOpcode: {
+      if (!native_gpu_sync::IsValidHeader(packet, count))
+        return false;
+      if (packet == native_gpu_sync::kEventHeader) {
+        static const PacketTypeInfo info = {PacketCategory::kGeneric, "NATIVE_SHADER_EVENT"};
+        out_info->type_info = &info;
+        out_info->actions.emplace_back(PacketAction::RegisterWrite(
+            XE_GPU_REG_VGT_EVENT_INITIATOR, memory::load_and_swap<uint32_t>(ptr) & 0x3F));
+      } else {
+        std::array<uint32_t, 10> payload;
+        for (uint32_t i = 0; i < payload.size(); ++i)
+          payload[i] = memory::load_and_swap<uint32_t>(ptr + i * 4);
+        native_gpu_sync::Coherency call;
+        if (!native_gpu_sync::Decode(payload, call))
+          return false;
+        static const PacketTypeInfo info = {PacketCategory::kGeneric,
+                                            "NATIVE_RETIREMENT_COHERENCY"};
+        out_info->type_info = &info;
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_COHER_STATUS_HOST, 0));
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_COHER_SIZE_HOST, call.size));
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_COHER_BASE_HOST, call.base));
+      }
+      return true;
+    }
+    case native_gpu_ports::kOpcode: {
+      uint32_t reg;
+      if (!native_gpu_ports::DecodeHeader(packet, count, reg))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kGeneric, "NATIVE_INITIALIZATION_PORT"};
+      out_info->type_info = &info;
+      for (uint32_t i = 0; i < count; ++i)
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(reg, memory::load_and_swap<uint32_t>(ptr + i * 4)));
+      return true;
+    }
+    case native_gpu_predication::kOpcode: {
+      if (!native_gpu_predication::IsValidHeader(packet, count))
+        return false;
+      if (native_gpu_predication::IsStateHeader(packet, count)) {
+        uint32_t first;
+        if (!native_gpu_predication::DecodeRegister(memory::load_and_swap<uint32_t>(ptr), first,
+                                                    count - 1))
+          return false;
+        static const PacketTypeInfo info = {PacketCategory::kGeneric, "NATIVE_CONDITIONAL_STATE"};
+        out_info->type_info = &info;
+        for (uint32_t i = 0; i < count - 1; ++i)
+          out_info->actions.emplace_back(PacketAction::RegisterWrite(
+              first + i, memory::load_and_swap<uint32_t>(ptr + 4 + i * 4)));
+      } else {
+        const bool high = packet == native_gpu_predication::kMaskHighHeader;
+        static const PacketTypeInfo low_info = {PacketCategory::kGeneric, "NATIVE_BIN_MASK_LOW"};
+        static const PacketTypeInfo high_info = {PacketCategory::kGeneric, "NATIVE_BIN_MASK_HIGH"};
+        out_info->type_info = high ? &high_info : &low_info;
+        out_info->actions.emplace_back(PacketAction::SetBinHalf(
+            high ? PacketAction::Type::kSetBinMaskHigh : PacketAction::Type::kSetBinMaskLow,
+            memory::load_and_swap<uint32_t>(ptr)));
+      }
+      return true;
+    }
+    case native_gpu_program::kOpcode: {
+      if (!native_gpu_program::IsValidHeader(packet, count))
+        return false;
+      if (packet == native_gpu_program::kInvalidateHeader) {
+        static const PacketTypeInfo info = {PacketCategory::kGeneric, "NATIVE_STATE_INVALIDATE"};
+        out_info->type_info = &info;
+      } else {
+        const uint32_t stage = memory::load_and_swap<uint32_t>(ptr);
+        const uint32_t start_size = memory::load_and_swap<uint32_t>(ptr + 4);
+        if (!native_gpu_program::ValidateShader(stage, start_size, count))
+          return false;
+        static const PacketTypeInfo info = {PacketCategory::kGeneric, "NATIVE_SHADER_BIND"};
+        out_info->type_info = &info;
+      }
+      return true;
+    }
+    case native_gpu_coherency::kOpcode: {
+      if (packet != native_gpu_coherency::kHeader)
+        return false;
+      std::array<uint32_t, 12> payload;
+      for (uint32_t i = 0; i < payload.size(); ++i)
+        payload[i] = memory::load_and_swap<uint32_t>(ptr + i * 4);
+      native_gpu_coherency::Call call;
+      if (!native_gpu_coherency::Decode(payload, call))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kGeneric, "NATIVE_COHERENCY"};
+      out_info->type_info = &info;
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_COHER_DEST_BASE_1, call.destination_base));
+      out_info->actions.emplace_back(PacketAction::RegisterWrite(XE_GPU_REG_COHER_STATUS_HOST, 0));
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_COHER_SIZE_HOST, call.size));
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_COHER_BASE_HOST, call.base));
+      return true;
+    }
+    case 0x72:
+    case 0x73:
+    case 0x74:
+    case 0x75:
+    case 0x76:
+    case 0x77:
+    case 0x78: {
+      native_gpu_state::StateRange range;
+      if (!native_gpu_state::DecodeHeader(packet, count, range))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kGeneric, "NATIVE_STATE_RANGE"};
+      out_info->type_info = &info;
+      for (uint32_t i = 0; i < count; ++i)
+        out_info->actions.emplace_back(PacketAction::RegisterWrite(
+            range.first_register + i, memory::load_and_swap<uint32_t>(ptr + i * 4)));
+      return true;
+    }
+    case native_gpu_calls::kVerticesDrawOpcode: {
+      if ((count != 15 && count != 17) || (packet & 0x80FFu))
+        return false;
+      std::array<uint32_t, 17> payload;
+      for (uint32_t i = 0; i < count; ++i)
+        payload[i] = memory::load_and_swap<uint32_t>(ptr + i * 4);
+      native_gpu_calls::VerticesDrawCall call;
+      if (!native_gpu_calls::DecodeVertices({payload.data(), count}, call))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kDraw, "NATIVE_VERTICES_DRAW"};
+      out_info->type_info = &info;
+      // Keep the packet unpredicated: only its contained draw uses the bin
+      // condition. The preceding state writes always apply.
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_VGT_INDX_OFFSET, call.first_vertex));
+      for (uint32_t i = 0; i < call.fetch.size(); ++i)
+        out_info->actions.emplace_back(PacketAction::RegisterWrite(0x48BA + i, call.fetch[i]));
+      for (uint32_t i = 0; i < call.constant_flush.size(); ++i)
+        out_info->actions.emplace_back(PacketAction::RegisterWrite(0x5000 + i, call.constant_flush[i]));
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_VGT_DRAW_INITIATOR, call.initiator));
+      if (((call.initiator >> 6) & 3) == 0) {
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_VGT_DMA_BASE, call.index_base));
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_VGT_DMA_SIZE, call.index_size));
+      }
+      return true;
+    }
+    case native_gpu_calls::kRangeDrawOpcode: {
+      if ((count != 4 && count != 6) || (packet & 0x80FFu))
+        return false;
+      std::array<uint32_t, 6> payload;
+      for (uint32_t i = 0; i < count; ++i)
+        payload[i] = memory::load_and_swap<uint32_t>(ptr + i * 4);
+      native_gpu_calls::RangeDrawCall call;
+      if (!native_gpu_calls::DecodeRange({payload.data(), count}, call))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kDraw, "NATIVE_RANGE_DRAW"};
+      out_info->type_info = &info;
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_VGT_INDX_OFFSET, call.first_vertex));
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_VGT_DRAW_INITIATOR, call.initiator));
+      if (((call.initiator >> 6) & 3) == 0) {
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_VGT_DMA_BASE, call.index_base));
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_VGT_DMA_SIZE, call.index_size));
+      }
+      return true;
+    }
+    case native_gpu_calls::kOpcode: {
+      if (count != 23 && count != 26)
+        return false;
+      std::array<uint32_t, 26> payload;
+      for (uint32_t i = 0; i < count; ++i)
+        payload[i] = memory::load_and_swap<uint32_t>(ptr + i * 4);
+      native_gpu_calls::DrawCall call;
+      if (!native_gpu_calls::DecodeDraw({payload.data(), count}, call))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kDraw, "NATIVE_DRAW"};
+      out_info->type_info = &info;
+      for (uint32_t i = 0; i < call.fetch.size(); ++i)
+        out_info->actions.emplace_back(PacketAction::RegisterWrite(0x48BA + i, call.fetch[i]));
+      out_info->actions.emplace_back(PacketAction::RegisterWrite(XE_GPU_REG_COHER_STATUS_HOST, 0));
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_COHER_SIZE_HOST, call.coherent_size));
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_COHER_BASE_HOST, call.coherent_base));
+      for (uint32_t i = 0; i < call.constant_flush.size(); ++i)
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(0x5000 + i, call.constant_flush[i]));
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_VGT_DRAW_INITIATOR, call.initiator));
+      if (((call.initiator >> 6) & 3) == 0) {
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_VGT_DMA_BASE, call.index_base));
+        out_info->actions.emplace_back(
+            PacketAction::RegisterWrite(XE_GPU_REG_VGT_DMA_SIZE, call.index_size));
+      }
+      return true;
+    }
+    case native_gpu_calls::kBareDrawOpcode: {
+      if (count != 1)
+        return false;
+      uint32_t control = memory::load_and_swap<uint32_t>(ptr);
+      if (((control >> 6) & 3) != 2)
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kDraw, "NATIVE_BARE_DRAW"};
+      out_info->type_info = &info;
+      out_info->actions.emplace_back(PacketAction::RegisterWrite(XE_GPU_REG_VGT_DRAW_INITIATOR, control));
+      return true;
+    }
+    case native_gpu_constants::kOpcode: {
+      native_gpu_constants::ConstantRange range;
+      if (!native_gpu_constants::DecodeHeader(packet, count, range))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kGeneric, "NATIVE_SHADER_CONSTANTS"};
+      out_info->type_info = &info;
+      for (uint32_t i = 0; i < range.register_count; ++i)
+        out_info->actions.emplace_back(PacketAction::RegisterWrite(
+            range.first_register + i, memory::load_and_swap<uint32_t>(ptr + i * 4)));
+      return true;
+    }
     case PM4_ME_INIT: {
       // initialize CP's micro-engine
       static const PacketTypeInfo op_info = {PacketCategory::kGeneric, "PM4_ME_INIT"};
@@ -144,6 +449,19 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
           // graphics_system_->DispatchInterruptCallback(1, n);
         }
       }
+      break;
+    }
+    case native_gpu_presentation::kOpcode: {
+      if (!native_gpu_presentation::IsValidHeader(packet, count))
+        return false;
+      std::array<uint32_t, 4> payload;
+      for (uint32_t i = 0; i < payload.size(); ++i)
+        payload[i] = memory::load_and_swap<uint32_t>(ptr + i * 4);
+      native_gpu_presentation::Call call;
+      if (!native_gpu_presentation::Decode(payload, call))
+        return false;
+      static const PacketTypeInfo info = {PacketCategory::kSwap, "NATIVE_PRESENT"};
+      out_info->type_info = &info;
       break;
     }
     case PM4_XE_SWAP: {
@@ -222,45 +540,27 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
       uint32_t unk1 = memory::load_and_swap<uint32_t>(ptr + 4);
       break;
     }
-    case PM4_DRAW_INDX: {
-      // initiate fetch of index buffer and draw
-      // dword0 = viz query info
-      static const PacketTypeInfo op_info = {PacketCategory::kDraw, "PM4_DRAW_INDX"};
-      out_info->type_info = &op_info;
-      uint32_t dword0 = memory::load_and_swap<uint32_t>(ptr + 0);
-      uint32_t dword1 = memory::load_and_swap<uint32_t>(ptr + 4);
-      uint32_t index_count = dword1 >> 16;
-      auto prim_type = static_cast<xenos::PrimitiveType>(dword1 & 0x3F);
-      uint32_t src_sel = (dword1 >> 6) & 0x3;
-      if (src_sel == 0x0) {
-        // Indexed draw.
-        uint32_t guest_base = memory::load_and_swap<uint32_t>(ptr + 8);
-        uint32_t index_size = memory::load_and_swap<uint32_t>(ptr + 12);
-        auto endianness = static_cast<xenos::Endian>(index_size >> 30);
-        index_size &= 0x00FFFFFF;
-        bool index_32bit = (dword1 >> 11) & 0x1;
-        index_size *= index_32bit ? 4 : 2;
-      } else if (src_sel == 0x2) {
-        // Auto draw.
-      } else {
-        // Unknown source select.
-        assert_always();
-      }
-      break;
-    }
+    case PM4_DRAW_INDX:
     case PM4_DRAW_INDX_2: {
-      // draw using supplied indices in packet
-      static const PacketTypeInfo op_info = {PacketCategory::kDraw, "PM4_DRAW_INDX_2"};
-      out_info->type_info = &op_info;
-      uint32_t dword0 = memory::load_and_swap<uint32_t>(ptr + 0);
-      uint32_t index_count = dword0 >> 16;
-      auto prim_type = static_cast<xenos::PrimitiveType>(dword0 & 0x3F);
-      uint32_t src_sel = (dword0 >> 6) & 0x3;
-      assert_true(src_sel == 0x2);  // 'SrcSel=AutoIndex'
-      bool index_32bit = (dword0 >> 11) & 0x1;
-      uint32_t indices_size = index_count * (index_32bit ? 4 : 2);
-      auto index_ptr = ptr + 4;
-      break;
+      const uint32_t prefix = opcode == PM4_DRAW_INDX ? 1 : 0;
+      if (count <= prefix)
+        return false;
+      const uint32_t control = memory::load_and_swap<uint32_t>(ptr + prefix * 4);
+      const uint32_t source = (control >> 6) & 3;
+      if ((source != 0 && source != 2) || (source == 0 && count - prefix < 3))
+        return false;
+      static const PacketTypeInfo query_info = {PacketCategory::kDraw, "PM4_DRAW_INDX"};
+      static const PacketTypeInfo auto_info = {PacketCategory::kDraw, "PM4_DRAW_INDX_2"};
+      out_info->type_info = prefix ? &query_info : &auto_info;
+      out_info->actions.emplace_back(
+          PacketAction::RegisterWrite(XE_GPU_REG_VGT_DRAW_INITIATOR, control));
+      if (source == 0) {
+        out_info->actions.emplace_back(PacketAction::RegisterWrite(
+            XE_GPU_REG_VGT_DMA_BASE, memory::load_and_swap<uint32_t>(ptr + (prefix + 1) * 4)));
+        out_info->actions.emplace_back(PacketAction::RegisterWrite(
+            XE_GPU_REG_VGT_DMA_SIZE, memory::load_and_swap<uint32_t>(ptr + (prefix + 2) * 4)));
+      }
+      return true;
     }
     case PM4_SET_CONSTANT: {
       // load constant into chip and to memory
@@ -409,7 +709,8 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
       out_info->type_info = &op_info;
       uint32_t value = memory::load_and_swap<uint32_t>(ptr);
       // bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | value;
-      out_info->actions.emplace_back(PacketAction::SetBinMask(value));
+      out_info->actions.emplace_back(
+          PacketAction::SetBinHalf(PacketAction::Type::kSetBinMaskLow, value));
       break;
     }
     case PM4_SET_BIN_MASK_HI: {
@@ -418,6 +719,8 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
       uint32_t value = memory::load_and_swap<uint32_t>(ptr);
       // bin_mask_ =
       //  (bin_mask_ & 0xFFFFFFFFull) | (static_cast<uint64_t>(value) << 32);
+      out_info->actions.emplace_back(
+          PacketAction::SetBinHalf(PacketAction::Type::kSetBinMaskHigh, value));
       break;
     }
     case PM4_SET_BIN_SELECT_LO: {
@@ -425,7 +728,8 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
       out_info->type_info = &op_info;
       uint32_t value = memory::load_and_swap<uint32_t>(ptr);
       // bin_select_ = (bin_select_ & 0xFFFFFFFF00000000ull) | value;
-      out_info->actions.emplace_back(PacketAction::SetBinSelect(value));
+      out_info->actions.emplace_back(
+          PacketAction::SetBinHalf(PacketAction::Type::kSetBinSelectLow, value));
       break;
     }
     case PM4_SET_BIN_SELECT_HI: {
@@ -435,18 +739,30 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
       // bin_select_ =
       //  (bin_select_ & 0xFFFFFFFFull) | (static_cast<uint64_t>(value) <<
       //  32);
+      out_info->actions.emplace_back(
+          PacketAction::SetBinHalf(PacketAction::Type::kSetBinSelectHigh, value));
       break;
     }
 
     // Ignored packets - useful if breaking on the default handler below.
-    case 0x50: {  // 0xC0015000 usually 2 words, 0xFFFFFFFF / 0x00000000
-      static const PacketTypeInfo op_info = {PacketCategory::kGeneric, "PM4_TYPE3_0x50"};
+    case PM4_SET_BIN_MASK: {
+      if (count != 2)
+        return false;
+      static const PacketTypeInfo op_info = {PacketCategory::kGeneric, "PM4_SET_BIN_MASK"};
       out_info->type_info = &op_info;
+      out_info->actions.emplace_back(
+          PacketAction::SetBinMask((uint64_t(memory::load_and_swap<uint32_t>(ptr)) << 32) |
+                                   memory::load_and_swap<uint32_t>(ptr + 4)));
       break;
     }
-    case 0x51: {  // 0xC0015100 usually 2 words, 0xFFFFFFFF / 0xFFFFFFFF
-      static const PacketTypeInfo op_info = {PacketCategory::kGeneric, "PM4_TYPE3_0x51"};
+    case PM4_SET_BIN_SELECT: {
+      if (count != 2)
+        return false;
+      static const PacketTypeInfo op_info = {PacketCategory::kGeneric, "PM4_SET_BIN_SELECT"};
       out_info->type_info = &op_info;
+      out_info->actions.emplace_back(
+          PacketAction::SetBinSelect((uint64_t(memory::load_and_swap<uint32_t>(ptr)) << 32) |
+                                     memory::load_and_swap<uint32_t>(ptr + 4)));
       break;
     }
     default: {
@@ -459,6 +775,7 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
 }
 
 bool PacketDisassembler::DisasmPacket(const uint8_t* base_ptr, PacketInfo* out_info) {
+  *out_info = {};
   const uint32_t packet = memory::load_and_swap<uint32_t>(base_ptr);
   const uint32_t packet_type = packet >> 30;
   switch (packet_type) {

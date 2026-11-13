@@ -3,10 +3,21 @@
 #include <rex/cvar.h>
 #include <rex/graphics/d3d11/graphics_system.h>
 #include <rex/graphics/d3d11/profile.h>
+#include <rex/graphics/util/register_write.h>
 #include <rex/logging.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/memory/utils.h>
 #include <rex/ui/d3d11/d3d11_presenter.h>
+
+#include <algorithm>
+#include <bit>
+#include <vector>
+
+REXCVAR_DEFINE_INT32(d3d11_buffer_cache_mb, 32, "GPU/D3D11",
+                     "Retained vertex and index buffer budget in MiB, including CPU snapshots "
+                     "(1-128, allocated only as needed)");
+REXCVAR_DEFINE_BOOL(d3d11_constant_buffer_ranges, true, "GPU/D3D11",
+                    "Append constant uploads into bounded buffers when the driver supports it");
 
 REXCVAR_DECLARE(int32_t, gpu_wait_stats);
 REXCVAR_DECLARE(bool, native_2x_msaa);
@@ -33,15 +44,19 @@ bool D3D11CommandProcessor::SetupContext() {
   std::lock_guard lock(Device().context_mutex());
   if (!CommandProcessor::SetupContext())
     return false;
+  native_gpu_diagnostics_.Initialize("d3d11");
+  native_gpu_diagnostics_.BindRegisterFile(register_file_);
   uint32_t scale_x, scale_y;
   TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y);
   draws_ = std::make_unique<DrawContext>(Device());
   shared_memory_ = std::make_unique<D3D11SharedMemory>(Device(), *draws_, *memory_, trace_writer_);
+  shared_memory_->SetNativeDiagnostics(&native_gpu_diagnostics_);
   std::string error;
   if (!shared_memory_->Initialize(error))
     return Fail(error);
   targets_ = std::make_unique<D3D11RenderTargetCache>(*register_file_, *memory_, &trace_writer_,
                                                       Device(), *draws_, scale_x, scale_y);
+  targets_->SetSharedMemory(shared_memory_.get());
   // The same options as the Direct3D 12 and Vulkan host render targets, except
   // that gamma targets always use the 16-bit storage qualified for DX11.
   D3D11RenderTargetCache::Options target_options;
@@ -69,8 +84,10 @@ bool D3D11CommandProcessor::SetupContext() {
   options.depth_float24_convert_in_pixel_shader = targets_->depth_float24_convert_in_pixel_shader();
   options.depth_float24_round = targets_->depth_float24_round();
   pipelines_ = std::make_unique<PipelineCache>(Device(), *register_file_, options);
-  guest_draw_ = std::make_unique<GuestDraw>(*register_file_, Device(), *draws_, *shared_memory_,
-                                            *textures_, *targets_, *primitives_, *pipelines_);
+  guest_draw_ = std::make_unique<GuestDraw>(
+      *register_file_, Device(), *draws_, *shared_memory_, *textures_, *targets_, *primitives_,
+      *pipelines_, uint64_t(std::clamp(REXCVAR_GET(d3d11_buffer_cache_mb), 1, 128)) << 20,
+      REXCVAR_GET(d3d11_constant_buffer_ranges));
   output_ = std::make_unique<ui::d3d11::D3D11ImageRenderer>(Device());
   if (!output_->Initialize(error))
     return Fail(error);
@@ -102,12 +119,25 @@ void D3D11CommandProcessor::ShutdownContext() {
     shared_memory_->Shutdown();
   shared_memory_.reset();
   draws_.reset();
+  native_gpu_diagnostics_.WriteReport(true);
   CommandProcessor::ShutdownContext();
 }
 void D3D11CommandProcessor::ClearCaches() {
   std::lock_guard lock(Device().context_mutex());
   if (!draws_)
     return;
+  auto save_shader = [](const Shader* shader) {
+    std::vector<uint32_t> words;
+    if (shader) {
+      words = shader->ucode_data();
+      if constexpr (std::endian::native != std::endian::big)
+        for (uint32_t& word : words)
+          word = std::byteswap(word);
+    }
+    return words;
+  };
+  auto vertex_code = save_shader(active_vertex_shader_);
+  auto pixel_code = save_shader(active_pixel_shader_);
   draws_->Clear();
   guest_draw_->ClearCache();
   primitives_->ClearCache();
@@ -115,15 +145,26 @@ void D3D11CommandProcessor::ClearCaches() {
   targets_->ClearCache();
   active_vertex_shader_ = active_pixel_shader_ = nullptr;
   pipelines_->Clear();
+  if (!vertex_code.empty())
+    active_vertex_shader_ = pipelines_->LoadShader(xenos::ShaderType::kVertex, vertex_code);
+  if (!pixel_code.empty())
+    active_pixel_shader_ = pipelines_->LoadShader(xenos::ShaderType::kPixel, pixel_code);
+  shared_memory_->ClearCache();
   gamma_buffers_->Clear();
   CommandProcessor::ClearCaches();
 }
 void D3D11CommandProcessor::InvalidateGpuMemory() {
   std::lock_guard lock(Device().context_mutex());
-  if (shared_memory_)
+  if (shared_memory_) {
+    shared_memory_->ClearCache();
     shared_memory_->InvalidateAllPages();
+  }
 }
 void D3D11CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31 && (*register_file_)[index] == value) {
+    return;
+  }
   CommandProcessor::WriteRegister(index, value);
   if (textures_ && index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5)
@@ -143,7 +184,12 @@ void D3D11CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
     return;
   }
-  memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X) {
+    if (!draw_util::CopyAndSwapRegisters(register_file_->values + start_index, base, num_registers))
+      return;
+  } else {
+    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+  }
   if (textures_ && start_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 &&
       end_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) {
     uint32_t first = std::max(start_index, uint32_t(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0));
@@ -173,10 +219,14 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType type, uint32_t count,
   clock.Mark(ProfilePhase::kDrawContext);
   std::string error;
   return guest_draw_->Submit(static_cast<D3D11Shader*>(active_vertex_shader_),
-                             static_cast<D3D11Shader*>(active_pixel_shader_), error) ||
+                             static_cast<D3D11Shader*>(active_pixel_shader_), error,
+                             IsReadbackMemexportEnabled(true)) ||
          Fail(error);
 }
 bool D3D11CommandProcessor::IssueCopy() {
+  NativeGpuDiagnostics::RouteScope route(&native_gpu_diagnostics_,
+                                         NativeGpuDiagnostics::RouteSystem::kResolves);
+  route.Native();
   if (!failure_.empty())
     return false;
   std::lock_guard lock(Device().context_mutex());
@@ -188,6 +238,7 @@ bool D3D11CommandProcessor::IssueCopy() {
   bool resolved =
       targets_->Resolve(*shared_memory_, *textures_, *memory_, trace_writer_, address, length);
   clock.Mark(ProfilePhase::kResolve);
+  route.Finish(resolved);
   return resolved || Fail(targets_->last_error());
 }
 void D3D11CommandProcessor::OnPrimaryBufferEnd() {
@@ -201,9 +252,16 @@ void D3D11CommandProcessor::TracePlaybackWroteMemory(uint32_t address, uint32_t 
   primitives_->MemoryInvalidationCallback(address, length, true);
 }
 void D3D11CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
-  Fail("Native DX11 EDRAM snapshot restoration is not connected");
+  if (!failure_.empty() || !targets_)
+    return;
+  std::lock_guard lock(Device().context_mutex());
+  if (!targets_->RestoreEdramSnapshot(snapshot))
+    Fail(targets_->last_error());
 }
 void D3D11CommandProcessor::IssueSwap(uint32_t pointer, uint32_t width, uint32_t height) {
+  NativeGpuDiagnostics::RouteScope route(&native_gpu_diagnostics_,
+                                         NativeGpuDiagnostics::RouteSystem::kHostPresentation);
+  route.Native();
   if (!failure_.empty() || !graphics_system_->presenter())
     return;
   ProfileClock clock;
@@ -275,12 +333,14 @@ void D3D11CommandProcessor::IssueSwap(uint32_t pointer, uint32_t width, uint32_t
     draws_->Invalidate();
     primitives_->EndFrame();
     shared_memory_->OnGuestFrameEnd();
+    native_gpu_diagnostics_.Frame();
     textures_->BeginFrame();
     gpu_profiler_->EndFrame();
     SetProfileEnabled(REXCVAR_GET(gpu_wait_stats) > 0);
     Device().context()->Flush();
   }
   clock.Mark(ProfilePhase::kSwap);
+  route.Finish(refreshed);
 }
 
 bool D3D11CommandProcessor::PrepareFxaaImage(uint32_t width, uint32_t height, std::string& error) {

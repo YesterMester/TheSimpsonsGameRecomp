@@ -1,0 +1,2054 @@
+{
+  "schema": 1,
+  "description": "Reviewed descriptive names, not recovered original symbols or public calling signatures. Definition hashes and quoted evidence need review when they change. Prefer the linked public mod operations.",
+  "functions": [
+    {
+      "symbol": "sub_823A4850",
+      "name": "Ui.Options.Suspend",
+      "system": "menus",
+      "summary": "Suspend the original Options screen.",
+      "definition_sha256": "d97315063f9f61ad2082e84fd012f6cc018fcf666abecb64940f988347973766",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "That state remains set after closing, so it cannot identify a visible screen by itself.\nThe base screen's active flag at `screen + 28` and close function (`0x827F3780`) determine when\nto release keyboard capture. The suspend hook (`0x823A4850`) also releases capture.\n\n`game_menu_apt.cpp` wraps the title's variable and method interfaces on its own game thread:"
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_823A4890",
+      "name": "Ui.Options.Show",
+      "system": "menus",
+      "summary": "Show the original Options screen.",
+      "definition_sha256": "06834d39ad0d9eba57bf35dfc8b0ea82fcbbc73f5fc79cdac068c756b485b7ed",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "## Menu lifecycle\n\n`game_menu.cpp` hooks the Options screen's show (`0x823A4890`), state transition (`0x823A4C90`)\nand input (`0x823A5768`). The singleton is at `0x82D08DDC`; the root state at `0x82D08DE0` is 1.\nThat state remains set after closing, so it cannot identify a visible screen by itself."
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_823A4C90",
+      "name": "Ui.Options.ChangeState",
+      "system": "menus",
+      "summary": "Transition the original Options screen's state.",
+      "definition_sha256": "4414fcd7cf03854311fd70c40e00069acf8984c86db1c811c26f9ecf92e7f513",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "## Menu lifecycle\n\n`game_menu.cpp` hooks the Options screen's show (`0x823A4890`), state transition (`0x823A4C90`)\nand input (`0x823A5768`). The singleton is at `0x82D08DDC`; the root state at `0x82D08DE0` is 1.\nThat state remains set after closing, so it cannot identify a visible screen by itself."
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_823A5768",
+      "name": "Ui.Options.Input",
+      "system": "menus",
+      "summary": "Dispatch input through the original Options screen.",
+      "definition_sha256": "456427c541df3e3f9421baa1dee067dbb52f3e262139b3435bc8c9814b82f4b5",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "\n`game_menu.cpp` hooks the Options screen's show (`0x823A4890`), state transition (`0x823A4C90`)\nand input (`0x823A5768`). The singleton is at `0x82D08DDC`; the root state at `0x82D08DE0` is 1.\nThat state remains set after closing, so it cannot identify a visible screen by itself.\nThe base screen's active flag at `screen + 28` and close function (`0x827F3780`) determine when"
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_823B1A18",
+      "name": "Streaming.RetireLoad",
+      "system": "streaming",
+      "summary": "Request original source-load retirement through the native state machine.",
+      "definition_sha256": "218965d2ab509e11219af9e5284eac29b3296bbc054b4dc3043e21a24009ae2a",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "Retirement uses `sub_823B1A18`, `sub_826C8358` and `sub_826C97C0`."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_823F1C98",
+      "name": "RenderWare.Camera.SetViewWindow",
+      "system": "camera",
+      "summary": "Write view-window extents and reciprocals, then dirty the camera frame.",
+      "definition_sha256": "15fca2c2015c3837c0f5f58e14cd0b86efa8e50769f9a84320b94514b4048236",
+      "evidence": [
+        {
+          "path": "simpsons/re/modkit_camera.md",
+          "quote": "`sub_823F1C98` stores horizontal/vertical view-window extents at camera +104/+108,\ntheir reciprocals at +112/+116, and marks the camera's frame dirty when present."
+        }
+      ],
+      "operations": [
+        "camera.pose",
+        "camera.set_pose"
+      ]
+    },
+    {
+      "symbol": "sub_823F2460",
+      "name": "Scene.Frame.MarkDirty",
+      "system": "entities",
+      "summary": "Queue the frame hierarchy for the original RenderWare update.",
+      "definition_sha256": "e27a184058307fd59eb361971a79a131dd5d79ebb133eed5ab8a0f359831c64e",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "Entity virtual +28 is the position setter. `sub_82696D10(entity, position)` writes\nthe three translation words at frame +64, calls `sub_823F2460(frame)` to queue a\nRenderWare update, then dispatches entity virtual +92. The base notification\n`sub_82697160` marks entity +202 bit `0x0800` and notifies a non-null model at +136\nthrough `sub_826A8708(model, 1)`. Calling only the base setter skips overrides:\nthe character setter `sub_8288D2E0` also calls controller +784, virtual +60, with\nthe position and flag 0. The ScriptableProp and all four family vtables observed\nin a private Linux GAME_HUB run agree on setter slot +28 and notification +92."
+        }
+      ],
+      "operations": [
+        "entities.transform",
+        "entities.move",
+        "world.spawn",
+        "players.teleport"
+      ]
+    },
+    {
+      "symbol": "sub_823F24D8",
+      "name": "Scene.Frame.UpdateWorldMatrix",
+      "system": "entities",
+      "summary": "Update parent world matrices recursively before composing a child.",
+      "definition_sha256": "0a72a037453bf373688d1e5fc6460a8abf7d0921c57dae7c09b6c7194b4d2ff9",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "The frame at entity +140 stores its modelling matrix at +16 and cached world\nmatrix at +80. Parent is frame +4; hierarchy root is frame +160.\n`sub_823F2540(frame)` returns the modelling matrix for a root or the resolved\nworld matrix for a child. It inspects the root's dirty flag and updates parent\nmatrices through `sub_823F24D8` before composing the child. A root's cached world\nmatrix can be stale even when its modelling matrix is current; copying either\ntranslation directly is not a substitute for the getter."
+        }
+      ],
+      "operations": [
+        "entities.transform",
+        "entities.move",
+        "world.spawn",
+        "players.teleport"
+      ]
+    },
+    {
+      "symbol": "sub_823F2540",
+      "name": "Scene.Frame.GetWorldMatrix",
+      "system": "entities",
+      "summary": "Resolve the RenderWare world transform, including pending parent changes.",
+      "definition_sha256": "0a07321db7bff3c9f6d725df61a3c5462f4a5b46018906146674154b6bd47d24",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "The frame at entity +140 stores its modelling matrix at +16 and cached world\nmatrix at +80. Parent is frame +4; hierarchy root is frame +160.\n`sub_823F2540(frame)` returns the modelling matrix for a root or the resolved\nworld matrix for a child. It inspects the root's dirty flag and updates parent\nmatrices through `sub_823F24D8` before composing the child. A root's cached world\nmatrix can be stale even when its modelling matrix is current; copying either\ntranslation directly is not a substitute for the getter."
+        }
+      ],
+      "operations": [
+        "entities.transform",
+        "entities.move",
+        "world.spawn",
+        "players.teleport"
+      ]
+    },
+    {
+      "symbol": "sub_823F2748",
+      "name": "Frame.ApplyMatrix",
+      "system": "entities",
+      "summary": "Apply the RenderWare matrix operation and queue a frame update.",
+      "definition_sha256": "bcf7a5cbe0da1db2facecb0751cf139ce4f40e8ba1afae844797670399debe88",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "`sub_823F2748(frame, matrix, combine)` applies the RenderWare matrix operation\nand marks the frame dirty. Entity cached scale and class notifications belong\nto the entity setter above, rather than to that frame wrapper."
+        }
+      ],
+      "operations": [
+        "entities.set_transform"
+      ]
+    },
+    {
+      "symbol": "sub_82453EB0",
+      "name": "Graphics.SwapInterrupt",
+      "system": "rendering",
+      "summary": "Release the game's swap queue from its GPU interrupt callback.",
+      "definition_sha256": "0ea647735554da5b898aef2d886aa979889bc07c74931061e2a8e11b78dcd2d7",
+      "evidence": [
+        {
+          "path": "simpsons/src/frame_pacing.cpp",
+          "quote": "// swap is released now when less than this percentage of a frame has passed\n// since the last vblank, otherwise at the next vblank. The game passes 0.\nREX_EXTERN(__imp__sub_82453EB0);\nREX_EXTERN(sub_82453EB0);\n"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8268F998",
+      "name": "Entity.DeliverMessage",
+      "system": "entities",
+      "summary": "Preserve activation, virtual delivery and deferred subscriber retirement.",
+      "definition_sha256": "857305d773f9562732f483e27e7206b61b77793b121bc7ad551db1aa6ff5f3d6",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "Delivery follows original synchronous hit producers such as `sub_82883888`:\n`sub_8268FAA8(message-global, entity +56, damage-info, 0)` constructs the borrowed\nmessage and calls `sub_8268F998`. That dispatcher respects subscriber +4 bit 0,\nenters the entity's virtual handler and preserves message-type dispatch flags\nand deferred subscriber retirement. Entering only the health receiver would\nomit other listening components and the subscriber activation check. The\nadapter uses this original dispatcher for both damage and healing, without the\nforce flag. The native fixture also executes both unchanged dispatch routines;\nits synthetic entity receiver is an explicit scene boundary.\n"
+        }
+      ],
+      "operations": [
+        "entities.damage",
+        "entities.heal",
+        "players.damage",
+        "players.heal",
+        "players.refill_health"
+      ]
+    },
+    {
+      "symbol": "sub_8268FAA8",
+      "name": "Entity.SendMessage",
+      "system": "entities",
+      "summary": "Construct and synchronously send a borrowed message to an entity subscriber.",
+      "definition_sha256": "a0317347304577237be2a4be3bc11aa0babf352084626fce2fe7167dfb68aa1b",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "Delivery follows original synchronous hit producers such as `sub_82883888`:\n`sub_8268FAA8(message-global, entity +56, damage-info, 0)` constructs the borrowed\nmessage and calls `sub_8268F998`. That dispatcher respects subscriber +4 bit 0,\nenters the entity's virtual handler and preserves message-type dispatch flags\nand deferred subscriber retirement. Entering only the health receiver would\nomit other listening components and the subscriber activation check. The\nadapter uses this original dispatcher for both damage and healing, without the\nforce flag. The native fixture also executes both unchanged dispatch routines;\nits synthetic entity receiver is an explicit scene boundary.\n"
+        }
+      ],
+      "operations": [
+        "entities.damage",
+        "entities.heal",
+        "players.damage",
+        "players.heal",
+        "players.refill_health"
+      ]
+    },
+    {
+      "symbol": "sub_82696D10",
+      "name": "Entity.SetLocalPosition",
+      "system": "entities",
+      "summary": "Write frame translation, queue its update and dispatch the class transform notification.",
+      "definition_sha256": "ac11bd6e8d369a6455328ca0aec91aed184ce0fe078b6c3bec5ac9ce0718ec8e",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "Entity virtual +28 is the position setter. `sub_82696D10(entity, position)` writes\nthe three translation words at frame +64, calls `sub_823F2460(frame)` to queue a\nRenderWare update, then dispatches entity virtual +92. The base notification\n`sub_82697160` marks entity +202 bit `0x0800` and notifies a non-null model at +136\nthrough `sub_826A8708(model, 1)`. Calling only the base setter skips overrides:\nthe character setter `sub_8288D2E0` also calls controller +784, virtual +60, with\nthe position and flag 0. The ScriptableProp and all four family vtables observed\nin a private Linux GAME_HUB run agree on setter slot +28 and notification +92."
+        }
+      ],
+      "operations": [
+        "entities.transform",
+        "entities.move",
+        "world.spawn",
+        "players.teleport"
+      ]
+    },
+    {
+      "symbol": "sub_82697160",
+      "name": "Entity.NotifyTransformChanged",
+      "system": "entities",
+      "summary": "Mark the base entity transform dirty and notify its model.",
+      "definition_sha256": "8f4371e316bc2513f88da80e64f4a9b14f7950684e27d239485290dc8388c036",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "Entity virtual +28 is the position setter. `sub_82696D10(entity, position)` writes\nthe three translation words at frame +64, calls `sub_823F2460(frame)` to queue a\nRenderWare update, then dispatches entity virtual +92. The base notification\n`sub_82697160` marks entity +202 bit `0x0800` and notifies a non-null model at +136\nthrough `sub_826A8708(model, 1)`. Calling only the base setter skips overrides:\nthe character setter `sub_8288D2E0` also calls controller +784, virtual +60, with\nthe position and flag 0. The ScriptableProp and all four family vtables observed\nin a private Linux GAME_HUB run agree on setter slot +28 and notification +92."
+        }
+      ],
+      "operations": [
+        "entities.transform",
+        "entities.move",
+        "world.spawn",
+        "players.teleport"
+      ]
+    },
+    {
+      "symbol": "sub_82697188",
+      "name": "Entity.Visibility.Hide",
+      "system": "entities",
+      "summary": "Increment the native hide count, detaching the model on its first request.",
+      "definition_sha256": "afdac148c316f52091ecb838d6091d9a871813b4ff053f5ca77ed9403478b6a7",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_visibility.md",
+          "quote": "`sub_82697188` increments the byte at entity +206. On the first hide, if the\nmodel at +136 exists, it invokes the entity's virtual +260. `sub_826971C0`\ndecrements a nonzero count and invokes virtual +256 when the result is zero.\n`sub_82697200` clears the counter and dispatches virtual +100 (the show method).\nIt is an explicit force-show and must not be used to release one owner's request."
+        }
+      ],
+      "operations": [
+        "entities.render_state",
+        "entities.set_visible"
+      ]
+    },
+    {
+      "symbol": "sub_826971C0",
+      "name": "Entity.Visibility.Show",
+      "system": "entities",
+      "summary": "Release one native hide request and attach the model when none remain.",
+      "definition_sha256": "7de42cbf15cf6d5e02685c3cdfb4e2f6fb57b2837e439e64ed283af597eb3b8a",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_visibility.md",
+          "quote": "`sub_82697188` increments the byte at entity +206. On the first hide, if the\nmodel at +136 exists, it invokes the entity's virtual +260. `sub_826971C0`\ndecrements a nonzero count and invokes virtual +256 when the result is zero.\n`sub_82697200` clears the counter and dispatches virtual +100 (the show method).\nIt is an explicit force-show and must not be used to release one owner's request."
+        }
+      ],
+      "operations": [
+        "entities.render_state",
+        "entities.set_visible"
+      ]
+    },
+    {
+      "symbol": "sub_82697200",
+      "name": "Entity.Visibility.ForceShow",
+      "system": "entities",
+      "summary": "Clear every native hide request before dispatching show.",
+      "definition_sha256": "84e9727490e050c2acbb16a507c05bf1396a052713e72904aaf4da3d899e9397",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_visibility.md",
+          "quote": "`sub_82697188` increments the byte at entity +206. On the first hide, if the\nmodel at +136 exists, it invokes the entity's virtual +260. `sub_826971C0`\ndecrements a nonzero count and invokes virtual +256 when the result is zero.\n`sub_82697200` clears the counter and dispatches virtual +100 (the show method).\nIt is an explicit force-show and must not be used to release one owner's request."
+        }
+      ],
+      "operations": [
+        "entities.render_state",
+        "entities.set_visible"
+      ]
+    },
+    {
+      "symbol": "sub_82697690",
+      "name": "Entity.SetLocalTransform",
+      "system": "entities",
+      "summary": "Set the complete local matrix, update cached native scale and notify the model through the class virtual.",
+      "definition_sha256": "f84697770d2b8a4586cdb0a1727afcaf2188fcf694fb4d1870fda14ef8ee36a8",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "Entity virtual +40 is the full local-matrix setter.\n`sub_82697690(entity, matrix)` computes the three cached scale values at entity\n+144/+148/+152 through the original vector-length routine, replaces the frame's\nmodelling matrix through `sub_823F2748`, marks the frame dirty and dispatches\nentity virtual +92. The observed ScriptableProp vtable uses that method.\nThe character override `sub_8288D428` calls it and then dispatches controller\n+784, virtual +56, with the matrix and flag zero. All four previously captured\nfamily-character vtables use this override at +40."
+        }
+      ],
+      "operations": [
+        "entities.set_transform"
+      ]
+    },
+    {
+      "symbol": "sub_826993F0",
+      "name": "Entity.Scene.AttachModel",
+      "system": "entities",
+      "summary": "Show the native model, update class bounds, attach its spatial node and refresh culling.",
+      "definition_sha256": "0bac3c252e13ee7451e19b1a3fac31777ad25249ffec68b7f6a0f12a06a64f88",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_visibility.md",
+          "quote": "The shared scene entries are `sub_826993F0` at virtual +256 and `sub_826994E0`\nat +260. Attach calls the model's virtual +40, obtains class bounds through\nvirtual +236, inserts the +156 spatial node and updates the +160 culling object.\nDetach removes the node, calls the model's virtual +44 and updates that culling\nobject. `sub_826AF408` sets spatial-node byte +26 bit 4 after successful insertion;\n`sub_826AF4B0` clears it on removal. This is scene membership, not a camera test."
+        }
+      ],
+      "operations": [
+        "entities.render_state",
+        "entities.set_visible"
+      ]
+    },
+    {
+      "symbol": "sub_826994E0",
+      "name": "Entity.Scene.DetachModel",
+      "system": "entities",
+      "summary": "Remove the spatial node, hide the native model and refresh culling state.",
+      "definition_sha256": "19b3671854734b75f0b299feaf29a6d828616a26dab7980c3e1720e4a83e2c55",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_visibility.md",
+          "quote": "The shared scene entries are `sub_826993F0` at virtual +256 and `sub_826994E0`\nat +260. Attach calls the model's virtual +40, obtains class bounds through\nvirtual +236, inserts the +156 spatial node and updates the +160 culling object.\nDetach removes the node, calls the model's virtual +44 and updates that culling\nobject. `sub_826AF408` sets spatial-node byte +26 bit 4 after successful insertion;\n`sub_826AF4B0` clears it on removal. This is scene membership, not a camera test."
+        }
+      ],
+      "operations": [
+        "entities.render_state",
+        "entities.set_visible"
+      ]
+    },
+    {
+      "symbol": "sub_8269AD58",
+      "name": "Entity.ForEachComponent",
+      "system": "combat",
+      "summary": "Walk the original component pointer array using the bank count.",
+      "definition_sha256": "df342efef8114b2a9d49ed67d5e58b2b45dbbe45373ee61ed4a0165d3151bb51",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "`sub_8269AD58` walks the component pointer array at entity +52, entries 1 through\nthe unsigned halfword count at bank +12; bank is entity +48. Entry zero is the\nabsent-component sentinel. `sub_8269ADC0` instead indexes the bank's numeric\ntype map at `(type + 7) * 2`. That numeric type is not a hash or a component's\nfield +4. The adapter walks the bounded bank rather than inventing a type ID."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_8269BC10",
+      "name": "Entity.DestroyBase",
+      "system": "entities",
+      "summary": "Release the base factory bank and unregister the entity; mod lifetime identities expire before this routine.",
+      "definition_sha256": "d04639914053ac277b9c4377cd6ae39c7c448381653acf3fdfa2319be28dfd58",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "The base destructor `sub_8269BC10` releases its factory bank and, when required,\ncalls `sub_826A16F8(world, entity)`. That unregister routine removes the direct GUID\nentry, decrements world +164 and unlinks entity +12/+16 and +4/+8. The handwritten\nbase-destructor hook invalidates host lifetime identities before the original runs.\nNo mod callbacks or guest calls run from that bookkeeping hook."
+        }
+      ],
+      "operations": [
+        "world.owned",
+        "world.destroy"
+      ]
+    },
+    {
+      "symbol": "sub_8269D130",
+      "name": "Camera.ApplyViewportPose",
+      "system": "camera",
+      "summary": "Apply a viewport pose, angles and lens through original RenderWare camera methods.",
+      "definition_sha256": "951ca362123e2f4f22605e528569b40d17dfd0c8ae5ee0bb3cf62618beabb157",
+      "evidence": [
+        {
+          "path": "simpsons/re/modkit_camera.md",
+          "quote": "`sub_8269D130` applies a viewport pose through the native RenderWare frame and\nprojection writers. It accepts manager, viewport, position, pitch/yaw/roll in\nradians, a lens angle and two projection-mode values. Manager +20 is viewport\n0's camera when the viewport count at +300 is nonzero."
+        }
+      ],
+      "operations": [
+        "camera.pose",
+        "camera.set_pose"
+      ]
+    },
+    {
+      "symbol": "sub_8269F990",
+      "name": "World.DestroyEntity",
+      "system": "entities",
+      "summary": "Dispatch an entity through its complete deleting destructor or subscriber removal path.",
+      "definition_sha256": "77cb58f9c0f706877a01d4366d0ce791a2cd7e275a919a25d98802767b0e13d0",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "`sub_8269F990(entity)` is the original single-object destruction dispatcher. For\nflag `0x08000000` it calls `sub_8268F538(entity +56)`, which sends the destruction\nmessage through subscriber virtual +4 and calls subscriber deleting virtual +0\nwith flag 1. Other objects call their own deleting virtual +0 with flag 1. World\ncleanup routines `sub_826A20E0` and `sub_826A2468` use the same dispatch. Calling a\nbase destructor directly would skip class-specific physics and component cleanup."
+        }
+      ],
+      "operations": [
+        "world.destroy"
+      ]
+    },
+    {
+      "symbol": "sub_826A0A28",
+      "name": "World.PostSpawnInitialize",
+      "system": "entities",
+      "summary": "Send post-spawn initialization to a loaded layer's entities.",
+      "definition_sha256": "24046bc22d198d7ba76438342606e49922b6d5ce28af8a9dad04816c340caf09",
+      "evidence": [
+        {
+          "path": "simpsons/src/spawner.cpp",
+          "quote": "// The loader separately registers it with the world (sub_826A31F0), which\n// copies its GUID to the entity at +28. Once a layer has loaded,\n// sub_826A0A28 sends iMsgPostSpawnInitialize (id at 0x82D583C4) to each of its\n// entities through the subscriber at +56 (vtable +4, with {id, 0, 1}); a copy\n// made later has to be sent it directly."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826A1108",
+      "name": "Entity.World.FindDefinition",
+      "system": "entities",
+      "summary": "Look up a resident definition by its complete native GUID.",
+      "definition_sha256": "432fa2686c43492ba2ffcecbad4ba834a666e3f17e88d860d23bfa91b3fa393c",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "`sub_826A1108` hashes all sixteen GUID bytes through `sub_82745390` and compares\nthe GUID returned by `sub_8269B028`."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_826A11E0",
+      "name": "World.FindDirectEntity",
+      "system": "entities",
+      "summary": "Look up a live directly indexed entity by its complete GUID.",
+      "definition_sha256": "e22db6308d59a15f46fe01a5870e246e463e86df89affd21072c8acb0a760d96",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "`sub_826A11E0(world +88, guid)` looks up a direct entity by all four GUID words,\nfollowing entity +44 for hash collisions. The clone's unique GUID must be in place\nbefore indexing; changing a linked entity's GUID leaves its index inconsistent."
+        }
+      ],
+      "operations": [
+        "world.owned"
+      ]
+    },
+    {
+      "symbol": "sub_826A16F8",
+      "name": "World.UnregisterEntity",
+      "system": "entities",
+      "summary": "Remove a live entity from world indexes and intrusive lists.",
+      "definition_sha256": "8c008f37baf8b2095ae7f10055a6a3a6815a5487a08edc596993d9f7c1e9a550",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "The base destructor `sub_8269BC10` releases its factory bank and, when required,\ncalls `sub_826A16F8(world, entity)`. That unregister routine removes the direct GUID\nentry, decrements world +164 and unlinks entity +12/+16 and +4/+8. The handwritten\nbase-destructor hook invalidates host lifetime identities before the original runs.\nNo mod callbacks or guest calls run from that bookkeeping hook."
+        }
+      ],
+      "operations": [
+        "world.destroy"
+      ]
+    },
+    {
+      "symbol": "sub_826A1818",
+      "name": "Entity.World.ShouldActivateLayer",
+      "system": "entities",
+      "summary": "Choose whether a retained SimG layer should enter native activation.",
+      "definition_sha256": "e9ecad9b91ebf68fc4f6a848cb8ada931354e276667b837faa9227f6c4c75963",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "The `sub_826A1818` hook returns false only for owned source\nloads, keeping their layers in the original pending list."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_826A31F0",
+      "name": "World.RegisterEntity",
+      "system": "entities",
+      "summary": "Register an entity and copy its record GUID into the live object.",
+      "definition_sha256": "ae4e2dc9a2c072a083174ea9ec8d2f55c04bcc37e8025d16d87c515fe984ade2",
+      "evidence": [
+        {
+          "path": "simpsons/src/spawner.cpp",
+          "quote": "// that sub_82704008 fills (hash -> create function, name, size) and builds\n// the entity from the record; sub_82703E90(hash) returns the class name.\n// The loader separately registers it with the world (sub_826A31F0), which\n// copies its GUID to the entity at +28. Once a layer has loaded,\n// sub_826A0A28 sends iMsgPostSpawnInitialize (id at 0x82D583C4) to each of its"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826A3350",
+      "name": "Entity.World.RegisterDefinition",
+      "system": "entities",
+      "summary": "Register a source-owned definition without constructing its live actor.",
+      "definition_sha256": "fd097e9b2dd5adddc4f5c516f2d8368343e4ea65c3b5d9e76d2a6c31c32cd038",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "Native `sub_826A3350` inserts definitions separately from constructing live\nentities."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_826A3418",
+      "name": "Level.LoadEntityRecord",
+      "system": "entities",
+      "summary": "Build a level entity from its stream record.",
+      "definition_sha256": "80bc44460c751462482c4bd441ee46c94fb332f99c2b2f8af08467d6b993c218",
+      "evidence": [
+        {
+          "path": "simpsons/src/spawner.cpp",
+          "quote": "// Entities created from level data, for the debug menu's spawner.\n//\n// The level loader (sub_826A3418 and two siblings) reads an entity record\n// from the stream: a header with flags at +16 (bit 0: has a header), the\n// entity's 16-byte GUID through the relative offset at +24 and its class hash"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826A8760",
+      "name": "Assets.MetaModel.Create",
+      "system": "assets",
+      "summary": "Create a native model retaining its relocated MMdl v10 prototype.",
+      "definition_sha256": "4da32a13d8dba175c038ac1dd0ad467446ffd0831805cf786804ffde8a361456",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_assets.md",
+          "quote": "`sub_826A8760` creates an MMdl model with vtable `0x820B7030` and retains its\nrelocated prototype at model +16."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "assets.search"
+      ]
+    },
+    {
+      "symbol": "sub_826AF408",
+      "name": "Entity.Scene.AttachNode",
+      "system": "entities",
+      "summary": "Insert a spatial node and mark successful scene membership.",
+      "definition_sha256": "1d5946f10babc132faa630c8a62870d14784bc147d40eb84e86b7d18de3ec9b2",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_visibility.md",
+          "quote": "The shared scene entries are `sub_826993F0` at virtual +256 and `sub_826994E0`\nat +260. Attach calls the model's virtual +40, obtains class bounds through\nvirtual +236, inserts the +156 spatial node and updates the +160 culling object.\nDetach removes the node, calls the model's virtual +44 and updates that culling\nobject. `sub_826AF408` sets spatial-node byte +26 bit 4 after successful insertion;\n`sub_826AF4B0` clears it on removal. This is scene membership, not a camera test."
+        }
+      ],
+      "operations": [
+        "entities.render_state",
+        "entities.set_visible"
+      ]
+    },
+    {
+      "symbol": "sub_826AF4B0",
+      "name": "Entity.Scene.DetachNode",
+      "system": "entities",
+      "summary": "Remove spatial links and clear scene membership.",
+      "definition_sha256": "f38502932fb613fdf58ed8de7e7f8d39953793a57b712755689bf54f3cbe2ae8",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_visibility.md",
+          "quote": "The shared scene entries are `sub_826993F0` at virtual +256 and `sub_826994E0`\nat +260. Attach calls the model's virtual +40, obtains class bounds through\nvirtual +236, inserts the +156 spatial node and updates the +160 culling object.\nDetach removes the node, calls the model's virtual +44 and updates that culling\nobject. `sub_826AF408` sets spatial-node byte +26 bit 4 after successful insertion;\n`sub_826AF4B0` clears it on removal. This is scene membership, not a camera test."
+        }
+      ],
+      "operations": [
+        "entities.render_state",
+        "entities.set_visible"
+      ]
+    },
+    {
+      "symbol": "sub_826B7B70",
+      "name": "FrameScheduler.WaitFrame",
+      "system": "rendering",
+      "summary": "Wait for the requested number of original vblank periods.",
+      "definition_sha256": "d2ba5ad4917ac070abab8c617b10bc3e4aab58194e420948d18efdd2b21cc5a5",
+      "evidence": [
+        {
+          "path": "simpsons/src/frame_pacing.cpp",
+          "quote": "// Frame rates other than whole fractions of 60 (and 0, unlimited) need more:\n// the game measures frames in whole 59.94 Hz vblanks (at least one), its frame\n// limiter (sub_826B7B70) waits whole vblank periods after the frame started,\n// and swaps wait for the next 60 Hz guest vblank. For those rates, frames are\n// counted in fractional vblanks (game_clock.cpp), the limiter waits for the"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826BEEE0",
+      "name": "Ui.ResolveButtonTag",
+      "system": "input",
+      "summary": "Resolve a game button tag before drawing dynamic input prompts.",
+      "definition_sha256": "506d572ae86771c484edfdf1d9534fde8890ad4adf740c7acdd43b70fd14ed0e",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "## Prompts and qualification\n\nButton tags are identified through the game's resolver (`0x826BEEE0`). Replacement shapes and\nlabels use the existing native font batch, retaining the original frame, transforms and render\nbackend. Atlas coordinates have four fractional bits and need the original renderer's 1/16"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826C3668",
+      "name": "Streams.ReadHeader",
+      "system": "assets",
+      "summary": "Read the 2048-byte SToc header.",
+      "definition_sha256": "b548daaf27da9aab88772d93b05ee867c78f66aaeaa4772d712b2b5676096bf7",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "\n`sub_826C6E48` checks version 7 and relocates +12 and +16. `sub_826C6D20` indexes records\nwith `index * 24`. `sub_826C3668` reads the 2,048-byte header.\n\n## Entry records"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826C36D0",
+      "name": "Streams.StoredSize",
+      "system": "assets",
+      "summary": "Compute the total stored archive size from its entry sizes.",
+      "definition_sha256": "2fa4b57072d6c920b28557e06c1cd159f5f9d339e3fc191e0154a87ab579631b",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "Payloads start at file offset 2,048, in entry order. Each file offset is 2,048 plus preceding\nstored sizes. `sub_826C3708` reads entry[+16] bytes into the buffer at entry[+20].\n`sub_826C36D0` computes total size using the same stored-size sum.\n\n`sub_826C6D20` resolves the +0 pool through `sub_826C5548` before allocating +12 bytes."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826C3708",
+      "name": "Streams.ReadEntry",
+      "system": "assets",
+      "summary": "Read stored entry bytes at the entry's in-buffer read offset.",
+      "definition_sha256": "3e761e2fda01ee120c37ee8d62db197318911f6c106132cb6b0f82403c8c17a7",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "\nPayloads start at file offset 2,048, in entry order. Each file offset is 2,048 plus preceding\nstored sizes. `sub_826C3708` reads entry[+16] bytes into the buffer at entry[+20].\n`sub_826C36D0` computes total size using the same stored-size sum.\n"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826C5548",
+      "name": "Streams.FindAllocationPool",
+      "system": "assets",
+      "summary": "Resolve an entry allocation-pool hash.",
+      "definition_sha256": "040b28c08f58b33a53082729579ec7a9fbb971bb73bddd2fdc8938385db257a1",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "`sub_826C36D0` computes total size using the same stored-size sum.\n\n`sub_826C6D20` resolves the +0 pool through `sub_826C5548` before allocating +12 bytes.\n`sub_826C5978` resolves the +4 codec through `sub_826C58F8` before decoding. The checked\nRefPack codec returns `0xB9F0B9EC` from `sub_8281E498`; `0x0EAC15C8` bypasses decompression."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826C58F8",
+      "name": "Streams.FindCodec",
+      "system": "assets",
+      "summary": "Resolve an entry compression-codec hash.",
+      "definition_sha256": "5af56b9fac5caef252fa7273ef591389d9f1ba1441dfad6a8dee405930f2e7a2",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "\n`sub_826C6D20` resolves the +0 pool through `sub_826C5548` before allocating +12 bytes.\n`sub_826C5978` resolves the +4 codec through `sub_826C58F8` before decoding. The checked\nRefPack codec returns `0xB9F0B9EC` from `sub_8281E498`; `0x0EAC15C8` bypasses decompression.\nThese hashes describe allocation and compression, not the RenderWare chunk's asset type."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826C5978",
+      "name": "Streams.DecodeEntry",
+      "system": "assets",
+      "summary": "Resolve the entry codec before decoding its resource bytes.",
+      "definition_sha256": "6f0a867ffb33c327426536f9b9cec9016a30589e859cefa5a89a6ab9b8757db3",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "\n`sub_826C6D20` resolves the +0 pool through `sub_826C5548` before allocating +12 bytes.\n`sub_826C5978` resolves the +4 codec through `sub_826C58F8` before decoding. The checked\nRefPack codec returns `0xB9F0B9EC` from `sub_8281E498`; `0x0EAC15C8` bypasses decompression.\nThese hashes describe allocation and compression, not the RenderWare chunk's asset type."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826C5E90",
+      "name": "Streaming.FindFolderByName",
+      "system": "streaming",
+      "summary": "Find a named folder record in the retained native stream catalogs.",
+      "definition_sha256": "8b16e3c06f77f70f0260c8e3ef3848e3875f0ca0387ff42cd3e660e3a36c05ec",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "The folder request uses `sub_826CB888`; `sub_826C5E90` proves that a child is described\nby a retained catalog."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_826C6168",
+      "name": "Streaming.FindSourceLoad",
+      "system": "streaming",
+      "summary": "Resolve a source GUID prefix to its current native file-load key.",
+      "definition_sha256": "e2e9090589a5034db6a9ef0699ae142a713bfe67001e13cd7d0eaed52ec2f37e",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "`sub_826C6168` resolves a GUID prefix through the file manager's four lists at\n+8728, +8712, +8704 and +8720."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_826C6D20",
+      "name": "Streams.OpenEntry",
+      "system": "assets",
+      "summary": "Index the 24-byte entry and allocate its declared pool buffer.",
+      "definition_sha256": "8a6ff5300ddc115e18b31b2ff9fdb53e9ceb8552885279e6d83d7dc3cb7d5f56",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "| `0x10` | 4 | Relative offset of the entry table |\n\n`sub_826C6E48` checks version 7 and relocates +12 and +16. `sub_826C6D20` indexes records\nwith `index * 24`. `sub_826C3668` reads the 2,048-byte header.\n"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826C6E48",
+      "name": "Streams.RelocateHeader",
+      "system": "assets",
+      "summary": "Validate the SToc version and relocate header pointers.",
+      "definition_sha256": "fb0c0b2b60759fd546821ce6cf61e6329bf14366a245e114a2be9cc624ce87a0",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "| `0x10` | 4 | Relative offset of the entry table |\n\n`sub_826C6E48` checks version 7 and relocates +12 and +16. `sub_826C6D20` indexes records\nwith `index * 24`. `sub_826C3668` reads the 2,048-byte header.\n"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826C76B8",
+      "name": "Streaming.QueueFile",
+      "system": "streaming",
+      "summary": "Insert a native file into the priority IO queue before loading starts.",
+      "definition_sha256": "6e85d23b1ae4501985881a4523336d5c5ff13a9a7e3f315340ddb57734132850",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "The queue hook at `sub_826C76B8` records each new load\nbefore IO can start. Pre-existing loads remain borrowed."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_826C8358",
+      "name": "Streaming.RetireFile",
+      "system": "streaming",
+      "summary": "Request native file retirement and its dependency traversal.",
+      "definition_sha256": "3de46e953b2579b7e780614424888b1857f2e3c9db45566ebe370ec6b8f3f517",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "Retirement uses `sub_823B1A18`, `sub_826C8358` and `sub_826C97C0`."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_826C97C0",
+      "name": "Streaming.CancelFile",
+      "system": "streaming",
+      "summary": "Cancel or unlink a native file according to its current loader state.",
+      "definition_sha256": "ef1e067f5412654bd7557cbe1be95fba55f8460f4c5c2767203d5f905d301fe6",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "Retirement uses `sub_823B1A18`, `sub_826C8358` and `sub_826C97C0`."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_826CB3A0",
+      "name": "Streaming.RequestByGuid",
+      "system": "streaming",
+      "summary": "Request a native catalog file and its dependency graph.",
+      "definition_sha256": "05b118d22f8b1d317367ab96a838244e3302b7ef7e6850260ffc9e850a38d3f4",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "`sub_826CB3A0` requests a catalog entry and its dependencies;\n`sub_826CA9A0` creates the native file owner when a load is needed."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_826CB888",
+      "name": "Streaming.RequestFolderByName",
+      "system": "streaming",
+      "summary": "Request an archive using retained catalog metadata or its original on-disk folder header.",
+      "definition_sha256": "aba85b01f26236d6d26bdc19a9d1cf01cb7219b2c3322d7504d547c1ba7b74bf",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "The folder request uses `sub_826CB888`; `sub_826C5E90` proves that a child is described\nby a retained catalog."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_826DECA0",
+      "name": "Assets.Model.BindReferences",
+      "system": "assets",
+      "summary": "Bind MMdl resource GUIDs through the original registry.",
+      "definition_sha256": "7a8c5e697d7a6be9bbc1288763d1acbd656f7313276d77972c716eb0b5e15880",
+      "evidence": [
+        {
+          "path": "simpsons/re/model_definitions.md",
+          "quote": "Reference records contain a native resource type at +8, a GUID at +12 and a\nruntime binding at +28. `sub_826DECA0` sets header flag 4, resolves these GUIDs\nthrough the original resource registry and stores the bindings. Wire data must\nhave zero runtime bindings and no bound flag."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_826E3F88",
+      "name": "Assets.ModelPart.Create",
+      "system": "assets",
+      "summary": "Construct a native render part from its declared DFF reference.",
+      "definition_sha256": "bb464f524f3345db9c6f46ea01c1357e30b9e830e67d9f6661cbcb803b8cd4be",
+      "evidence": [
+        {
+          "path": "simpsons/re/model_definitions.md",
+          "quote": "`sub_826E3F88` constructs a ModelPart using its resource-valued Model property.\nIt requires native type `0x9E3791CF` and passes the bound DFF clump through the\noriginal render-part setup. The live variant policy therefore permits selecting\nanother already declared DFF reference, while preserving GUIDs, dependency\nrecords, part classes and allocation sizes."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82701BD8",
+      "name": "Assets.Mesh.BuildDeclaration",
+      "system": "assets",
+      "summary": "Cache and forward a preinstanced mesh declaration to the original native constructor.",
+      "definition_sha256": "7e0cfd426da656e09091352ffc6226b42c7dd40a085a62d032432ee48fc2017b",
+      "evidence": [
+        {
+          "path": "simpsons/re/native_mesh_data.md",
+          "quote": "Stream 0, semantic `0x00030000`, declaration type `0x002A2187` supplies a\nbig-endian packed normal. XYZ occupy signed ten-bit fields starting at bits\n0, 10 and 20. Decode each with division by 511 and clamp the alternate -512\nencoding to -1. The upper two bits are preserved. This agrees with the signed\nnormalized `k_2_10_10_10` fetch representation in `graphics/xenos.h` and\n`graphics/pipeline/shader/interpreter.cpp`; `sub_82701BD8` forwards the original\ndeclaration to the native vertex declaration constructor."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82703960",
+      "name": "Entity.Factory.FindClassIndex",
+      "system": "entities",
+      "summary": "Find a class hash in the original sorted factory registry.",
+      "definition_sha256": "0d9f1f373f6d3a33f547ee3bd7302a625e125f391a7093044b9eeed200d7382d",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "`sub_82704008` registers those fields; `sub_82703960` performs class lookup."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_82703BD0",
+      "name": "Entity.Factory.Registry",
+      "system": "entities",
+      "summary": "Return the original sorted native factory registry.",
+      "definition_sha256": "75a13057754689a9b001770e27cb142afdceae95232dd04c2249eb0510bbb19c",
+      "evidence": [
+        {
+          "path": "simpsons/re/spawn_templates.md",
+          "quote": "`sub_82703BD0` returns the sorted factory registry at `0x82D6C08C`. Its entries\nare sixteen bytes: class hash, factory, name pointer and component offset."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_82703CA8",
+      "name": "EntityFactory.CreateFromRecord",
+      "system": "entities",
+      "summary": "Resolve the registered class and create an entity from a record.",
+      "definition_sha256": "7c06d0565bbbb2a27423b2f27758e9d7664f1fb21ff392e660878e78acff21d0",
+      "evidence": [
+        {
+          "path": "simpsons/src/spawner.cpp",
+          "quote": "// from the stream: a header with flags at +16 (bit 0: has a header), the\n// entity's 16-byte GUID through the relative offset at +24 and its class hash\n// at +28. sub_82703CA8(class hash, record) looks the class up in the registry\n// that sub_82704008 fills (hash -> create function, name, size) and builds\n// the entity from the record; sub_82703E90(hash) returns the class name."
+        }
+      ],
+      "operations": [
+        "world.spawn"
+      ]
+    },
+    {
+      "symbol": "sub_82703E90",
+      "name": "EntityFactory.ClassName",
+      "system": "entities",
+      "summary": "Look up a registered class name by hash.",
+      "definition_sha256": "fbc370fba6325f965c701f61266b9f0a616df5ff987a1d3e5e6382544cd335df",
+      "evidence": [
+        {
+          "path": "simpsons/src/spawner.cpp",
+          "quote": "// at +28. sub_82703CA8(class hash, record) looks the class up in the registry\n// that sub_82704008 fills (hash -> create function, name, size) and builds\n// the entity from the record; sub_82703E90(hash) returns the class name.\n// The loader separately registers it with the world (sub_826A31F0), which\n// copies its GUID to the entity at +28. Once a layer has loaded,"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82704008",
+      "name": "EntityFactory.RegisterClass",
+      "system": "entities",
+      "summary": "Register a class hash, constructor, class name and size.",
+      "definition_sha256": "b758499f3b26e74d54fef0f2e298100378d83509a152064e9cebc07a51d12242",
+      "evidence": [
+        {
+          "path": "simpsons/src/spawner.cpp",
+          "quote": "// entity's 16-byte GUID through the relative offset at +24 and its class hash\n// at +28. sub_82703CA8(class hash, record) looks the class up in the registry\n// that sub_82704008 fills (hash -> create function, name, size) and builds\n// the entity from the record; sub_82703E90(hash) returns the class name.\n// The loader separately registers it with the world (sub_826A31F0), which"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82710EB0",
+      "name": "Assets.Resource.FindGuid",
+      "system": "assets",
+      "summary": "Walk a resource hash bucket and compare the complete native GUID.",
+      "definition_sha256": "08a478045d9cd04b40368438d3499afc43b784c9e7e38bc3f5f7948702a52c65",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_assets.md",
+          "quote": "`sub_82710EB0` selects a hash bucket, follows resource entry +44,\nand compares all four GUID words at +28."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "assets.search"
+      ]
+    },
+    {
+      "symbol": "sub_82711460",
+      "name": "Assets.Resource.ResolveGuid",
+      "system": "assets",
+      "summary": "Resolve a nonzero native resource GUID through the original registry.",
+      "definition_sha256": "866cd96c02f082c54858156f1c45e51dc2f4731e1ee9c8c43311be516a19a174",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_assets.md",
+          "quote": "`sub_82711460` resolves a nonzero GUID through the resource registry at\n`0x82D6CADC`."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "assets.search"
+      ]
+    },
+    {
+      "symbol": "sub_82711B28",
+      "name": "Resources.ReadNamed",
+      "system": "assets",
+      "summary": "Read a named RenderWare resource from a decoded entry.",
+      "definition_sha256": "c12cca226486c14f1bb2bbbacd9a63e4d88baa5412e091b863fde52ac4eca54b",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "chunks, including `0x722` entity/layer data, must also be retained.\n\n`sub_82711B28`, registered through `sub_82711D38`, reads named resources. After the RenderWare\nheader it reads a big-endian header length. The payload begins at chunk +16 plus that length.\nThe padded name length at +16 leads to a 16-byte GUID. Relative fields following the GUID"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82714588",
+      "name": "Camera.BuildViewWindow",
+      "system": "camera",
+      "summary": "Compute native view-window extents with projection flags, raster aspect and interlaced video.",
+      "definition_sha256": "c1a5e7feda546fbc58444c9c8d76334610355e0fc52f0b7d5ab7e25578d655ad",
+      "evidence": [
+        {
+          "path": "simpsons/re/modkit_camera.md",
+          "quote": "`sub_82714588` computes a view window from tan(lens angle / 2), the video mode,\ncamera raster dimensions and two byte flags. Its vertical-preserving branch\nmultiplies by the shipped 0.5625 widescreen or 0.75 standard factor; the other\nbranch derives vertical extent from the raster aspect. Interlaced fields\ndouble the effective height. The director's input angle therefore is not\nunconditionally an actual vertical field of view."
+        }
+      ],
+      "operations": [
+        "camera.pose",
+        "camera.set_pose"
+      ]
+    },
+    {
+      "symbol": "sub_82718710",
+      "name": "FrameScheduler.TimeToDeadline",
+      "system": "rendering",
+      "summary": "Return the time until the scheduler's next frame deadline.",
+      "definition_sha256": "dcef2aa5f6d4119043161eb8ab9687394eefc54d90be3997f4bd91e02ee488f2",
+      "evidence": [
+        {
+          "path": "simpsons/src/frame_pacing.cpp",
+          "quote": "// per frame at +144, read on every call. The period is the game's own fixed\n// refresh rate (59.94 Hz), whatever rate the guest vblank runs at.\nREX_EXTERN(__imp__sub_82718710);\nREX_EXTERN(sub_82718710);\n"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82718788",
+      "name": "FrameScheduler.StartFrame",
+      "system": "rendering",
+      "summary": "Store the current frame's start timebase.",
+      "definition_sha256": "7e74a53edd35fd0c7503975ee11ba95ae512cfe77ba2701efb1a5d9be1eaa611",
+      "evidence": [
+        {
+          "path": "simpsons/src/frame_pacing.cpp",
+          "quote": "\n// Marks the start of a frame: the scheduler's start timebase (+136) = now.\nREX_EXTERN(__imp__sub_82718788);\nREX_EXTERN(sub_82718788);\n"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82719360",
+      "name": "Assets.Model.CopyMatrixValue",
+      "system": "assets",
+      "summary": "Copy the sixteen-float native model matrix property.",
+      "definition_sha256": "f3c9dfd44e199af14468ae7819e0bfb1cecb453aba2cbd6ee0ba6ccae4e7e7e4",
+      "evidence": [
+        {
+          "path": "simpsons/re/model_definitions.md",
+          "quote": "Property records contain the value at +0, name and owner/class strings at +4\nand +8, a name hash at +16 and the native type at +20. The original relocator\nfixes the value only when `type & 0x1B8` is nonzero. Reviewed types are unsigned\n32-bit integers (2), floats (4), strings (8), resource references (16), matrices\n(32) and three-component vectors (128). A matrix holds sixteen floats; a vector\nholds three. `sub_82719360` and `sub_827193D0` copy those respective layouts.\nOther kinds remain preserved, and unreviewed pointees prevent overlapping edits."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_827193D0",
+      "name": "Assets.Model.CopyVectorValue",
+      "system": "assets",
+      "summary": "Copy the three-float native model vector property.",
+      "definition_sha256": "41782734510ef1bc2ced9887dfac4d8f07b70cc87fa11a63c97afa948254ee8d",
+      "evidence": [
+        {
+          "path": "simpsons/re/model_definitions.md",
+          "quote": "Property records contain the value at +0, name and owner/class strings at +4\nand +8, a name hash at +16 and the native type at +20. The original relocator\nfixes the value only when `type & 0x1B8` is nonzero. Reviewed types are unsigned\n32-bit integers (2), floats (4), strings (8), resource references (16), matrices\n(32) and three-component vectors (128). A matrix holds sixteen floats; a vector\nholds three. `sub_82719360` and `sub_827193D0` copy those respective layouts.\nOther kinds remain preserved, and unreviewed pointees prevent overlapping edits."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82719770",
+      "name": "Assets.Model.Relocate",
+      "system": "assets",
+      "summary": "Relocate version 10 MMdl relative pointers in place.",
+      "definition_sha256": "720bfdf61075cf68f11f3fe4eb28b623f67f9dea6323cf018667a32db2a79524",
+      "evidence": [
+        {
+          "path": "simpsons/re/model_definitions.md",
+          "quote": "`sub_82719770` relocates a version 10 MMdl payload, adding its base to stored\nrelative pointers. `sub_82719B50` performs the inverse operation. The host\nreader/writer and reference fixture use these original routines to validate\nthe pointer layout without launching the game."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82719B50",
+      "name": "Assets.Model.Unrelocate",
+      "system": "assets",
+      "summary": "Undo the reviewed native MMdl pointer relocations.",
+      "definition_sha256": "f6a125bdc27c6c3e2b4015ba15608255ed2073265cb604671f4aad2cf958edca",
+      "evidence": [
+        {
+          "path": "simpsons/re/model_definitions.md",
+          "quote": "`sub_82719770` relocates a version 10 MMdl payload, adding its base to stored\nrelative pointers. `sub_82719B50` performs the inverse operation. The host\nreader/writer and reference fixture use these original routines to validate\nthe pointer layout without launching the game."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82728420",
+      "name": "StreamCatalog.FindFile",
+      "system": "assets",
+      "summary": "Find a file's 24-byte preallocation-catalog record.",
+      "definition_sha256": "cbef80b56f97b9db660f5d694860a59184365de6478540072f2a0e88ff0373c3",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "`StreamTOC` is a named resource in entry zero of the checked `*_global.str` files. Its\npayload starts at resource +16 plus the big-endian header length at +12. The payload magic\nis `0x9CBA7B28`, version 9. `sub_827285D0` relocates the catalog and `sub_82728420` finds\nits 24-byte file records. Relative pointers are based on the payload start.\n"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_827285D0",
+      "name": "StreamCatalog.Relocate",
+      "system": "assets",
+      "summary": "Relocate a version-9 StreamTOC preallocation catalog.",
+      "definition_sha256": "e6ec0785e59c401a1c8891939627649276aa9fec55fe25a310198826f41b8674",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "`StreamTOC` is a named resource in entry zero of the checked `*_global.str` files. Its\npayload starts at resource +16 plus the big-endian header length at +12. The payload magic\nis `0x9CBA7B28`, version 9. `sub_827285D0` relocates the catalog and `sub_82728420` finds\nits 24-byte file records. Relative pointers are based on the payload start.\n"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8273B760",
+      "name": "Assets.Mesh.CreateBuffers",
+      "system": "assets",
+      "summary": "Initialize the original vertex buffer, index buffer and declaration.",
+      "definition_sha256": "c82e31aaf4673954cf0bd8a6a3ea64727fa578b00129633bc4cb215f69e23174",
+      "evidence": [
+        {
+          "path": "simpsons/re/native_mesh_data.md",
+          "quote": "The current writer accepts a single `0x3C43A23D` section of 56 bytes. Its +12\npointer selects the combined vertex/index allocation record. The original\ninitializer `sub_8273B760` uses that record to create the vertex buffer at +56,\nindex buffer at +88 and declaration at +48. It does not iterate the adjacent\nsection words as arrays of allocation records. Other drawing layouts still need\ntheir own decoder and acceptance."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_827451C0",
+      "name": "ScoreKeeper.HashName",
+      "system": "progression",
+      "summary": "Hash a score name with ASCII case folding and the 65599 multiplier.",
+      "definition_sha256": "fb5fc43a2a0cfcc05082ffdc29f67487d27265f1a1ba2299082b53e56084b2e1",
+      "evidence": [
+        {
+          "path": "simpsons/re/achievements.md",
+          "quote": "\nThe ScoreKeeper pointer is at `0x82D08BB8`; its sorted score array is at +16 and the count at +20.\nA score's name is hashed by `sub_827451C0` (ASCII lowercased, `h = h * 65599 + c`). The natives\nunder the Lua bindings take the hash:\n"
+        }
+      ],
+      "operations": [
+        "scores.get",
+        "scores.set",
+        "scores.issue"
+      ]
+    },
+    {
+      "symbol": "sub_82745390",
+      "name": "Assets.Resource.HashGuid",
+      "system": "assets",
+      "summary": "Hash all sixteen big-endian resource GUID bytes.",
+      "definition_sha256": "e597927688d75cdf2cd65ee4464031a25306b37fe27e0abd0860db12c754f408",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_assets.md",
+          "quote": "`sub_82745390` hashes sixteen big-endian GUID bytes using `hash * 65599 + byte`."
+        }
+      ],
+      "operations": [
+        "world.catalog",
+        "assets.search"
+      ]
+    },
+    {
+      "symbol": "sub_827A55C0",
+      "name": "Physics.StepHavok",
+      "system": "simulation",
+      "summary": "Step the live level's Havok world by f1 seconds.",
+      "definition_sha256": "fc70c7528db228452400f1e3cfbae9e7210f234d4e06c0de02055d83b972c718",
+      "evidence": [
+        {
+          "path": "simpsons/src/frame_pacing.cpp",
+          "quote": "// Steps the Havok world by f1 seconds of frame time. Runs every frame while a\n// level is live and never in the front end.\nREX_EXTERN(sub_827A55C0);\n// physics_step.cpp: the step itself, through the shipped code.\nvoid HavokStep(PPCContext& ctx, uint8_t* base);"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_827BC0C8",
+      "name": "Apt.GetProperty",
+      "system": "menus",
+      "summary": "Read an APT movie property.",
+      "definition_sha256": "ae28dd8f2a9a585b9ce6ae2aef81a9c9dfa81cbc0127de1a093bf94b9dc46fd6",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "| Interface | Entry |\n|---|---|\n| Get / set a property | `0x827BC0C8` / `0x827BC128` |\n| Construct / release a string reference | `0x827C8180` / `0x827C7BB8` |\n| Create string / integer / float values | `0x827C6A60` / `0x827C5CB8` / `0x827C5EE0` |"
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_827BC128",
+      "name": "Apt.SetProperty",
+      "system": "menus",
+      "summary": "Set an APT movie property.",
+      "definition_sha256": "a23a8fcb1b772b2ecb6ff658320301fd6903770ee06c42e05bcd9c2364e4c243",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "| Interface | Entry |\n|---|---|\n| Get / set a property | `0x827BC0C8` / `0x827BC128` |\n| Construct / release a string reference | `0x827C8180` / `0x827C7BB8` |\n| Create string / integer / float values | `0x827C6A60` / `0x827C5CB8` / `0x827C5EE0` |"
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_827BF8F8",
+      "name": "Apt.InvokeMethod",
+      "system": "menus",
+      "summary": "Invoke an APT method with its owning movie as receiver.",
+      "definition_sha256": "71ec4657c922806823c87b78d983c75d19748019a5630e9ca5a2641e2f9b8e61",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "| Construct / release a string reference | `0x827C8180` / `0x827C7BB8` |\n| Create string / integer / float values | `0x827C6A60` / `0x827C5CB8` / `0x827C5EE0` |\n| Invoke a method | `0x827BF8F8` |\n\nThe method entry uses its movie argument as the receiver even when the method name contains a"
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_827C5CB8",
+      "name": "Apt.CreateInteger",
+      "system": "menus",
+      "summary": "Create an APT integer value.",
+      "definition_sha256": "d8b02dad9ce40b502820dd3ffafdadbd83bd80cf3561f096cccd1dfdb08143fd",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "| Get / set a property | `0x827BC0C8` / `0x827BC128` |\n| Construct / release a string reference | `0x827C8180` / `0x827C7BB8` |\n| Create string / integer / float values | `0x827C6A60` / `0x827C5CB8` / `0x827C5EE0` |\n| Invoke a method | `0x827BF8F8` |\n"
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_827C5EE0",
+      "name": "Apt.CreateFloat",
+      "system": "menus",
+      "summary": "Create an APT floating-point value.",
+      "definition_sha256": "e571193164e315bf00054b6c6be1a601710eae92fae38e776faf4445e9aa4860",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "| Get / set a property | `0x827BC0C8` / `0x827BC128` |\n| Construct / release a string reference | `0x827C8180` / `0x827C7BB8` |\n| Create string / integer / float values | `0x827C6A60` / `0x827C5CB8` / `0x827C5EE0` |\n| Invoke a method | `0x827BF8F8` |\n"
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_827C6A60",
+      "name": "Apt.CreateString",
+      "system": "menus",
+      "summary": "Create an APT string value.",
+      "definition_sha256": "e1667dd1451d32996489949367ed2ff44277d278d8c3e48c6e6627bc38166ad2",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "| Get / set a property | `0x827BC0C8` / `0x827BC128` |\n| Construct / release a string reference | `0x827C8180` / `0x827C7BB8` |\n| Create string / integer / float values | `0x827C6A60` / `0x827C5CB8` / `0x827C5EE0` |\n| Invoke a method | `0x827BF8F8` |\n"
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_827C7BB8",
+      "name": "Apt.ReleaseStringReference",
+      "system": "menus",
+      "summary": "Release an APT string reference.",
+      "definition_sha256": "50f0513b9fdae6ea904e57b5438a52fb4c09e18e2fc9e22eb9674c295ae8b574",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "|---|---|\n| Get / set a property | `0x827BC0C8` / `0x827BC128` |\n| Construct / release a string reference | `0x827C8180` / `0x827C7BB8` |\n| Create string / integer / float values | `0x827C6A60` / `0x827C5CB8` / `0x827C5EE0` |\n| Invoke a method | `0x827BF8F8` |"
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_827C8180",
+      "name": "Apt.ConstructStringReference",
+      "system": "menus",
+      "summary": "Construct an APT string reference.",
+      "definition_sha256": "678ff78d30c50b51d235224b640f382c4bbefd1c5869f8e504d9a41b2080c8df",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "|---|---|\n| Get / set a property | `0x827BC0C8` / `0x827BC128` |\n| Construct / release a string reference | `0x827C8180` / `0x827C7BB8` |\n| Create string / integer / float values | `0x827C6A60` / `0x827C5CB8` / `0x827C5EE0` |\n| Invoke a method | `0x827BF8F8` |"
+        }
+      ],
+      "operations": [
+        "ui.register_page"
+      ]
+    },
+    {
+      "symbol": "sub_827F3780",
+      "name": "Ui.Screen.Close",
+      "system": "menus",
+      "summary": "Close a native menu screen through its own lifecycle.",
+      "definition_sha256": "0df55037ba0652638416c88539208df4cdc2615820b161211cb7b60c5defc6b0",
+      "evidence": [
+        {
+          "path": "simpsons/re/in_game_settings.md",
+          "quote": "and input (`0x823A5768`). The singleton is at `0x82D08DDC`; the root state at `0x82D08DE0` is 1.\nThat state remains set after closing, so it cannot identify a visible screen by itself.\nThe base screen's active flag at `screen + 28` and close function (`0x827F3780`) determine when\nto release keyboard capture. The suspend hook (`0x823A4850`) also releases capture.\n"
+        }
+      ],
+      "operations": [
+        "ui.remove_page"
+      ]
+    },
+    {
+      "symbol": "sub_8281E5B0",
+      "name": "RefPack.Decode",
+      "system": "assets",
+      "summary": "Decode the game's RefPack resources; the creator tools use this native reference.",
+      "definition_sha256": "0dacaaeb809e62d5bc171dd93e3d4f1336df5711c6c69b60c06405440ea7ab5e",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "replacement round trips, multiple chunks, text resizing, identifiers and asset priority.\nThe optional native reference also checks re-encoding and in-place decoding with the game's\n`sub_8281E5B0`: 2,549 packed entries and 2,719,195,380 decoded bytes across 490 local archives\nagree byte for byte. The new encoder stores those entries in 1,071,785,984 padded bytes;\nthe originals use 1,060,644,864. This qualifies the codec against that routine, not the"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8281E8C0",
+      "name": "RefPack.ReadSize",
+      "system": "assets",
+      "summary": "Read and advance a resource size header through its input cursor.",
+      "definition_sha256": "83c354324223e01e7de9d60cedd8be41cad9b6aef92a2894c3ad06733861d348",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "`sub_8281E8C0` reads the size header through the input-cursor pointer in r3, advances that\ncursor and returns the declared decoded size. `sub_8281E9B0` is the asynchronous decoder:\nr3 and r4 point to the input and output cursors; r5 is the requested output-byte budget.\nIt completes the current command before checking that budget, so a call can overshoot by\nup to 1,030 bytes. Reaching the budget returns 0; consuming the terminator returns 1."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8281E9B0",
+      "name": "RefPack.DecodeStep",
+      "system": "assets",
+      "summary": "Decode whole RefPack commands to a byte budget, preserving cursor and saved-register semantics.",
+      "definition_sha256": "181a4c2dfdbba9e69692a1f65286824478480423df45a8e0cb88b9ec4327165a",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "`sub_8281E8C0` reads the size header through the input-cursor pointer in r3, advances that\ncursor and returns the declared decoded size. `sub_8281E9B0` is the asynchronous decoder:\nr3 and r4 point to the input and output cursors; r5 is the requested output-byte budget.\nIt completes the current command before checking that budget, so a call can overshoot by\nup to 1,030 bytes. Reaching the budget returns 0; consuming the terminator returns 1.\nA zero budget advances neither cursor. Each call spills and restores r29-r31 and the\nreturn address through `__savegprlr_29` and `__restgprlr_29`, without changing r1."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8282D5B8",
+      "name": "TextTable.Lookup",
+      "system": "text",
+      "summary": "Look up a table's text ID; language overrides hook this path.",
+      "definition_sha256": "74d329904c96f173d26dfef40547ad4ee058ebd72330b81a903e997652783ee0",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "\nLocalized text begins with `32 48 43 4c` (`2HCL`). `sub_8282D618` relocates its string offsets;\n`sub_8282D5B8` looks up a string by hash.\n\n| Payload offset | Bytes | Meaning |"
+        }
+      ],
+      "operations": [
+        "text.lookup"
+      ]
+    },
+    {
+      "symbol": "sub_8282D618",
+      "name": "TextTable.Reload",
+      "system": "text",
+      "summary": "Reload a text table and invalidate its cached source identity.",
+      "definition_sha256": "4eaec7d695c53b221ca2a7993e77b5ec8ebdb0f5e7aac2ce9d6f87ca53f492f9",
+      "evidence": [
+        {
+          "path": "simpsons/re/str_format.md",
+          "quote": "## LH2 text\n\nLocalized text begins with `32 48 43 4c` (`2HCL`). `sub_8282D618` relocates its string offsets;\n`sub_8282D5B8` looks up a string by hash.\n"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8282F618",
+      "name": "Assets.Mesh.ReadNativeData",
+      "system": "assets",
+      "summary": "Read and allocate the original EA native geometry blocks.",
+      "definition_sha256": "8aa6deb1ac05f9bd2f7a1bb8ccb2bf5416c1534d372be451f5ffd1754be97395",
+      "evidence": [
+        {
+          "path": "simpsons/re/native_mesh_data.md",
+          "quote": "`sub_8282F970` registers geometry plugin `0xEA33`; its plugin offset is retained\nat `0x82E06F7C`. The registered reader, writer and size routines are respectively\n`sub_8282F618`, `sub_8282F788` and `sub_8282F848`. The reader consumes a 12-byte\nlittle-endian allocation header: alignment, main size and secondary size. The\nmain and secondary bytes follow. Unknown contents are preserved."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8282F788",
+      "name": "Assets.Mesh.WriteNativeData",
+      "system": "assets",
+      "summary": "Write the original EA native geometry stream representation.",
+      "definition_sha256": "0a160f94f6eff1df15b69be3e2741a2de9aac862318c32711c935eaea9602b75",
+      "evidence": [
+        {
+          "path": "simpsons/re/native_mesh_data.md",
+          "quote": "`sub_8282F970` registers geometry plugin `0xEA33`; its plugin offset is retained\nat `0x82E06F7C`. The registered reader, writer and size routines are respectively\n`sub_8282F618`, `sub_8282F788` and `sub_8282F848`. The reader consumes a 12-byte\nlittle-endian allocation header: alignment, main size and secondary size. The\nmain and secondary bytes follow. Unknown contents are preserved."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8282F848",
+      "name": "Assets.Mesh.NativeDataSize",
+      "system": "assets",
+      "summary": "Calculate the original native geometry stream size.",
+      "definition_sha256": "37d81c689522747f7ddf840218e2538fae6983e66587b7bb04deda1bb91c0db4",
+      "evidence": [
+        {
+          "path": "simpsons/re/native_mesh_data.md",
+          "quote": "`sub_8282F970` registers geometry plugin `0xEA33`; its plugin offset is retained\nat `0x82E06F7C`. The registered reader, writer and size routines are respectively\n`sub_8282F618`, `sub_8282F788` and `sub_8282F848`. The reader consumes a 12-byte\nlittle-endian allocation header: alignment, main size and secondary size. The\nmain and secondary bytes follow. Unknown contents are preserved."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8282F970",
+      "name": "Assets.Mesh.RegisterPlugin",
+      "system": "assets",
+      "summary": "Register the EA native geometry plugin and its stream callbacks.",
+      "definition_sha256": "0fe8ab7975d26222fd29b6b0d5a6d3ff6d963656fa5e124aabe45d1bff3f1895",
+      "evidence": [
+        {
+          "path": "simpsons/re/native_mesh_data.md",
+          "quote": "`sub_8282F970` registers geometry plugin `0xEA33`; its plugin offset is retained\nat `0x82E06F7C`. The registered reader, writer and size routines are respectively\n`sub_8282F618`, `sub_8282F788` and `sub_8282F848`. The reader consumes a 12-byte\nlittle-endian allocation header: alignment, main size and secondary size. The\nmain and secondary bytes follow. Unknown contents are preserved."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82831280",
+      "name": "Assets.Mesh.Relocate",
+      "system": "assets",
+      "summary": "Relocate the original native main and secondary pointer fields.",
+      "definition_sha256": "4d3a1be18e2d661e1d81fb3cda2ef80bfae64337f487c5d6aa22881eb82368d7",
+      "evidence": [
+        {
+          "path": "simpsons/re/native_mesh_data.md",
+          "quote": "Each relocation gives a field offset and target block kind, 0 for main and 1\nfor secondary. `sub_82831280` adds the selected base to the field's stored\noffset, including zero offsets. `sub_828312D0` copies both blocks and rebases the\nsame fields from their old allocations to the new ones. The host reader bounds\nall tables, rejects duplicate relocation fields and preserves secondary data."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_828312D0",
+      "name": "Assets.Mesh.CopyAndRebase",
+      "system": "assets",
+      "summary": "Copy both native geometry blocks and rebase their relocation fields.",
+      "definition_sha256": "891d9433451fd0d7c9846a28b452cba6b9d56d73082e27892379a108470d274f",
+      "evidence": [
+        {
+          "path": "simpsons/re/native_mesh_data.md",
+          "quote": "Each relocation gives a field offset and target block kind, 0 for main and 1\nfor secondary. `sub_82831280` adds the selected base to the field's stored\noffset, including zero offsets. `sub_828312D0` copies both blocks and rebases the\nsame fields from their old allocations to the new ones. The host reader bounds\nall tables, rejects duplicate relocation fields and preserves secondary data."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82881400",
+      "name": "DamageInfo.Destroy",
+      "system": "combat",
+      "summary": "Release the original damage record references.",
+      "definition_sha256": "464439370079b988a32295a07758150a4cdc9b91248f771899a504b60959e75a",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "The temporary 72-byte damage record uses original constructor `sub_82937650`\nand destructor `sub_82881400`. Amount is +44 and type is +52. Original type 13\naccepts a source-free scripted request while retaining the remaining masks and\nclass filters. This is a descriptive public use, not a recovered enum name.\nThe host provides no fabricated source references."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_828836F8",
+      "name": "Player.FilterDamage",
+      "system": "combat",
+      "summary": "Apply original character damage state and simulation-timestamp cooldown filtering.",
+      "definition_sha256": "3e4385e112917b4cde8ec48cbd4a809e23b52fa5b420056831b754fb1eb3a07f",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "Original hit producers `sub_82938660`, `sub_82938C70` and `sub_82957F78` write\nthe simulation timestamp from `0x82D572BC` into damage +64. `sub_82938660` also\ncopies its impact vector to +20 and +32. The adapter supplies the target's\nresolved world position and that original clock. Leaving timestamp zero caused\nthe live family hit to be ignored: `sub_828836F8` compares new and previous\ndamage timestamps against the character's cooldown before accepting a hit.\nThe reference check includes this unchanged filter and its original member\ncallback thunk `sub_82882C48`; same-frame hits remain subject to cooldown."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_828844F0",
+      "name": "Player.BindInputController",
+      "system": "players",
+      "summary": "Move a character input binding between game controller ports; port 6 retires the binding.",
+      "definition_sha256": "ea4749c45d818eac92b123de5ee01328616902fd9b0209c9c337b341ecaac3a0",
+      "evidence": [
+        {
+          "path": "simpsons/src/player_control.h",
+          "quote": "// sub_8288DBE0 tests +820 against -1 for human control. The input binding\n// installed by sub_828844F0 is at +2076 (6 means unbound); the original\n// button readers, including sub_82884788, pass it to the input dispatcher.\n// +2068 is a family-list identity and +2088 is a viewport, not an input port."
+        }
+      ],
+      "operations": [
+        "players.list",
+        "players.controlled"
+      ]
+    },
+    {
+      "symbol": "sub_82884788",
+      "name": "Player.ReadInputButton",
+      "system": "players",
+      "summary": "Dispatch a character button query through its current game input binding.",
+      "definition_sha256": "a02badb72091527c94402dd6dd59b63952574704c81c09098257180e04afaf17",
+      "evidence": [
+        {
+          "path": "simpsons/src/player_control.h",
+          "quote": "// sub_8288DBE0 tests +820 against -1 for human control. The input binding\n// installed by sub_828844F0 is at +2076 (6 means unbound); the original\n// button readers, including sub_82884788, pass it to the input dispatcher.\n// +2068 is a family-list identity and +2088 is a viewport, not an input port."
+        }
+      ],
+      "operations": [
+        "players.list",
+        "players.controlled"
+      ]
+    },
+    {
+      "symbol": "sub_82886AF0",
+      "name": "Player.CheckLowHealth",
+      "system": "combat",
+      "summary": "Check player and component health before sending the low-health message.",
+      "definition_sha256": "344012089e27c5e7a9ea9b281dc77d2165555dac70664ab75fd480af9af53c1c",
+      "evidence": [
+        {
+          "path": "simpsons/src/players.cpp",
+          "quote": "// whose modelling matrix puts the position at +64.\n//\n// The health check that sends iMsgPlayerHealthLow (sub_82886AF0) reads the\n// entity's health through its vtable at +176 and the maximum through the\n// component at +344 (vtable +40). The health component keeps the hit points"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8288D2E0",
+      "name": "Player.SetLocalPosition",
+      "system": "entities",
+      "summary": "Place the character frame and its original movement controller.",
+      "definition_sha256": "7217d2dc0c6f20d193fb7337a19f09695c566a6f672f31c2d41a9cef2163b9a8",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "Entity virtual +28 is the position setter. `sub_82696D10(entity, position)` writes\nthe three translation words at frame +64, calls `sub_823F2460(frame)` to queue a\nRenderWare update, then dispatches entity virtual +92. The base notification\n`sub_82697160` marks entity +202 bit `0x0800` and notifies a non-null model at +136\nthrough `sub_826A8708(model, 1)`. Calling only the base setter skips overrides:\nthe character setter `sub_8288D2E0` also calls controller +784, virtual +60, with\nthe position and flag 0. The ScriptableProp and all four family vtables observed\nin a private Linux GAME_HUB run agree on setter slot +28 and notification +92."
+        }
+      ],
+      "operations": [
+        "entities.transform",
+        "entities.move",
+        "world.spawn",
+        "players.teleport"
+      ]
+    },
+    {
+      "symbol": "sub_8288D428",
+      "name": "Character.SetLocalTransform",
+      "system": "entities",
+      "summary": "Apply the full entity matrix and pass it to the character controller through its original override.",
+      "definition_sha256": "8ca6248e0c8f13c785cf68434e0c7a3903c3fadb09424f1455cd25d63992eb9e",
+      "evidence": [
+        {
+          "path": "simpsons/re/entities.md",
+          "quote": "Entity virtual +40 is the full local-matrix setter.\n`sub_82697690(entity, matrix)` computes the three cached scale values at entity\n+144/+148/+152 through the original vector-length routine, replaces the frame's\nmodelling matrix through `sub_823F2748`, marks the frame dirty and dispatches\nentity virtual +92. The observed ScriptableProp vtable uses that method.\nThe character override `sub_8288D428` calls it and then dispatches controller\n+784, virtual +56, with the matrix and flag zero. All four previously captured\nfamily-character vtables use this override at +40."
+        }
+      ],
+      "operations": [
+        "entities.set_transform"
+      ]
+    },
+    {
+      "symbol": "sub_8288DBE0",
+      "name": "Player.HasHumanControl",
+      "system": "players",
+      "summary": "Test the actor human-control marker against the unbound value.",
+      "definition_sha256": "13e63508a3ef4f5f8ed2526d64115280916c3a03d4e3285120a9f65f62d8de79",
+      "evidence": [
+        {
+          "path": "simpsons/src/player_control.h",
+          "quote": "// sub_8288DBE0 tests +820 against -1 for human control. The input binding\n// installed by sub_828844F0 is at +2076 (6 means unbound); the original\n// button readers, including sub_82884788, pass it to the input dispatcher.\n// +2068 is a family-list identity and +2088 is a viewport, not an input port."
+        }
+      ],
+      "operations": [
+        "players.list",
+        "players.controlled"
+      ]
+    },
+    {
+      "symbol": "sub_82895130",
+      "name": "PlayerManager.FindCharacter",
+      "system": "players",
+      "summary": "Find a player by character identity, not by logical input slot.",
+      "definition_sha256": "d40c5f443339cbefe99dea1bce46d9bbea4bd6397790b4ac73f7bed50e478907",
+      "evidence": [
+        {
+          "path": "simpsons/src/players.cpp",
+          "quote": "// The player manager (0x82D08BA4) keeps its players in a list at +8: an array\n// of pointers at +4 and a count at +8. Each pointer is to +2032 in a player\n// entity, which keeps its character id at +3460 (sub_82895130 finds a player\n// by character, as the bus stop map does) and its RenderWare frame at +140,\n// whose modelling matrix puts the position at +64."
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_8289BEA8",
+      "name": "GameFlow.RestartCheckpoint",
+      "system": "progression",
+      "summary": "Restart the main loop from its checkpoint with restart-pending state set.",
+      "definition_sha256": "2d9789e1d3f97ee24d7f8f7ec595ca64f53e74bfbb441ecc77e697cd093a38b2",
+      "evidence": [
+        {
+          "path": "simpsons/src/characters.cpp",
+          "quote": "// alone, so the level's own character comes back with the next load once the\n// choice is cleared. A change takes effect through a restart from the last\n// checkpoint (sub_8289BEA8 with the GameFlowManager's restart-pending flag set,\n// as the pause menu's restart and a death do), which loses the progress since\n// that checkpoint."
+        }
+      ],
+      "operations": [
+        "characters.apply"
+      ]
+    },
+    {
+      "symbol": "sub_8289E428",
+      "name": "GameFlow.ResolvePlayerTemplates",
+      "system": "characters",
+      "summary": "Resolve level player-slot overrides to character template GUIDs.",
+      "definition_sha256": "b207dfa5b4f2762ff50efdbebbca9a4647e2635abc2fe93c58d97e724d586ba0",
+      "evidence": [
+        {
+          "path": "simpsons/src/characters.cpp",
+          "quote": "//\n// A level spawns its playable characters from four player slots. Every time\n// the level loads, including a restart from a checkpoint, sub_8289E428\n// resolves the slots' overrides into one character template GUID per slot at\n// GameFlowManager (0x82D08BA8) +0x354 + slot * 16, whose first word is the"
+        }
+      ],
+      "operations": [
+        "characters.apply"
+      ]
+    },
+    {
+      "symbol": "sub_828A3100",
+      "name": "ScoreKeeper.GetScore",
+      "system": "progression",
+      "summary": "Read a hashed score in its context; a missing score returns zero.",
+      "definition_sha256": "e1ca73a4a9f3ec1dd43e208803590ad7fd8a1fc4164d08a481db29e8bdcc6b44",
+      "evidence": [
+        {
+          "path": "simpsons/re/achievements.md",
+          "quote": "| Binding | Native | Arguments |\n|---|---|---|\n| `sk:GetScore(name)` | `sub_828A3100` | keeper, hash, context → f1 (0 for a missing score) |\n| `sk:SetScore(name, value)` | `sub_828A31A8` | keeper, hash, f1 = value, r6 = context |\n| `sk:IssueScoreEvent(name)` | `sub_828A3420` | keeper, hash, context |"
+        }
+      ],
+      "operations": [
+        "scores.get"
+      ]
+    },
+    {
+      "symbol": "sub_828A31A8",
+      "name": "ScoreKeeper.SetScore",
+      "system": "progression",
+      "summary": "Set a hashed score through the game's watcher system.",
+      "definition_sha256": "31896cd29f5121dec528e4b2c291631f4d46bcfbb3194a597fc96b391217ed42",
+      "evidence": [
+        {
+          "path": "simpsons/re/achievements.md",
+          "quote": "|---|---|---|\n| `sk:GetScore(name)` | `sub_828A3100` | keeper, hash, context → f1 (0 for a missing score) |\n| `sk:SetScore(name, value)` | `sub_828A31A8` | keeper, hash, f1 = value, r6 = context |\n| `sk:IssueScoreEvent(name)` | `sub_828A3420` | keeper, hash, context |\n"
+        }
+      ],
+      "operations": [
+        "scores.set"
+      ]
+    },
+    {
+      "symbol": "sub_828A3420",
+      "name": "ScoreKeeper.IssueScoreEvent",
+      "system": "progression",
+      "summary": "Issue a score event in its context.",
+      "definition_sha256": "daed519fa488993b21daa2a43874396afa802f123a7666b06b34dcacfac6c88e",
+      "evidence": [
+        {
+          "path": "simpsons/re/achievements.md",
+          "quote": "| `sk:GetScore(name)` | `sub_828A3100` | keeper, hash, context → f1 (0 for a missing score) |\n| `sk:SetScore(name, value)` | `sub_828A31A8` | keeper, hash, f1 = value, r6 = context |\n| `sk:IssueScoreEvent(name)` | `sub_828A3420` | keeper, hash, context |\n\nSetting a score runs its watchers, as the game's scripts do. The global context is 0."
+        }
+      ],
+      "operations": [
+        "scores.issue"
+      ]
+    },
+    {
+      "symbol": "sub_828A6900",
+      "name": "EpisodePkg.AddEntry",
+      "system": "progression",
+      "summary": "Attach a mode handle to an episode handle.",
+      "definition_sha256": "d39b03be255aee3f8671e75eb6e367c16df20523cd8ef549e0722385dcf2cc38",
+      "evidence": [
+        {
+          "path": "simpsons/re/freeroam_coop.md",
+          "quote": "two when the mode is attached, without editing the user's game files.\n\n`sub_828A6900` is `EpisodePkg::AddEntry(episode handle, mode handle)`. A handle's\ndata pointer is at +4. Episode data has kind 5 at +8, a name pointer at +12 and\na big-endian 16-bit name length at +16. Mode data has kind 3 at +8 and its player"
+        }
+      ],
+      "operations": []
+    },
+    {
+      "symbol": "sub_82937650",
+      "name": "DamageInfo.Initialize",
+      "system": "combat",
+      "summary": "Construct the original 72-byte damage record.",
+      "definition_sha256": "393f72180a28324b502ca6b41033b0bb03dde7cca2f96d2604e6977056be7668",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "The temporary 72-byte damage record uses original constructor `sub_82937650`\nand destructor `sub_82881400`. Amount is +44 and type is +52. Original type 13\naccepts a source-free scripted request while retaining the remaining masks and\nclass filters. This is a descriptive public use, not a recovered enum name.\nThe host provides no fabricated source references."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_82955D00",
+      "name": "HealthComponent.ScheduleRecovery",
+      "system": "combat",
+      "summary": "Preserve the native health update subscription.",
+      "definition_sha256": "9313e70a19c989d205fb0803bf0fae60d5ba46d439440445d9b0fb932edebd1d",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "`sub_82957478` is the health message handler (component vtable +4). Damage uses\nthe message ID stored at `0x82E07CC4`; healing uses `0x82E07CD4`. Its damage\nbranch copies the input to component +124 through `sub_82937118`, resets the\nnative recovery timer for absorbed hits, calls `sub_82956900`, then preserves\nupdate registration through `sub_82955D00`. Healing runs `sub_829573C8` then\n`sub_82956530`. The normal damage eligibility function `sub_82957208` remains\nhooked by the existing family damage-protection service; result 2 ignores a hit."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_829563B8",
+      "name": "HealthComponent.NotifyDeath",
+      "system": "combat",
+      "summary": "Run the native death callback and authored death actions.",
+      "definition_sha256": "a6327c015798658c3792b90a0776b55dce5c3bfe127f578d7b570d62e5829fb4",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "`sub_829563B8` runs native death callbacks and authored death actions. Its hook\ncaptures only a recognized component satisfying the original death predicate,\nqueues the owned lifetime before class callbacks can delete it, and always\nexecutes the original routine. The host drains at most 16 death/removal actions\nwithin the existing 2 ms retirement budget. Ownership records deduplicate the\nfirst death per allocation and retain delivery state through reload/restore.\nSaving while native notices remain queued reports `busy` instead of freezing\ninconsistent encounter progress. No script callback runs inside the hook."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_82956530",
+      "name": "HealthComponent.ApplyHealing",
+      "system": "combat",
+      "summary": "Heal through the original limit, callback and recovery actions.",
+      "definition_sha256": "bc25d8f22aa2c9ceffa85405f47f1f137e01023d200a330ef0764995ef7b25c8",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "`sub_82957478` is the health message handler (component vtable +4). Damage uses\nthe message ID stored at `0x82E07CC4`; healing uses `0x82E07CD4`. Its damage\nbranch copies the input to component +124 through `sub_82937118`, resets the\nnative recovery timer for absorbed hits, calls `sub_82956900`, then preserves\nupdate registration through `sub_82955D00`. Healing runs `sub_829573C8` then\n`sub_82956530`. The normal damage eligibility function `sub_82957208` remains\nhooked by the existing family damage-protection service; result 2 ignores a hit."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_82956900",
+      "name": "HealthComponent.ApplyDamage",
+      "system": "combat",
+      "summary": "Apply native damage with hit, recovery and death callbacks.",
+      "definition_sha256": "575ed01bd85f254e5c1062c21787950608cd6412409572ee94985f31931aa751",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "`sub_82957478` is the health message handler (component vtable +4). Damage uses\nthe message ID stored at `0x82E07CC4`; healing uses `0x82E07CD4`. Its damage\nbranch copies the input to component +124 through `sub_82937118`, resets the\nnative recovery timer for absorbed hits, calls `sub_82956900`, then preserves\nupdate registration through `sub_82955D00`. Healing runs `sub_829573C8` then\n`sub_82956530`. The normal damage eligibility function `sub_82957208` remains\nhooked by the existing family damage-protection service; result 2 ignores a hit."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_82956E70",
+      "name": "HealthComponent.Initialize",
+      "system": "combat",
+      "summary": "Initialize the original health component and its message subscription.",
+      "definition_sha256": "6cb75f297b0447bab60ae57241d44e2c79b5b1005ba1632bfd6d20aebabf422f",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "`sub_82956E70` constructs the recognized health component with vtable\n`0x8218AB98`, owner at +8/+40 and 216 bytes. Live family banks contained this\ncomponent at different indices (41, 38 and 37), agreeing with their existing\nentity +344 convenience pointer. Generic props need not have this component.\nUnsupported tables, excessive counts, unreadable data, duplicate health\ncomponents and mismatched owners reject before mutation."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_82956FF0",
+      "name": "HealthComponent.ReadCurrent",
+      "system": "combat",
+      "summary": "Read current hit points through the native component getter.",
+      "definition_sha256": "42c739f5445210b941a1734da12004893ab870cb74d0273145deec94f155f63a",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "`sub_82956FF0` returns current health (+16); `sub_82956FF8` returns the normal\nhealing limit (+20). `sub_82957000` returns the separate reference value (+24).\n`sub_82957018` is the native death predicate and `sub_82956FC0` the enabled\npredicate. The original setter `sub_82955FC0` also performs property\nnotification, so raw hit-point writes are insufficient."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_82956FF8",
+      "name": "HealthComponent.ReadMaximum",
+      "system": "combat",
+      "summary": "Read the normal native healing limit.",
+      "definition_sha256": "3c9e5570cf08a4e35f4cd99f047ff1044aa9cb31d585c68d913b26c3c54e6312",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "`sub_82956FF0` returns current health (+16); `sub_82956FF8` returns the normal\nhealing limit (+20). `sub_82957000` returns the separate reference value (+24).\n`sub_82957018` is the native death predicate and `sub_82956FC0` the enabled\npredicate. The original setter `sub_82955FC0` also performs property\nnotification, so raw hit-point writes are insufficient."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_82957018",
+      "name": "HealthComponent.IsDead",
+      "system": "combat",
+      "summary": "Evaluate the original death predicate, including the immortal-at-zero flag.",
+      "definition_sha256": "e771f23cbf1eee614d5bb74a3a71cdb589faa28d12db52612885fefc8c3561ab",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "`sub_82956FF0` returns current health (+16); `sub_82956FF8` returns the normal\nhealing limit (+20). `sub_82957000` returns the separate reference value (+24).\n`sub_82957018` is the native death predicate and `sub_82956FC0` the enabled\npredicate. The original setter `sub_82955FC0` also performs property\nnotification, so raw hit-point writes are insufficient."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_82957208",
+      "name": "HealthComponent.CheckDamage",
+      "system": "combat",
+      "summary": "Decide whether damage counts; result 2 means it is ignored.",
+      "definition_sha256": "4725a261641b1f3cabdf7ee0c8ef4b400c73001b000fbf2e12b748d48050f20d",
+      "evidence": [
+        {
+          "path": "simpsons/src/players.cpp",
+          "quote": "// component at +344 (vtable +40). The health component keeps the hit points\n// at +16 and the maximum the game compares with at +24. Its iMsgDamage handler\n// (sub_82957478) asks sub_82957208(component, damage) whether the hit counts;\n// 2 means it is ignored, as for a component that is already down.\n"
+        }
+      ],
+      "operations": [
+        "entities.damage",
+        "entities.heal",
+        "players.damage",
+        "players.god_mode",
+        "players.heal",
+        "players.refill_health"
+      ]
+    },
+    {
+      "symbol": "sub_829573C8",
+      "name": "HealthComponent.CheckHealing",
+      "system": "combat",
+      "summary": "Check native healing eligibility.",
+      "definition_sha256": "4e3da94334351328919507f1b07da9d911626a1d5738f28a9e4a3f1aa9ce1178",
+      "evidence": [
+        {
+          "path": "simpsons/re/entity_health.md",
+          "quote": "`sub_82957478` is the health message handler (component vtable +4). Damage uses\nthe message ID stored at `0x82E07CC4`; healing uses `0x82E07CD4`. Its damage\nbranch copies the input to component +124 through `sub_82937118`, resets the\nnative recovery timer for absorbed hits, calls `sub_82956900`, then preserves\nupdate registration through `sub_82955D00`. Healing runs `sub_829573C8` then\n`sub_82956530`. The normal damage eligibility function `sub_82957208` remains\nhooked by the existing family damage-protection service; result 2 ignores a hit."
+        }
+      ],
+      "operations": [
+        "entities.health",
+        "entities.damage",
+        "entities.heal",
+        "players.health",
+        "players.damage",
+        "players.heal"
+      ]
+    },
+    {
+      "symbol": "sub_82957478",
+      "name": "HealthComponent.HandleDamage",
+      "system": "combat",
+      "summary": "Handle the game's damage message through the health component.",
+      "definition_sha256": "854498fbc2c96c224968c3f566db628bba49374fbd6b3f94c6856d99ad82cc3b",
+      "evidence": [
+        {
+          "path": "simpsons/src/players.cpp",
+          "quote": "// component at +344 (vtable +40). The health component keeps the hit points\n// at +16 and the maximum the game compares with at +24. Its iMsgDamage handler\n// (sub_82957478) asks sub_82957208(component, damage) whether the hit counts;\n// 2 means it is ignored, as for a component that is already down.\n"
+        }
+      ],
+      "operations": [
+        "entities.damage",
+        "entities.heal",
+        "players.damage",
+        "players.god_mode",
+        "players.heal",
+        "players.refill_health"
+      ]
+    },
+    {
+      "symbol": "sub_82B766A8",
+      "name": "Input.ReadGameState",
+      "system": "input",
+      "summary": "Read one logical controller through the original XInputGetState wrapper.",
+      "definition_sha256": "9547a0842f749c330ac8e1f8c69a145870b6d412ce659c325693dc1d7b88afc3",
+      "evidence": [
+        {
+          "path": "simpsons/src/modkit_input.cpp",
+          "quote": "// The game's XInputGetState wrapper moves r4 (output) to r5 and clears r4\n// (flags) before calling XamInputGetState. Observe its completed output; never\n// ask the driver to poll again or change any guest registers or memory."
+        }
+      ],
+      "operations": [
+        "input.state"
+      ]
+    }
+  ]
+}

@@ -31,6 +31,11 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+REXCVAR_DEFINE_DOUBLE(audio_dialogue_level, 1.0, "Audio",
+                      "Level of the centre channel, which carries the dialogue, when the 5.1 mix "
+                      "is folded down to stereo: 1 = as the Xbox 360 does it, higher = clearer voices")
+    .range(0.5, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 // Diagnostics: every frame the game submits, raw (256 samples x 6 channels,
 // big-endian float, channel after channel), and in <file>.ts the
 // monotonic nanosecond timestamp of each, for measuring gaps without listening.
@@ -69,7 +74,7 @@ bool SDLAudioDriver::Initialize() {
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
 
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_GNU_LINUX
   // HAND PATCH: SDL's default audio driver auto-probe can land on "jack"
   // before ever trying pipewire/pulseaudio, and if no real JACK server is
   // reachable (common -- SteamOS runs PipeWire, whose JACK-compatibility
@@ -87,7 +92,7 @@ bool SDLAudioDriver::Initialize() {
   SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
 
   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_GNU_LINUX
     // The steered driver list can itself be wrong on unusual setups (e.g. a
     // bare ALSA-less system). Fall back to SDL's own probe order before
     // giving up on audio entirely.
@@ -108,12 +113,38 @@ bool SDLAudioDriver::Initialize() {
   desired_spec.freq = frame_frequency_;
   desired_spec.format = SDL_AUDIO_F32LE;
   desired_spec.channels = frame_channels_;
-  sdl_device_channels_ = frame_channels_;
+#if REX_PLATFORM_ANDROID
+  // AAudio may accept a six-channel stream on a phone with stereo speakers.
+  // Its reported format is that stream's format, not a count of physical
+  // speakers. Fold the game's centre/dialogue channel into stereo here instead
+  // of depending on the phone's surround routing. SDL still handles mono and
+  // Bluetooth devices from this stereo source.
+  desired_spec.channels = 2;
+#endif
+  sdl_device_channels_ = desired_spec.channels;
+  stereo_center_gain_ = conversion::kStereoCenterGain *
+                        float(std::clamp(REXCVAR_GET(audio_dialogue_level), 0.5, 2.0));
   sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
                                           SDLCallback, this);
   if (!sdl_stream_) {
-    REXAPU_ERROR("SDL_OpenAudioDeviceStream() failed: {}", SDL_GetError());
-    return false;
+    // No output device (none connected, or a TV or receiver that is off).
+    // Without a stream nothing consumes the game's frames and the game hangs
+    // at startup, so play on SDL's dummy driver instead, which consumes them
+    // in real time without sound.
+    REXAPU_WARN("SDL_OpenAudioDeviceStream() failed: {}; continuing without sound",
+                SDL_GetError());
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+      REXAPU_ERROR("SDL dummy audio failed to start: {}", SDL_GetError());
+      return false;
+    }
+    sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
+                                            SDLCallback, this);
+    if (!sdl_stream_) {
+      REXAPU_ERROR("SDL_OpenAudioDeviceStream() failed on dummy audio: {}", SDL_GetError());
+      return false;
+    }
   }
 
   SDL_AudioDeviceID sdl_device = SDL_GetAudioStreamDevice(sdl_stream_);
@@ -127,7 +158,7 @@ bool SDLAudioDriver::Initialize() {
     obtained_spec = desired_spec;
   }
 
-  if (obtained_spec.channels == 2) {
+  if (obtained_spec.channels == 2 && desired_spec.channels != 2) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
     desired_spec.channels = 2;
@@ -149,6 +180,16 @@ bool SDLAudioDriver::Initialize() {
     REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
     return false;
   }
+#if REX_PLATFORM_ANDROID
+  int device_frames = 0;
+  if (SDL_GetAudioDeviceFormat(sdl_device, &obtained_spec, &device_frames)) {
+    REXAPU_INFO("[audio-device] {}: {} Hz, {} device channels, {} device frames; mixer {} Hz, "
+                "{} output channels, centre gain {:.3f}",
+                SDL_GetCurrentAudioDriver(), obtained_spec.freq, obtained_spec.channels,
+                device_frames, uint32_t(frame_frequency_), sdl_device_channels_,
+                stereo_center_gain_);
+  }
+#endif
 
   const std::string dump_path = REXCVAR_GET(audio_dump_file);
   if (!dump_path.empty()) {
@@ -301,12 +342,13 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     // The popped buffer belongs to this callback until it is returned to the
     // pool. Keep conversion, SDL calls and semaphore wakeups outside the
     // queue lock so the submitting thread can fill the next available slot.
-    if (!buffer || REXCVAR_GET(audio_mute)) {
+    if (!buffer || REXCVAR_QUERY(bool, audio_mute)) {
       std::memset(data, 0, len);
     } else {
       switch (driver->sdl_device_channels_) {
         case 2:
-          conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_);
+          conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_,
+                                                          driver->stereo_center_gain_);
           break;
         case 6:
           conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_);

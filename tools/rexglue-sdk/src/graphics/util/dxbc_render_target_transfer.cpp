@@ -122,7 +122,7 @@ bool DxbcRenderTargetTransferShader::Create(TransferShaderKey key, const Options
   output.clear();
   error.clear();
   constexpr uint32_t used_key_bits =
-      3 * xenos::kMsaaSamplesBits + 2 * xenos::kRenderTargetFormatBits + 4;
+      3 * xenos::kMsaaSamplesBits + 2 * xenos::kRenderTargetFormatBits + 7;
   if (!options.resolution_scale_x || !options.resolution_scale_y ||
       options.resolution_scale_x > 3 || options.resolution_scale_y > 3 ||
       uint32_t(key.mode) >= uint32_t(TransferMode::kCount) || (key.key >> used_key_bits) ||
@@ -795,13 +795,15 @@ bool DxbcRenderTargetTransferShader::Create(TransferShaderKey key, const Options
   if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX) {
     a.OpDclOutput(dxbc::Dest::OStencilRef());
   }
-  // r0:r2 are involved at least in common addressing code. Texture loads
-  // usually can overwrite some of the addressing temps as they are only needed
-  // for the coordinates for that load. Currently 3 temps are enough.
-  a.OpDclTemps(3);
+  // Mixed-resolution views map guest samples first, then resample each
+  // source independently. r3 keeps the destination subpixel and r4 the load
+  // coordinates, so two 32-bit halves still address distinct guest samples.
+  const bool resample = key.dest_original_resolution || key.source_original_resolution ||
+                        key.host_depth_source_original_resolution;
+  a.OpDclTemps(resample ? 5 : 3);
 
-  uint32_t draw_resolution_scale_x = options.resolution_scale_x;
-  uint32_t draw_resolution_scale_y = options.resolution_scale_y;
+  uint32_t draw_resolution_scale_x = resample ? 1u : options.resolution_scale_x;
+  uint32_t draw_resolution_scale_y = resample ? 1u : options.resolution_scale_y;
 
   uint32_t tile_width_samples = xenos::kEdramTileWidthSamples * draw_resolution_scale_x;
   uint32_t tile_height_samples = xenos::kEdramTileHeightSamples * draw_resolution_scale_y;
@@ -810,6 +812,25 @@ bool DxbcRenderTargetTransferShader::Create(TransferShaderKey key, const Options
   // 32bpp-tile-relative pixel index in r0.xy.
   // r0.xy = pixel XY as uint
   a.OpFToU(dxbc::Dest::R(0, 0b0011), dxbc::Src::V1D(kInputRegisterPosition));
+  if (resample) {
+    if (key.dest_original_resolution) {
+      a.OpMov(dxbc::Dest::R(3, 0b0011), dxbc::Src::LU(options.resolution_scale_x / 2u,
+                                                      options.resolution_scale_y / 2u, 0, 0));
+    } else {
+      a.OpUDiv(dxbc::Dest::R(0, 0b0011), dxbc::Dest::R(3, 0b0011), dxbc::Src::R(0),
+               dxbc::Src::LU(options.resolution_scale_x, options.resolution_scale_y, 1, 1));
+    }
+    a.OpMov(dxbc::Dest::R(4, 0b0100), dxbc::Src::LU(0));
+  }
+  auto scale_source_coordinates = [&](uint32_t destination, uint32_t source,
+                                      bool original_resolution) {
+    if (!resample)
+      return;
+    a.OpUMAd(dxbc::Dest::R(destination, 0b0011), dxbc::Src::R(source),
+             dxbc::Src::LU(original_resolution ? 1u : options.resolution_scale_x,
+                           original_resolution ? 1u : options.resolution_scale_y, 0, 0),
+             original_resolution ? dxbc::Src::LU(0) : dxbc::Src::R(3));
+  };
   uint32_t dest_tile_width_pixels =
       tile_width_samples >>
       (uint32_t(dest_is_64bpp) + uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k4X));
@@ -1181,19 +1202,21 @@ bool DxbcRenderTargetTransferShader::Create(TransferShaderKey key, const Options
   if (key.source_msaa_samples != xenos::MsaaSamples::k1X) {
     for (uint32_t i = 0; i <= uint32_t(source_load_is_two_dwords); ++i) {
       uint32_t source_load_register = source_load_is_two_dwords ? i : 1;
+      scale_source_coordinates(4, 1, key.source_original_resolution);
       if (srv_index_depth != UINT32_MAX) {
-        a.OpLdMS(dxbc::Dest::R(source_load_register, 0b1000), dxbc::Src::R(1), 0b0011,
-                 dxbc::Src::T(srv_index_depth, kTransferSRVRegisterDepth, dxbc::Src::kXXXX),
+        a.OpLdMS(dxbc::Dest::R(source_load_register, 0b1000), dxbc::Src::R(resample ? 4 : 1),
+                 0b0011, dxbc::Src::T(srv_index_depth, kTransferSRVRegisterDepth, dxbc::Src::kXXXX),
                  source_sample);
       }
       if (srv_index_stencil != UINT32_MAX) {
-        a.OpLdMS(dxbc::Dest::R(source_load_register, 0b0001), dxbc::Src::R(1), 0b0011,
+        a.OpLdMS(dxbc::Dest::R(source_load_register, 0b0001), dxbc::Src::R(resample ? 4 : 1),
+                 0b0011,
                  dxbc::Src::T(srv_index_stencil, kTransferSRVRegisterStencil, dxbc::Src::kYYYY),
                  source_sample);
       } else if (srv_index_color != UINT32_MAX) {
         a.OpLdMS(dxbc::Dest::R(source_load_register, source_color_srv_component_mask),
-                 dxbc::Src::R(1), 0b0011, dxbc::Src::T(srv_index_color, kTransferSRVRegisterColor),
-                 source_sample);
+                 dxbc::Src::R(resample ? 4 : 1), 0b0011,
+                 dxbc::Src::T(srv_index_color, kTransferSRVRegisterColor), source_sample);
       }
       if (source_load_is_two_dwords && !i) {
         // Go to the next sample or pixel along X if need to load two dwords.
@@ -1208,9 +1231,10 @@ bool DxbcRenderTargetTransferShader::Create(TransferShaderKey key, const Options
   } else {
     // Write zero to the LOD index in r1.z.
     a.OpMov(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(0));
-    dxbc::Src source_coordinates(dxbc::Src::R(1, 0b10000100));
+    dxbc::Src source_coordinates(dxbc::Src::R(resample ? 4 : 1, 0b10000100));
     for (uint32_t i = 0; i <= uint32_t(source_load_is_two_dwords); ++i) {
       uint32_t source_load_register = source_load_is_two_dwords ? i : 1;
+      scale_source_coordinates(4, 1, key.source_original_resolution);
       if (srv_index_depth != UINT32_MAX) {
         a.OpLd(dxbc::Dest::R(source_load_register, 0b1000), source_coordinates, 0b1011,
                dxbc::Src::T(srv_index_depth, kTransferSRVRegisterDepth, dxbc::Src::kXXXX));
@@ -1872,6 +1896,7 @@ bool DxbcRenderTargetTransferShader::Create(TransferShaderKey key, const Options
                            tile_height_samples >>
                            uint32_t(key.host_depth_source_msaa_samples >= xenos::MsaaSamples::k2X)),
                        dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(0, dxbc::Src::kYYYY));
+              scale_source_coordinates(0, 0, key.host_depth_source_original_resolution);
               // Load from the host depth texture.
               if (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X) {
                 a.OpLdMS(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0), 0b0011,

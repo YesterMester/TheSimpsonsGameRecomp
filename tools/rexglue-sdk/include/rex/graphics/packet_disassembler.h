@@ -35,6 +35,10 @@ struct PacketAction {
     kRegisterWrite,
     kSetBinMask,
     kSetBinSelect,
+    kSetBinMaskLow,
+    kSetBinMaskHigh,
+    kSetBinSelectLow,
+    kSetBinSelectHigh,
   };
   Type type;
 
@@ -72,12 +76,19 @@ struct PacketAction {
     action.set_bin_select.value = value;
     return action;
   }
+
+  static PacketAction SetBinHalf(Type type, uint32_t value) {
+    PacketAction action;
+    action.type = type;
+    action.set_bin_mask.value = value;
+    return action;
+  }
 };
 
 struct PacketInfo {
-  const PacketTypeInfo* type_info;
-  bool predicated;
-  uint32_t count;
+  const PacketTypeInfo* type_info = nullptr;
+  bool predicated = false;
+  uint32_t count = 0;
   std::vector<PacketAction> actions;
 };
 

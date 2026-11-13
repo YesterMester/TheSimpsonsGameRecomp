@@ -178,7 +178,8 @@ class TestWindow {
   HWND window_ = nullptr;
 };
 
-uint64_t CheckRenderTargets(D3D11Device& owner, bool present, uint32_t& presentations) {
+uint64_t CheckRenderTargets(D3D11Device& owner, bool present, uint32_t& presentations,
+                            D3D11SwapChain::PresentationMode mode, uint32_t& reconnects) {
   auto vertex_code = Compile(R"(
 float4 main(uint id : SV_VertexID) : SV_Position {
   float2 p = float2((id << 1) & 2, id & 2);
@@ -217,7 +218,7 @@ float4 main(float4 position : SV_Position) : SV_Target {
       window.Pump();
       if (!chain) {
         std::string error;
-        chain = D3D11SwapChain::Create(owner, window.window(), width, height, error);
+        chain = D3D11SwapChain::Create(owner, window.window(), width, height, error, mode);
         Require(bool(chain), error.c_str());
       } else {
         Check(chain->Resize(width, height), "Swap-chain resize");
@@ -269,11 +270,18 @@ float4 main(float4 position : SV_Position) : SV_Target {
       context->OMSetRenderTargets(0, nullptr, nullptr);
       if (present) {
         context->CopyResource(chain->back_buffer(), output.Get());
+        // Retain the actual backbuffer's pixels, not just the offscreen source.
+        // Reading every version below catches stale/misrouted presentation data.
+        ComPtr<ID3D11Texture2D> presented;
+        Check(owner.device()->CreateTexture2D(&desc, nullptr, presented.GetAddressOf()),
+              "Retained swap-chain image");
+        context->CopyResource(presented.Get(), chain->back_buffer());
         HRESULT status = chain->Present((seed & 1) == 0);
         Check(status, "Flip presentation");
         Require(status == S_OK,
                 "Presentation test window is occluded; frame delivery was not checked");
         ++presentations;
+        output = std::move(presented);
       }
       versions.push_back(std::move(output));
     }
@@ -302,6 +310,24 @@ float4 main(float4 position : SV_Position) : SV_Target {
       checked_pixels += uint64_t(width) * height;
     }
     context->ClearState();
+    if (present) {
+      for (uint32_t cycle = 0; cycle < 3; ++cycle) {
+        // Destroy while its view is bound and a clear is queued. D3D11 must
+        // retire both before another flip chain can reuse this same HWND.
+        auto* target = chain->render_target();
+        context->OMSetRenderTargets(1, &target, nullptr);
+        constexpr float clear[] = {0.25f, 0.5f, 0.75f, 1.0f};
+        context->ClearRenderTargetView(target, clear);
+        chain.reset();
+        std::string error;
+        chain = D3D11SwapChain::Create(owner, window.window(), width, height, error, mode);
+        Require(bool(chain), error.c_str());
+        Check(chain->WaitForFrame(), "Reconnected presentation frame");
+        context->ClearRenderTargetView(chain->render_target(), clear);
+        Check(chain->Present(false), "Reconnected presentation");
+        ++reconnects;
+      }
+    }
   }
   Check(owner.WaitForCompletion(), "Final presentation completion");
   return checked_pixels;
@@ -348,19 +374,35 @@ int main(int argc, char** argv) {
     D3D11Device::Options options;
     options.debug = true;
     bool present = false;
+    D3D11SwapChain::PresentationMode mode = D3D11SwapChain::PresentationMode::kAutomatic;
+    std::string present_mode = "auto";
     for (int i = 1; i < argc; ++i) {
       std::string_view arg = argv[i];
       if (arg == "--warp") {
         options.warp = true;
       } else if (arg == "--present") {
         present = true;
+      } else if (arg == "--present-mode" && i + 1 < argc) {
+        present = true;
+        present_mode = argv[++i];
+        if (present_mode == "auto")
+          mode = D3D11SwapChain::PresentationMode::kAutomatic;
+        else if (present_mode == "flip-discard")
+          mode = D3D11SwapChain::PresentationMode::kFlipDiscard;
+        else if (present_mode == "flip-sequential")
+          mode = D3D11SwapChain::PresentationMode::kFlipSequential;
+        else if (present_mode == "discard")
+          mode = D3D11SwapChain::PresentationMode::kDiscard;
+        else
+          throw std::runtime_error("Unknown presentation mode");
       } else if (arg == "--adapter" && i + 1 < argc) {
         options.adapter_index = std::stoi(argv[++i]);
       } else if (arg == "--output" && i + 1 < argc) {
         output = argv[++i];
       } else {
         throw std::runtime_error(
-            "Usage: d3d11_check [--warp | --adapter N] [--present] [--output report.json]");
+            "Usage: d3d11_check [--warp | --adapter N] [--present] "
+            "[--present-mode auto|flip-discard|flip-sequential|discard] [--output report.json]");
       }
     }
     std::string error;
@@ -368,7 +410,8 @@ int main(int argc, char** argv) {
     Require(bool(owner), error.c_str());
     uint64_t words = CheckRawBuffers(*owner);
     uint32_t presentations = 0;
-    uint64_t pixels = CheckRenderTargets(*owner, present, presentations);
+    uint32_t reconnects = 0;
+    uint64_t pixels = CheckRenderTargets(*owner, present, presentations, mode, reconnects);
     CheckDebugMessages(owner->device());
     const auto& features = owner->features();
     std::string report =
@@ -382,6 +425,8 @@ int main(int argc, char** argv) {
     report += "  \"raw_words\": " + std::to_string(words) + ",\n";
     report += "  \"retained_image_versions\": 32,\n  \"scales\": [1, 2],\n";
     report += "  \"exact_pixels\": " + std::to_string(pixels) + ",\n";
+    report += "  \"presentation_mode\": " + Quote(present_mode) + ",\n";
+    report += "  \"swap_chain_reconnections\": " + std::to_string(reconnects) + ",\n";
     report += "  \"presentations\": " + std::to_string(presentations) + "\n}\n";
     std::fputs(report.c_str(), stdout);
     if (!output.empty()) {

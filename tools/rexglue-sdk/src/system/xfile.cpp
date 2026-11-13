@@ -320,7 +320,7 @@ bool XFile::Save(stream::ByteStream* stream) {
     return false;
   }
 
-  stream->Write(file_->entry()->absolute_path());
+  stream->Write(std::string_view(file_->entry()->absolute_path()));
   stream->Write<uint64_t>(position_);
   stream->Write(file_access());
   stream->Write<bool>((file_->entry()->attributes() & rex::filesystem::kFileAttributeDirectory) !=

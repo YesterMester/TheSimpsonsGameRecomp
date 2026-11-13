@@ -142,6 +142,7 @@ class WindowedApp {
         creators_->erase(iterator_inserted_.first);
         if (creators_->empty()) {
           delete creators_;
+          creators_ = nullptr;
         }
       }
     }
@@ -156,6 +157,13 @@ class WindowedApp {
     }
     auto it = creators_->find(identifier);
     return it != creators_->end() ? it->second : nullptr;
+  }
+
+  // A platform entry point can run a library containing one application
+  // without embedding its identifier. Multiple-app hosts still select an
+  // explicit identifier through GetCreator.
+  static Creator GetSingleCreator() {
+    return creators_ && creators_->size() == 1 ? creators_->begin()->second : nullptr;
   }
 
  private:

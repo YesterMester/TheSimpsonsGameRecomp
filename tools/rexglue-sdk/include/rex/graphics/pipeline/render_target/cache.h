@@ -185,12 +185,18 @@ class RenderTargetCache {
   bool IsOriginalResolutionRenderTarget(uint32_t base_tiles, uint32_t pitch_tiles_at_32bpp,
                                         bool is_depth) const;
 
+  // All attachments used by the last Update share their rasterization scale.
+  bool IsLastUpdateOriginalResolution() const;
+
   // Virtual (both the common code and the implementation may do something
   // here), don't call from destructors (does work not needed for shutdown
   // also).
   virtual void ClearCache();
 
   virtual void BeginFrame();
+  void SetSharedMemory(SharedMemory* shared_memory) {
+    draw_extent_estimator_.SetSharedMemory(shared_memory);
+  }
 
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask, const Shader& vertex_shader);
@@ -579,6 +585,20 @@ class RenderTargetCache {
   void GetResolveCopyRectanglesToDump(uint32_t base, uint32_t row_length, uint32_t rows,
                                       uint32_t pitch,
                                       std::vector<ResolveCopyDumpRectangle>& rectangles_out) const;
+  struct NativeResolveOwnershipPlan {
+    RenderTargetKey destination;
+    uint32_t start = 0, length = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> tile_ranges;
+    std::vector<Transfer> transfers;
+  };
+  // Preview every owner before changing any. Backends validate their native
+  // transfer pipelines, then publish the same ownership change and execute it.
+  bool PlanNativeResolveOwnership(const draw_util::ResolveInfo& resolve, uint32_t base,
+                                  uint32_t row_length, uint32_t rows, uint32_t pitch,
+                                  NativeResolveOwnershipPlan& plan,
+                                  bool allow_mixed_resolution = false) const;
+  RenderTarget* FindNativeResolveSource(uint32_t base, uint32_t row_length, uint32_t rows,
+                                        uint32_t pitch) const;
   void GetResolveCopyDispatchesToDump(uint32_t base, uint32_t row_length, uint32_t rows,
                                       uint32_t pitch,
                                       std::vector<ResolveCopyDumpRectangle>& rectangles_out,

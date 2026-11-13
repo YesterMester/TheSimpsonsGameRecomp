@@ -19,7 +19,10 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/shared_memory.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
+#include <rex/graphics/util/vertex_fetch_bounds.h>
+#include <rex/graphics/util/vertex_index_bounds.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
@@ -61,6 +64,53 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
 //     "GPU");
 
 namespace rex::graphics {
+
+bool DrawExtentEstimator::CanReadVertexInputs(const Shader& vertex_shader, uint32_t first,
+                                              uint32_t last) const {
+  if (first > last || !vertex_shader.has_static_vertex_addresses())
+    return false;
+  for (const auto& binding : vertex_shader.vertex_bindings()) {
+    auto fetch = register_file_.GetVertexFetch(binding.fetch_constant);
+    if (!fetch.size)
+      continue;
+    if (!shared_memory_ || fetch.type != xenos::FetchConstantType::kVertex)
+      return false;
+    int64_t first_word = INT64_MAX, end_word = INT64_MIN;
+    for (const auto& attribute : binding.attributes) {
+      const auto& instruction = attribute.fetch_instr;
+      const auto& expression = attribute.index_expression;
+      auto indices =
+          instruction.attributes.stride
+              ? draw_util::GetVertexFetchIndexBounds(
+                    first, last, instruction.attributes.is_index_rounded,
+                    expression.offset_constant, expression.scale_constant,
+                    [&](uint32_t index) {
+                      return register_file_.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + index);
+                    })
+              : draw_util::VertexFetchIndexBounds{0, 0};
+      if (!indices)
+        return false;
+      uint32_t needed = xenos::GetVertexFormatNeededWords(
+          instruction.attributes.data_format, instruction.result.GetUsedResultComponents());
+      for (uint32_t word = 0; word < 4; ++word) {
+        if (!(needed & (1u << word)))
+          continue;
+        int64_t offset = int64_t(instruction.attributes.offset) + word;
+        first_word = std::min(first_word, indices.first * binding.stride_words + offset);
+        end_word = std::max(end_word, indices.last * binding.stride_words + offset + 1);
+      }
+    }
+    if (first_word == INT64_MAX)
+      continue;
+    auto range = draw_util::GetVertexFetchByteRange(fetch.address, first_word, end_word,
+                                                    SharedMemory::kBufferSize);
+    // CPU memory is stale while a retained GPU owner is authoritative. Do not
+    // shrink attachment ownership, or replace a draw with a clear, from it.
+    if (!range || shared_memory_->IsRangeGpuWritten(range.address, range.size))
+      return false;
+  }
+  return true;
+}
 
 void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister export_register,
                                                       const float* value, uint32_t value_mask) {
@@ -118,6 +168,10 @@ bool DrawExtentEstimator::GetAutoIndexedVertexPositions(const Shader& vertex_sha
   uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
   uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
   uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+  auto bounds =
+      draw_util::GetAutoVertexIndexBounds(vertex_count, index_offset, min_index, max_index);
+  if (!CanReadVertexInputs(vertex_shader, bounds.first, bounds.last))
+    return false;
   shader_interpreter_.SetShader(vertex_shader);
   PositionExportSink position_export_sink;
   shader_interpreter_.SetExportSink(&position_export_sink);
@@ -189,17 +243,19 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
         index_endian = xenos::Endian::kNone;
       }
       index_buffer_base &= ~uint32_t(sizeof(uint16_t) - 1);
-      if (trace_writer_) {
-        trace_writer_->WriteMemoryRead(index_buffer_base,
-                                       sizeof(uint16_t) * index_buffer_read_count);
-      }
     } else {
       assert_true(vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32);
       index_buffer_base &= ~uint32_t(sizeof(uint32_t) - 1);
-      if (trace_writer_) {
-        trace_writer_->WriteMemoryRead(index_buffer_base,
-                                       sizeof(uint32_t) * index_buffer_read_count);
-      }
+    }
+    const uint32_t index_bytes =
+        index_buffer_read_count *
+        (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16 ? 2u : 4u);
+    if (index_buffer_base >= SharedMemory::kBufferSize ||
+        index_bytes > SharedMemory::kBufferSize - index_buffer_base || !shared_memory_ ||
+        shared_memory_->IsRangeGpuWritten(index_buffer_base, index_bytes))
+      return xenos::kTexture2DCubeMaxWidthHeight;
+    if (trace_writer_) {
+      trace_writer_->WriteMemoryRead(index_buffer_base, index_bytes);
     }
     index_buffer = memory_.TranslatePhysical(index_buffer_base);
   }
@@ -208,6 +264,29 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
   uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
   uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
   uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+
+  draw_util::VertexIndexBounds bounds;
+  if (min_index > max_index)
+    return xenos::kTexture2DCubeMaxWidthHeight;
+  if (vgt_draw_initiator.source_select == xenos::SourceSelect::kAutoIndex) {
+    bounds = draw_util::GetAutoVertexIndexBounds(vgt_draw_initiator.num_indices, index_offset,
+                                                 min_index, max_index);
+  } else {
+    // Including restart values is conservative and avoids reproducing the
+    // primitive converter here. Reads beyond the DMA count use vertex zero.
+    bounds = draw_util::GetVertexIndexBounds(
+        index_buffer,
+        std::min(uint32_t(vgt_draw_initiator.num_indices), uint32_t(vgt_dma_size.num_words)),
+        vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16, index_endian, false,
+        index_offset, min_index, max_index);
+    if (vgt_draw_initiator.num_indices > vgt_dma_size.num_words) {
+      uint32_t index = std::clamp(index_offset & xenos::kVertexIndexMask, min_index, max_index);
+      bounds.first = std::min(bounds.first, index);
+      bounds.last = std::max(bounds.last, index);
+    }
+  }
+  if (!CanReadVertexInputs(vertex_shader, bounds.first, bounds.last))
+    return xenos::kTexture2DCubeMaxWidthHeight;
 
   auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
   float viewport_y_scale =

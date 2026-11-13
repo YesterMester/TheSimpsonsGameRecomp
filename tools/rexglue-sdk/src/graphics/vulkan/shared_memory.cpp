@@ -255,11 +255,14 @@ bool VulkanSharedMemory::FlushGpuWrittenRange(uint32_t start, uint32_t length, b
 
 void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range,
                              std::pair<uint32_t, uint32_t> read_range) {
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kMemoryMirror,
-      uint64_t(written_range.second) + read_range.second,
-      fmt::format("usage {} at {}", uint32_t(usage),
-                  DescribeCodeAddress(__builtin_return_address(0))));
+  // The detail looks up a symbol name: only when anything records it.
+  if (command_processor_.native_gpu_diagnostics().enabled()) {
+    command_processor_.native_gpu_diagnostics().RecordDependency(
+        NativeGpuDiagnostics::Dependency::kMemoryMirror,
+        uint64_t(written_range.second) + read_range.second,
+        fmt::format("usage {} at {}", uint32_t(usage),
+                    DescribeCodeAddress(__builtin_return_address(0))));
+  }
   if (!EnsureHostBuffer()) {
     return;
   }
@@ -310,6 +313,10 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
   }
   last_written_range_ = written_range;
+}
+
+bool VulkanSharedMemory::DownloadNativeGpuIndices(uint32_t start, std::span<uint8_t> bytes) {
+  return command_processor_.DownloadNativeIndexRange(start, bytes);
 }
 
 bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {

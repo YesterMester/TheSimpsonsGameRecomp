@@ -123,6 +123,14 @@ if(NOT WIN32)
     endif()
     # Position-independent code for all targets
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    # The runtime is a shared library loaded with the program, not by dlopen,
+    # so its thread-local variables can live in the static TLS block: one
+    # %fs-relative access each instead of a __tls_get_addr call (the game's
+    # KeTlsGetValue and the audio mixer's budget checks run thousands of times
+    # a frame). Android loads the game's libraries with dlopen.
+    if(NOT ANDROID AND NOT APPLE)
+        add_compile_options(-ftls-model=initial-exec)
+    endif()
 endif()
 
 # Global compile options
@@ -156,7 +164,12 @@ if(REXGLUE_ENABLE_LTO)
 endif()
 
 # Platform detection (supports AMD64 and ARM64)
-if(WIN32)
+if(ANDROID)
+    if(NOT CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+        message(FATAL_ERROR "The Android runtime currently requires arm64-v8a")
+    endif()
+    set(REX_PLATFORM "android-arm64")
+elseif(WIN32)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "win-amd64")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
@@ -213,10 +226,13 @@ configure_file(
     @ONLY
 )
 
-# Output directories (multi-config appends /<Config>/ automatically)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+# Output directories (multi-config appends /<Config>/ automatically). A build
+# directory can keep its libraries apart from other builds of the same tree.
+set(REXGLUE_OUTPUT_DIR "${REXGLUE_ROOT}/out/${REX_PLATFORM}" CACHE PATH
+    "Directory for the SDK's libraries")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
 
 # Sanitizer support for debugging memory corruption and undefined behavior
 if(REXGLUE_ENABLE_SANITIZERS)
@@ -250,8 +266,10 @@ add_subdirectory(src/audio)
 add_subdirectory(src/graphics)
 add_subdirectory(src/system)
 add_subdirectory(src/kernel)
-add_subdirectory(src/codegen)
-add_subdirectory(src/rexglue)
+if(NOT ANDROID)
+    add_subdirectory(src/codegen)
+    add_subdirectory(src/rexglue)
+endif()
 
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)

@@ -4,8 +4,24 @@
 
 #pragma once
 
+
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
+#include "achievements.h"
+#include "game_menu.h"
+#include "game_prompts.h"
+#include "game_canvas.h"
+#include "game_thread.h"
+#include "host_memory.h"
+#include "debug_menu.h"
+#include "saves.h"
+#include "snapshot.h"
+#include "game_ui.h"
+#include "overlay.h"
+#include "pause_menu.h"
+#include "spawner.h"
+#include "modkit_game.h"
+#include "cutscene_skip.h"
 
 namespace rex::memory {
 class Memory;
@@ -38,13 +54,62 @@ class SimpsonsApp : public rex::ReXApp {
         PPCImageConfig));
   }
 
+  void OnConfigurePaths(rex::PathConfig& paths) override {
+    const std::string quick = rex::cvar::GetFlagByName("quick_launch_level");
+    const std::string preview = rex::cvar::GetFlagByName("mods_editor_preview");
+    if (!quick.empty() && preview != "true") {
+      if (paths.cache_root.empty() && !paths.user_data_root.empty())
+        paths.cache_root = paths.user_data_root / "cache";
+      paths.user_data_root = paths.user_data_root / "quick-launch";
+      std::error_code ec;
+      std::filesystem::remove_all(paths.user_data_root, ec);
+      std::filesystem::create_directories(paths.user_data_root, ec);
+      rex::cvar::SetFlagByName("saves_screen", "false");
+    }
+  }
   void OnPostLoadXexImage() override {
     ApplyInkOutlineOptions(runtime()->memory());
     ApplyEyeShadingOptions(runtime()->memory());
     ApplyPhysicsStepOptions(runtime()->memory());
   }
-  void OnPostSetup() override { InitFreecam(window()); }
-  void OnShutdown() override { ShutdownFreecam(window()); }
+  void OnLoadXexImage(std::string& image) override {
+    modkit_game::Prepare(runtime());
+  }
+  void OnPostSetup() override {
+    // Before anything takes guest memory for itself.
+    host_memory::Init(runtime()->memory());
+    modkit_game::InitText(runtime());
+    InitFreecam(window());
+    InitGamePrompts(runtime());
+    InitGameMenu(runtime(), window(), config_path());
+    InitGameThread(runtime());
+    achievements::Init(runtime());
+    InitPauseMenu(runtime());
+    spawner::Init(runtime());
+    snapshot::Init(runtime());
+    saves::Init(runtime());
+    canvas::Init(host_memory::Alloc(16), host_memory::Alloc(4096 * 28), 4096,
+                 host_memory::AllocPhysical(canvas::kPictureMemory));
+    debug_menu::Init(config_path());
+    game_ui::Init(runtime(), window());
+    InitCutsceneSkip(runtime(), window());
+  }
+  void OnShutdown() override {
+    ShutdownCutsceneSkip();
+    spawner::Shutdown();
+    modkit_game::Shutdown();
+    saves::Shutdown();
+    game_ui::Shutdown();
+    overlay::Shutdown();
+    achievements::Shutdown();
+    ShutdownGameMenu();
+    ShutdownGamePrompts();
+    ShutdownFreecam(window());
+  }
+  void OnConfigureFonts(ImFontAtlas* atlas) override { overlay::ConfigureFonts(atlas); }
+  void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    overlay::Init(window(), drawer, immediate_drawer());
+  }
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}

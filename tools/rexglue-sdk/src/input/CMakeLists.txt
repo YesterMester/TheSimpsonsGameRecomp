@@ -2,6 +2,7 @@
 # Input system and drivers for Xbox 360 controller emulation
 
 add_library(rexinput OBJECT
+    device.cpp
     input_system.cpp
     mnk/mnk_input_driver.cpp
     nop/nop_input_driver.cpp
@@ -19,3 +20,6 @@ else()
 endif()
 
 target_link_libraries(rexinput PUBLIC rexcore rexui SDL3::SDL3)
+if(ANDROID)
+    target_sources(rexinput PRIVATE touch/touch_input_driver.cpp)
+endif()

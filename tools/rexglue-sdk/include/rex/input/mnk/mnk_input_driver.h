@@ -40,6 +40,8 @@ class MnkInputDriver final : public InputDriver,
                         X_INPUT_KEYSTROKE* out_keystroke) override;
 
   void OnWindowAvailable(rex::ui::Window* window) override;
+  std::vector<InputDevice> GetDevices() override;
+  void SetMenuPointerActive(bool active);
 
   // WindowInputListener
   void OnKeyDown(rex::ui::KeyEvent& e) override;
@@ -99,6 +101,7 @@ class MnkInputDriver final : public InputDriver,
   // Game thread: the capture state last requested from the UI thread.
   bool capture_requested_ = false;
   std::atomic<bool> mouse_captured_{false};
+  std::atomic<bool> menu_pointer_active_{false};
   std::atomic<bool> has_focus_{true};
 
   // Keystroke queue

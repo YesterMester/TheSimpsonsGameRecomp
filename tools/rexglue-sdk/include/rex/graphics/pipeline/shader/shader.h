@@ -895,6 +895,13 @@ class Shader {
   const std::set<uint32_t>& memexport_stream_constants() const {
     return memexport_stream_constants_;
   }
+  bool has_static_memexport_addresses() const { return has_static_memexport_addresses_; }
+  // For X, Z and W of each address MAD, two possible zero factors. UINT32_MAX
+  // is literal zero, UINT32_MAX - 1 is unproved; other values name float
+  // constant components in this shader's bank. Y is bounded by the shader.
+  const std::vector<std::array<uint32_t, 6>>& memexport_address_zero_factors() const {
+    return memexport_address_zero_factors_;
+  }
 
   // Labels that jumps (explicit or from loops) can be done to.
   const std::set<uint32_t>& label_addresses() const { return label_addresses_; }
@@ -1061,6 +1068,8 @@ class Shader {
   std::unordered_map<uint64_t, Translation*> translations_;
 
   uint32_t ucode_storage_index_ = UINT32_MAX;
+  bool has_static_memexport_addresses_ = true;
+  std::vector<std::array<uint32_t, 6>> memexport_address_zero_factors_;
 
  private:
   void GatherExecInformation(const ParsedExecInstruction& instr,

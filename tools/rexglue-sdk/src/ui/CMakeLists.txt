@@ -68,7 +68,13 @@ if(REXGLUE_USE_D3D11)
 endif()
 
 # Platform-specific sources
-if(WIN32)
+if(ANDROID)
+    set(REXUI_PLATFORM_SOURCES
+        surface_android.cpp
+        window_android.cpp
+        windowed_app_context_android.cpp
+    )
+elseif(WIN32)
     set(REXUI_PLATFORM_SOURCES
         surface_win.cpp
         window_win.cpp
@@ -147,7 +153,9 @@ if(REXGLUE_USE_VULKAN)
 endif()
 
 # Platform-specific dependencies
-if(WIN32)
+if(ANDROID)
+    target_link_libraries(rexui PUBLIC SDL3::SDL3 android log)
+elseif(WIN32)
     target_link_libraries(rexui PUBLIC
         dwmapi
         shcore

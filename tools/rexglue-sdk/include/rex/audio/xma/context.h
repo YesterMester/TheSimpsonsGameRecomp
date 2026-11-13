@@ -308,6 +308,10 @@ class XmaContext {
   // Loop subframe precision state
   uint8_t loop_frame_output_limit_ = 0;
   bool loop_start_skip_pending_ = false;
+
+  // The new stream's output buffer was silenced since the context was
+  // cleared or released (see Work).
+  bool output_cleared_since_clear_ = false;
 };
 
 }  // namespace rex::audio

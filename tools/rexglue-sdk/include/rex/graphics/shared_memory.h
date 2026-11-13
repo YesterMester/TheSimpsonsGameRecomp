@@ -12,8 +12,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -136,6 +138,20 @@ class SharedMemory {
   // back. Checks whole pages, so a neighboring GPU write also keeps the range
   // on the shared-memory path.
   bool IsRangeGpuWritten(uint32_t start, uint32_t length);
+  // Read page ownership once under the common lock. The start must be page
+  // aligned; each output byte describes one whole host page. Invalid ranges
+  // return false without changing the destination.
+  bool GetGpuWrittenPages(uint32_t start, std::span<uint8_t> pages);
+  // Retain an owner if any still-valid page is GPU-written. Unknown ranges
+  // conservatively retain it; they must never discard authoritative GPU data.
+  bool IsAnyGpuWrittenPage(uint32_t start, std::span<const uint8_t> valid_pages);
+  // Freeze retained GPU index bytes for CPU topology conversion and bounds.
+  // No physical-memory publication or compatibility mirror is involved.
+  // Exact and contained reads reuse current bytes until a CPU or GPU write
+  // invalidates them. Hot versions stay cached ahead of unused older entries.
+  std::shared_ptr<const std::vector<uint8_t>> SnapshotNativeGpuIndices(
+      uint32_t start, uint32_t length, bool& newly_downloaded);
+  uint64_t native_index_download_count() const { return native_index_download_count_; }
   // Whether the host GPU buffer has memory behind a guest physical address
   // (always with a non-sparse buffer).
   uint32_t host_gpu_memory_sparse_granularity_log2_public() const {
@@ -150,9 +166,15 @@ class SharedMemory {
   }
 
  protected:
+  virtual bool DownloadNativeGpuIndices(uint32_t /*start*/, std::span<uint8_t> /*bytes*/) {
+    return false;
+  }
   // Creates the host GPU buffer if the implementation creates it only when
   // first needed. Called before anything uses the mirror.
   virtual bool EnsureHostBuffer() { return true; }
+  // Native owners materializing data need resident mirror pages before the
+  // ordinary request can finish its validity check.
+  bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
   // Native GPU resources may hold newer bytes than the compatibility mirror.
   // Called before requesting or overwriting a mirror range.
   virtual bool FlushGpuWrittenRange(uint32_t /*start*/, uint32_t /*length*/,
@@ -225,14 +247,21 @@ class SharedMemory {
   void ReleaseTraceDownloadRanges();
 
  private:
+  struct NativeIndexSnapshot {
+    uint32_t start = 0;
+    std::shared_ptr<std::vector<uint8_t>> bytes;
+    WatchHandle watch = nullptr;
+    bool valid = false;
+  };
+  std::deque<std::unique_ptr<NativeIndexSnapshot>> native_index_snapshots_;
+  size_t native_index_snapshot_bytes_ = 0;
+  uint64_t native_index_download_count_ = 0;
   memory::Memory& memory_;
 
   // Log2 of invalidation granularity (the system page size, but the dependency
   // on it is not hard - the access callback takes a range as an argument, and
   // touched pages of the buffer of this size will be invalidated).
   uint32_t page_size_log2_;
-
-  bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
 
   // Shared tail of RequestRanges, taking ranges that are already bounds-checked,
   // merged and backed by host GPU memory. Lets a single-range request skip
@@ -266,8 +295,9 @@ class SharedMemory {
 
   // Valid-page flags. Every mutation happens under global_critical_region;
   // the all-valid fast path in RequestRanges reads them without the lock,
-  // which is why the storage is a stable allocation whose address never
-  // changes for the lifetime of the buffer.
+  // so all accesses to published words use atomic_ref. The allocation stays
+  // stable for the buffer's lifetime; a stable pointer alone would not make
+  // concurrent plain integer reads and writes safe.
   //
   // This used to be double-buffered with an active/staging pointer swap at
   // frame end so the frame-end refresh could run lock-free. That was unsound:

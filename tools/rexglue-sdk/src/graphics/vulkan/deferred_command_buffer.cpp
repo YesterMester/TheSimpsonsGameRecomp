@@ -28,6 +28,8 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/perf/counter.h>
+#include <rex/platform/performance_hint.h>
+#include <rex/thread.h>
 
 namespace rex::graphics {
 extern uint64_t g_upload_request_stats[3 + 32];
@@ -64,28 +66,159 @@ constexpr const char* kCommandStatNames[] = {
 
 DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                                              size_t initial_size)
-    : command_processor_(command_processor) {
-  command_stream_.reserve(initial_size / sizeof(uintmax_t));
+    : command_processor_(command_processor),
+      chunk_capacities_(new size_t[kMaxChunks]()),
+      chunk_ends_(new size_t[kMaxChunks]()) {
+  chunks_.reserve(kMaxChunks);
+  EnsureChunk(0, std::max(kChunkElements, initial_size / sizeof(uintmax_t)));
+}
+
+DeferredCommandBuffer::~DeferredCommandBuffer() {
+  if (worker_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lock(worker_mutex_);
+      worker_stop_ = true;
+    }
+    worker_cond_.notify_one();
+    finishing_.store(true, std::memory_order_release);
+    wake_.fetch_add(1, std::memory_order_release);
+    wake_.notify_one();
+    worker_.join();
+  }
 }
 
 void DeferredCommandBuffer::Reset() {
-  command_stream_.clear();
+  assert_false(executing_);
+  write_chunk_ = 0;
+  write_offset_ = 0;
+}
+
+void DeferredCommandBuffer::EnsureChunk(size_t index, size_t size) {
+  assert_true(index < kMaxChunks);
+  if (index < chunks_.size() && chunk_capacities_[index] >= size) {
+    return;
+  }
+  size_t capacity = std::max(kChunkElements, size);
+  std::unique_ptr<uintmax_t[]> chunk(new uintmax_t[capacity]);
+  if (index < chunks_.size()) {
+    chunks_[index] = std::move(chunk);
+  } else {
+    chunks_.push_back(std::move(chunk));
+  }
+  chunk_capacities_[index] = capacity;
 }
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  assert_false(executing_);
+  for (size_t i = 0; i <= write_chunk_; ++i) {
+    const uintmax_t* chunk = chunks_[i].get();
+    ExecuteRange(command_buffer, chunk, chunk + (i < write_chunk_ ? chunk_ends_[i] : write_offset_));
+  }
+  ReportCommandStats();
+}
 
+void DeferredCommandBuffer::BeginExecution(VkCommandBuffer command_buffer) {
+  assert_false(executing_);
+  executing_ = true;
+  execution_command_buffer_ = command_buffer;
+  commands_since_wake_ = 0;
+  finishing_.store(false, std::memory_order_relaxed);
+  finished_.store(false, std::memory_order_relaxed);
+  // Everything written before is the caller's to record.
+  uint64_t start = (uint64_t(write_chunk_) << 32) | write_offset_;
+  written_.store(start, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(worker_mutex_);
+    // Not written_, which may be past it by the time the worker reads it.
+    execution_start_ = start;
+    worker_job_ = true;
+    if (!worker_.joinable()) {
+      worker_ = std::thread([this] { WorkerMain(); });
+    }
+  }
+  worker_cond_.notify_one();
+}
+
+void DeferredCommandBuffer::FinishExecution() {
+  if (!executing_) {
+    return;
+  }
+  PublishWritten();
+  finishing_.store(true, std::memory_order_release);
+  wake_.fetch_add(1, std::memory_order_release);
+  wake_.notify_one();
+  while (!finished_.load(std::memory_order_acquire)) {
+    finished_.wait(false, std::memory_order_acquire);
+  }
+  executing_ = false;
+  execution_command_buffer_ = VK_NULL_HANDLE;
+}
+
+void DeferredCommandBuffer::PublishWritten() {
+  written_.store((uint64_t(write_chunk_) << 32) | write_offset_, std::memory_order_release);
+}
+
+void DeferredCommandBuffer::WorkerMain() {
+  rex::thread::set_current_thread_name("GPU Recording");
+  // Submissions wait for this thread's recording.
+  rex::platform::AddPerformanceHintThread();
+  for (;;) {
+    VkCommandBuffer command_buffer;
+    uint64_t position;
+    {
+      std::unique_lock<std::mutex> lock(worker_mutex_);
+      worker_cond_.wait(lock, [this] { return worker_job_ || worker_stop_; });
+      if (worker_stop_) {
+        return;
+      }
+      worker_job_ = false;
+      command_buffer = execution_command_buffer_;
+      position = execution_start_;
+    }
+    size_t chunk = size_t(position >> 32);
+    size_t offset = size_t(uint32_t(position));
+    for (;;) {
+      // Read the wake counter before checking for work, so a wake after the
+      // check isn't missed.
+      uint32_t wake = wake_.load(std::memory_order_acquire);
+      bool finishing = finishing_.load(std::memory_order_acquire);
+      uint64_t written = written_.load(std::memory_order_acquire);
+      size_t written_chunk = size_t(written >> 32);
+      size_t written_offset = size_t(uint32_t(written));
+      while (chunk < written_chunk || offset < written_offset) {
+        size_t end = chunk < written_chunk ? chunk_ends_[chunk] : written_offset;
+        const uintmax_t* data = chunks_[chunk].get();
+        ExecuteRange(command_buffer, data + offset, data + end);
+        if (chunk < written_chunk) {
+          ++chunk;
+          offset = 0;
+        } else {
+          offset = end;
+        }
+      }
+      if (finishing) {
+        // finishing_ is set after the last position is published.
+        ReportCommandStats();
+        finished_.store(true, std::memory_order_release);
+        finished_.notify_one();
+        break;
+      }
+      wake_.wait(wake, std::memory_order_acquire);
+    }
+  }
+}
+
+void DeferredCommandBuffer::ExecuteRange(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                                         const uintmax_t* stream_end) {
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_.size();
   CommandStats& command_stats = GetCommandStats();
-  while (stream_remaining) {
+  while (stream < stream_end) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
-    stream_remaining -= kCommandHeaderSizeElements;
     if (command_stats.enabled) {
       ++command_stats.counts[uint32_t(header.command) & 63];
     }
@@ -405,8 +538,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
     }
 
     stream += header.arguments_size_elements;
-    stream_remaining -= header.arguments_size_elements;
   }
+}
+
+void DeferredCommandBuffer::ReportCommandStats() {
+  CommandStats& command_stats = GetCommandStats();
   static const uint64_t stats_every = [] {
     const char* every = std::getenv("REX_CMD_STATS_EVERY");
     return every ? std::max(uint64_t(1), uint64_t(std::strtoull(every, nullptr, 10))) : uint64_t(20);
@@ -555,12 +691,31 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
-  size_t offset = command_stream_.size();
-  command_stream_.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
-  CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
+  size_t size = kCommandHeaderSizeElements + arguments_size_elements;
+  if (write_offset_ + size > chunk_capacities_[write_chunk_]) {
+    chunk_ends_[write_chunk_] = write_offset_;
+    EnsureChunk(write_chunk_ + 1, size);
+    ++write_chunk_;
+    write_offset_ = 0;
+  }
+  if (executing_) {
+    // The caller has filled the previous command's arguments by now.
+    PublishWritten();
+    // Wake the worker in batches rather than for every command.
+    if (++commands_since_wake_ >= 32) {
+      commands_since_wake_ = 0;
+      wake_.fetch_add(1, std::memory_order_release);
+      wake_.notify_one();
+    }
+  }
+  uintmax_t* data = chunks_[write_chunk_].get() + write_offset_;
+  // Arguments start zeroed, as callers may leave padding unwritten.
+  std::memset(data, 0, size * sizeof(uintmax_t));
+  CommandHeader& header = *reinterpret_cast<CommandHeader*>(data);
   header.command = command;
   header.arguments_size_elements = uint32_t(arguments_size_elements);
-  return command_stream_.data() + (offset + kCommandHeaderSizeElements);
+  write_offset_ += size;
+  return data + kCommandHeaderSizeElements;
 }
 
 }  // namespace rex::graphics::vulkan

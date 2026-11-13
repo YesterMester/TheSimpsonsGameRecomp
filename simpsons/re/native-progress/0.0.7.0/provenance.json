@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "recorded_e52_date": "2026-11-04",
+  "e52_application_sha256": "8d6857ea21a55c645e24f851b567e97b7d65f145f3b8145b19d376c8b80dbcea",
+  "e52_runtime_sha256": "51bf5d456e52934b14e056a9cc191889f9a55268020b47c0972d356de4b5a61d",
+  "historical_fixture_run": "native-direct-ring-20261101/backends-final",
+  "inputs": [
+    {
+      "file": "vulkan-title-e52.json",
+      "sha256": "58a7763f6c0b5d115cfb43a02216fa9d31b9111d664ed8e4f2116234b95d10ad",
+      "backend": "vulkan",
+      "frames": 1079,
+      "scope": "E52 startup/title, 1x, experimental native_gpu_calls=true"
+    },
+    {
+      "file": "gpu-native.json",
+      "sha256": "0ea5d74952aab1fb4e691cf6998539e0e3494206fccc964d4cdc80bea218ed24",
+      "backend": "vulkan",
+      "frames": 200,
+      "scope": "Historical generated geometry fixture, 200 frames, Steam Deck; Windows APIs through Proton"
+    },
+    {
+      "file": "gpu-dx11.json",
+      "sha256": "9d4ed1a893586c2052d2117186dffcd71f94940d6b3ead447e1e2ab79749d78c",
+      "backend": "d3d11",
+      "frames": 200,
+      "scope": "Historical generated geometry fixture, 200 frames, Steam Deck; Windows APIs through Proton"
+    },
+    {
+      "file": "gpu-dx12.json",
+      "sha256": "301ec714759f42acec0d4e9510e5045894f2fd8f94c3f6e5089b20f87ed4b6c8",
+      "backend": "d3d12",
+      "frames": 200,
+      "scope": "Historical generated geometry fixture, 200 frames, Steam Deck; Windows APIs through Proton"
+    }
+  ],
+  "current_build_qualified": false,
+  "full_game_native_proven": false,
+  "fixture_selection": "One 200-frame mode per renderer; alternate modes with identical counter payloads are omitted."
+}

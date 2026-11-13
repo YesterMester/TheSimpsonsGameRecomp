@@ -185,6 +185,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   const std::filesystem::path& user_data_root() const { return user_data_root_; }
   const std::filesystem::path& update_data_root() const { return update_data_root_; }
   const std::filesystem::path& cache_root() const { return cache_root_; }
+  const std::filesystem::path& config_path() const { return config_path_; }
 
   /// Set a callback that provides guest frame stats to the debug overlay.
   void SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider);
@@ -216,6 +217,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::Window> window_;
   std::thread module_thread_;
   std::atomic<bool> shutting_down_{false};
+  std::shared_ptr<std::atomic<bool>> shutdown_complete_ =
+      std::make_shared<std::atomic<bool>>(false);
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
 

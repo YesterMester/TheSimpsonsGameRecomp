@@ -16,12 +16,15 @@
 
 namespace rex::graphics::d3d11 {
 
-void BuildGuestSystemConstants(
-    DxbcShaderTranslator::SystemConstants& system_constants, const RegisterFile& regs,
-    TextureCache& textures, bool gamma_as_unorm16, bool shared_memory_is_uav,
-    bool primitive_polygonal, uint32_t line_loop_closing_index, xenos::Endian index_endian,
-    const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
-    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask) {
+void BuildGuestSystemConstants(DxbcShaderTranslator::SystemConstants& system_constants,
+                               const RegisterFile& regs, TextureCache& textures,
+                               bool gamma_as_unorm16, bool shared_memory_is_uav,
+                               bool primitive_polygonal, uint32_t line_loop_closing_index,
+                               xenos::Endian index_endian,
+                               const draw_util::ViewportInfo& viewport_info,
+                               uint32_t used_texture_mask,
+                               reg::RB_DEPTHCONTROL normalized_depth_control,
+                               uint32_t normalized_color_mask, bool original_resolution) {
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
   auto rb_alpha_ref = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
@@ -33,8 +36,8 @@ void BuildGuestSystemConstants(
   uint32_t vgt_max_vtx_indx = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
   uint32_t vgt_min_vtx_indx = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
 
-  uint32_t draw_resolution_scale_x = textures.draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = textures.draw_resolution_scale_y();
+  uint32_t draw_resolution_scale_x = original_resolution ? 1u : textures.draw_resolution_scale_x();
+  uint32_t draw_resolution_scale_y = original_resolution ? 1u : textures.draw_resolution_scale_y();
 
   // Get the color info register values for each render target. Also, for ROV,
   // exclude components that don't exist in the format from the write mask.

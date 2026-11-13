@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <mutex>
 #include <utility>
 
 #include <rex/chrono/clock.h>
@@ -20,6 +21,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/presenter.h>
+#include <rex/ui/guest_output_viewport.h>
 #include <rex/ui/window.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -30,6 +32,16 @@
 #if REX_PLATFORM_WIN32
 #include <rex/ui/window_win.h>
 #endif
+
+namespace {
+std::mutex guest_viewport_mutex;
+rex::ui::GuestOutputViewport guest_viewport;
+}
+
+rex::ui::GuestOutputViewport rex::ui::GetGuestOutputViewport() {
+  std::lock_guard lock(guest_viewport_mutex);
+  return guest_viewport;
+}
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
@@ -726,6 +738,10 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
   }
 }
 
+void Presenter::ApplyGuestOutputSettingsFromUIThread() {
+  SetGuestOutputPaintConfigFromUIThread(BuildGuestOutputPaintConfigFromCVar());
+}
+
 void Presenter::AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order) {
   assert_not_null(drawer);
   // Obtain whether the iterator list was empty before erasing in case of
@@ -984,6 +1000,14 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     // output_width might have been rounded up already by rescale_unsigned, so
     // rounding down in this division.
     flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
+  }
+
+  {
+    std::lock_guard lock(guest_viewport_mutex);
+    guest_viewport = {float(flow.output_x) / float(surface_width_in_paint_connection_),
+                      float(flow.output_y) / float(surface_height_in_paint_connection_),
+                      float(output_width) / float(surface_width_in_paint_connection_),
+                      float(output_height) / float(surface_height_in_paint_connection_)};
   }
 
   // Convert the location from surface pixels (which have 1:1 aspect ratio
@@ -1392,7 +1416,7 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
           surface_width_in_paint_connection_ = surface_width;
           surface_height_in_paint_connection_ = surface_height;
-          if (!is_reconnect) {
+          if (!is_reconnect && repaint_needed_out) {
             *repaint_needed_out = true;
           }
           break;

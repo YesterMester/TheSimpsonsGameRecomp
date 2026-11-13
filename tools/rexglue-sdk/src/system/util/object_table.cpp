@@ -394,6 +394,34 @@ bool ObjectTable::Restore(stream::ByteStream* stream) {
   return true;
 }
 
+X_STATUS ObjectTable::RestoreHandle(X_HANDLE handle, XObject* object, int ref_count) {
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t slot = GetHandleSlot(handle);
+  if (table_capacity_ <= slot) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  auto& entry = table_[slot];
+  if (entry.object && entry.object != object) {
+    return X_STATUS_OBJECT_NAME_COLLISION;
+  }
+  if (!entry.object) {
+    object->Retain();
+  }
+  entry.object = object;
+  entry.handle_ref_count = ref_count;
+  if (std::find(object->handles().begin(), object->handles().end(), handle) ==
+      object->handles().end()) {
+    object->handles().push_back(handle);
+  }
+  return X_STATUS_SUCCESS;
+}
+
+int ObjectTable::HandleRefCount(X_HANDLE handle) {
+  auto global_lock = global_critical_region_.Acquire();
+  ObjectTableEntry* entry = LookupTable(handle);
+  return entry && entry->object ? entry->handle_ref_count : 0;
+}
+
 X_STATUS ObjectTable::RestoreHandle(X_HANDLE handle, XObject* object) {
   uint32_t slot = GetHandleSlot(handle);
   assert_true(table_capacity_ > slot);

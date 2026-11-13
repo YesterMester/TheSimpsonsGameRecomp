@@ -1,0 +1,41 @@
+{
+  "id": "examples.scene-editor",
+  "name": "Scene editor",
+  "author": "",
+  "description": "Place, transform, duplicate and save original native props through the game's own menus.",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "state",
+  "requires_operations": [
+    "scenes.document",
+    "scenes.validate",
+    "scenes.save",
+    "world.tagged",
+    "world.catalog",
+    "world.owned",
+    "world.spawn",
+    "world.destroy",
+    "entities.transform",
+    "entities.set_transform",
+    "assets.source_streams",
+    "assets.load_source",
+    "assets.cancel_source",
+    "assets.release_source",
+    "assets.source_status",
+    "system.try_call",
+    "ui.register_page",
+    "storage.read",
+    "storage.status",
+    "players.controlled",
+    "world.status"
+  ],
+  "scene": {
+    "schema": 1,
+    "name": "My scene",
+    "level_root": "",
+    "autoload": false,
+    "objects": []
+  }
+}

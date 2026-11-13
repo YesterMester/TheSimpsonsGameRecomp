@@ -1,4 +1,5 @@
 #include <rex/graphics/d3d11/buffer_cache.h>
+#include <rex/graphics/util/bytes_equal.h>
 #include <rex/graphics/d3d11/scaled_resolve_memory.h>
 
 #include <array>
@@ -164,7 +165,94 @@ uint64_t CheckScaledStorage(D3D11Device& device) {
   return compared_words;
 }
 
-uint64_t Run(D3D11Device& owner, BufferCache::Statistics& statistics) {
+uint64_t CheckCpuRangeUploads(D3D11Device& owner) {
+  uint64_t checks = 0;
+  auto check = [&](bool result, const char* message) {
+    Require(result, message);
+    ++checks;
+  };
+  BufferCache cache(owner, 256);
+  std::string error;
+  std::array<uint32_t, 16> source_a = {}, source_b, source_c;
+  source_b.fill(0xAA09B137);
+  source_c.fill(0x61BC0783);
+  BufferCache::CpuRange range{Bytes(source_a).data(), 0, uint32_t(Bytes(source_a).size())};
+  const std::array split = {BufferCache::CpuRange{range.data, 0, 16},
+                            BufferCache::CpuRange{range.data + 16, 16, 48}};
+  auto a = cache.GetOrCreate(split, 64, BufferKind::kRaw, error);
+  check(a && Acquire(cache, source_a, BufferKind::kRaw) == a,
+        "Multipart and contiguous input did not share their content cache");
+  auto b = Acquire(cache, source_b, BufferKind::kRaw);
+  std::weak_ptr<const BufferVersion> weak_a = a, weak_b = b;
+  a.reset();
+  b.reset();
+  uint64_t creations = cache.statistics().creations;
+  check(bool(cache.GetOrCreate(split, 64, BufferKind::kRaw, error)),
+        "Unchanged multipart input was not reused");
+  check(cache.statistics().creations == creations, "Range reuse allocated a GPU buffer");
+  auto c = Acquire(cache, source_c, BufferKind::kRaw);
+  check(!weak_a.expired() && weak_b.expired(), "Range reuse did not update the content LRU");
+  auto held = weak_a.lock();
+  source_a.back() ^= 0x840271A3;
+  auto changed = cache.GetOrCreate(split, 64, BufferKind::kRaw, error);
+  check(changed && changed != held && held->cpu_bytes().back() == 0,
+        "A changed range reused or modified old GPU data");
+  source_a.back() ^= 0x840271A3;
+  auto restored = cache.GetOrCreate(split, 64, BufferKind::kRaw, error);
+  check(restored && rex::graphics::draw_util::BytesEqual(restored->cpu_bytes().data(),
+                                                         held->cpu_bytes().data(), 64),
+        "Restored CPU bytes lost their original contents");
+  BufferCache::CpuRange invalid{nullptr, 0, 64};
+  check(!cache.GetOrCreate({&invalid, 1}, 64, BufferKind::kRaw, error), "A null range was read");
+  invalid = {range.data, 60, 8};
+  check(!cache.GetOrCreate({&invalid, 1}, 64, BufferKind::kRaw, error),
+        "An out-of-range span was read");
+  const std::array overlapping{range, range};
+  check(!cache.GetOrCreate(overlapping, 128, BufferKind::kRaw, error),
+        "Overlapping CPU spans were accepted");
+  BufferCache tiny(owner, 64);
+  auto pinned = tiny.GetOrCreate(split, 64, BufferKind::kRaw, error);
+  check(pinned && tiny.statistics().retained_bytes <= 64,
+        "A range upload exceeded the cache budget");
+  std::weak_ptr<const BufferVersion> expired = pinned;
+  pinned.reset();
+  check(expired.expired(), "An evicted range upload kept its GPU storage alive");
+  std::array<uint32_t, 32> padded = {};
+  std::copy(source_a.begin(), source_a.end(), padded.begin() + 4);
+  BufferCache::CpuRange inset{range.data, 16, 64};
+  auto padding_version = Acquire(cache, padded, BufferKind::kRaw);
+  check(cache.GetOrCreate({&inset, 1}, 128, BufferKind::kRaw, error) == padding_version,
+        "Zero padding prevented valid content reuse");
+  cache.Clear();
+  padded.front() = 0x8109A431;
+  auto invalid_padding = Acquire(cache, padded, BufferKind::kRaw);
+  auto correct_padding = cache.GetOrCreate({&inset, 1}, 128, BufferKind::kRaw, error);
+  check(
+      correct_padding && correct_padding != invalid_padding && correct_padding->cpu_bytes()[0] == 0,
+      "Nonzero padding was ignored by a range upload");
+  std::array<uint32_t, 32> zero = {};
+  check(cache.GetOrCreate(std::span<const BufferCache::CpuRange>{}, 128, BufferKind::kRaw, error) ==
+            Acquire(cache, zero, BufferKind::kRaw),
+        "An empty stream did not produce zero padding");
+  // Cover both short and long XXH3 paths, arbitrary partitions, and allocation
+  // padding. The existing contiguous path must find exactly the same version.
+  for (uint32_t size : {1u, 17u, 31u, 32u, 63u, 64u, 65u, 127u, 128u, 129u, 239u, 240u, 241u, 511u,
+                        512u, 513u, 4096u}) {
+    std::vector<uint8_t> bytes(size);
+    for (uint32_t i = 0; i < size; ++i)
+      bytes[i] = uint8_t(i * 37 + size);
+    uint32_t prefix = size / 3;
+    std::fill_n(bytes.begin(), prefix, 0);
+    BufferCache exact(owner);
+    auto contiguous = exact.GetOrCreate(bytes, BufferKind::kRaw, error);
+    BufferCache::CpuRange part{bytes.data() + prefix, prefix, size - prefix};
+    check(contiguous && exact.GetOrCreate({&part, 1}, size, BufferKind::kRaw, error) == contiguous,
+          "Multipart hashing differed from the contiguous content cache");
+  }
+  return checks;
+}
+
+uint64_t Run(D3D11Device& owner, BufferCache::Statistics& statistics, uint64_t& range_checks) {
   constexpr uint32_t count = 129, mutations = 64, retained_checks = 16;
   constexpr uint32_t total = count * (mutations + retained_checks) * 2;
   BufferCache cache(owner, 2048);
@@ -216,6 +304,28 @@ uint64_t Run(D3D11Device& owner, BufferCache::Statistics& statistics) {
     auto version = Acquire(cache, source, kinds[iteration % kinds.size()]);
     Require(Acquire(cache, source, version->kind()) == version,
             "Unchanged native bytes did not reuse their buffer");
+    const auto bytes = Bytes(source);
+    const std::array ranges = {
+        BufferCache::CpuRange{bytes.data(), 0, 64},
+        BufferCache::CpuRange{bytes.data() + 64, 64, uint32_t(bytes.size() - 64)}};
+    uint64_t creations = cache.statistics().creations;
+    std::string range_error;
+    auto reused = cache.GetOrCreate(ranges, uint32_t(bytes.size()), version->kind(), range_error);
+    Require(reused == version && cache.statistics().creations == creations,
+            "Unchanged CPU streams allocated a new native buffer");
+    source.back() ^= 0x840271A3;
+    auto changed = cache.GetOrCreate(ranges, uint32_t(bytes.size()), version->kind(), range_error);
+    Require(
+        changed && changed != version &&
+            rex::graphics::draw_util::BytesEqual(version->cpu_bytes().data(), Bytes(source).data(),
+                                                 bytes.size() - sizeof(uint32_t)),
+        "A CPU stream mutation reused old data or modified the retained snapshot");
+    source.back() ^= 0x840271A3;
+    Require(rex::graphics::draw_util::BytesEqual(version->cpu_bytes().data(), Bytes(source).data(),
+                                                 bytes.size()),
+            "A CPU stream upload changed an immutable snapshot");
+    range_checks += 3;
+    version = std::move(reused);
     snapshots.push_back({version, source});
     dispatch(snapshots.back());
   }
@@ -304,7 +414,8 @@ int main(int argc, char** argv) {
     if (!owner)
       throw std::runtime_error(error);
     BufferCache::Statistics statistics;
-    uint64_t words = Run(*owner, statistics);
+    uint64_t range_checks = CheckCpuRangeUploads(*owner);
+    uint64_t words = Run(*owner, statistics, range_checks);
     uint64_t scaled_words = CheckScaledStorage(*owner);
     std::string report =
         "{\n  \"passed\": true,\n  \"scope\": \"immutable native buffer versions\",\n";
@@ -313,6 +424,7 @@ int main(int argc, char** argv) {
         "  \"software\": " + std::string(owner->features().software ? "true" : "false") + ",\n";
     report += "  \"exact_words\": " + std::to_string(words) + ",\n";
     report += "  \"scaled_preservation_words\": " + std::to_string(scaled_words) + ",\n";
+    report += "  \"cpu_range_checks\": " + std::to_string(range_checks) + ",\n";
     report += "  \"source_mutations\": 64,\n  \"retained_versions_revisited\": 16,\n";
     report += "  \"gpu_source_mutations\": 64,\n  \"gpu_versions_revisited\": 16,\n";
     report += "  \"cache_hits\": " + std::to_string(statistics.hits) + ",\n";

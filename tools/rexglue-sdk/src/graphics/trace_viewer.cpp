@@ -357,6 +357,14 @@ void TraceViewer::DrawPacketDisassemblerUI() {
                   ImGui::Text("%.16" PRIX64, action.set_bin_select.value);
                   break;
                 }
+                case PacketAction::Type::kSetBinMaskLow:
+                case PacketAction::Type::kSetBinSelectLow:
+                  ImGui::Text("Low: %.8" PRIX32, uint32_t(action.set_bin_mask.value));
+                  break;
+                case PacketAction::Type::kSetBinMaskHigh:
+                case PacketAction::Type::kSetBinSelectHigh:
+                  ImGui::Text("High: %.8" PRIX32, uint32_t(action.set_bin_mask.value));
+                  break;
               }
             }
             ImGui::TreePop();

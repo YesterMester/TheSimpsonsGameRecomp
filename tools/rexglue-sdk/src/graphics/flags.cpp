@@ -16,6 +16,10 @@
 
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
+REXCVAR_DEFINE_INT32(native_resolve_buffer_mb, 128, "GPU",
+                     "Target MiB of native resource buffers, times the resolution scale's pixel "
+                     "count; live GPU data is retained above this cache target")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // This game leaves the vertex fetch constants of absent optional streams
 // (blend-shape deltas on morphless meshes, slots 89-94) permanently all-zero
 // with the "invalid" type. Vetoing on them threw away entire otherwise-valid
@@ -59,8 +63,7 @@ REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Path to dump shaders to");
 REXCVAR_DEFINE_STRING(gpu, "", "GPU",
                       "Graphics backend to use: \"vulkan\", \"d3d12\", the experimental "
                       "\"d3d11\" (Windows builds with it), or empty for the platform default "
-                      "(Vulkan preferred where both are built, with D3D12 as the automatic "
-                      "fallback).");
+                      "(Vulkan preferred, followed by D3D12 and then D3D11 where built).");
 REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
                     "Use approximate compare for alpha test values to prevent "
                     "flickering on NVIDIA graphics cards");

@@ -292,6 +292,7 @@ void PrimitiveProcessor::ClearPerFrameCache() {
   }
   std::lock_guard<std::mutex> cache_lock(cache_mutex_);
   for (const std::pair<CacheKey, size_t>& cache_map_entry : cache_map_) {
+    cache_entry_pool_[cache_map_entry.second].result.native_index_shadow.reset();
     cache_entry_pool_[cache_map_entry.second].free_next = cache_bucket_free_first_entry_;
     cache_bucket_free_first_entry_ = cache_map_entry.second;
   }
@@ -301,9 +302,11 @@ void PrimitiveProcessor::ClearPerFrameCache() {
 }
 
 bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_indices,
-                                 bool triangle_patches) {
+                                 bool triangle_patches, bool native_shader_indices) {
   SCOPE_profile_cpu_f("gpu");
   result_out.native_index_snapshot = nullptr;
+  result_out.shader_index_buffer_deferred = false;
+  result_out.native_index_from_gpu = false;
   result_out.triangle_patches = false;
 
   const RegisterFile& regs = register_file_;
@@ -467,10 +470,105 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
   }
   uint32_t line_loop_closing_index = 0;
   uint32_t guest_index_base = 0, guest_index_buffer_needed_bytes = 0;
+  const uint8_t* gpu_indices = nullptr;
+  uint32_t gpu_index_address = 0;
+  std::pair<uint32_t, uint32_t> checked_index_range = {};
+  bool checked_index_gpu_written = false;
+  auto index_range_gpu_written = [&](uint32_t address, uint32_t length) {
+    // GPU writers are serialized on this thread. Reuse the ownership query
+    // within this draw rather than taking the global lock twice for CPU DMA.
+    if (checked_index_range != std::pair{address, length}) {
+      checked_index_range = {address, length};
+      checked_index_gpu_written = shared_memory_.IsRangeGpuWritten(address, length);
+    }
+    return checked_index_gpu_written;
+  };
+  if ((native_dma_indices || native_shader_indices) && guest_draw_vertex_count &&
+      vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+    const uint32_t stride = vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16 ? 2 : 4;
+    const uint32_t address = regs[XE_GPU_REG_VGT_DMA_BASE] & ~(stride - 1);
+    const uint32_t length = guest_draw_vertex_count * stride;
+    const uint32_t first = address & ~3u;
+    const uint32_t size = (length + (address & 3u) + 3u) & ~3u;
+    if (address < SharedMemory::kBufferSize && length <= SharedMemory::kBufferSize - address &&
+        index_range_gpu_written(address, length)) {
+      bool downloaded = false;
+      auto snapshot = shared_memory_.SnapshotNativeGpuIndices(first, size, downloaded);
+      if (snapshot) {
+        // Preserve the original address's SIMD alignment and a safe tail for
+        // conversion routines that process a whole vector at a time.
+        native_gpu_index_snapshot_.assign(size + 2 * XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE, 0);
+        const size_t offset = GetSimdCoalignmentOffset(native_gpu_index_snapshot_.data(), first);
+        std::memcpy(native_gpu_index_snapshot_.data() + offset, snapshot->data(), size);
+        gpu_indices = native_gpu_index_snapshot_.data() + offset;
+        gpu_index_address = first;
+        result_out.native_index_from_gpu = true;
+      } else {
+        // An unretained writer still needs the compatibility path. Never
+        // advertise stale physical bytes as a proven native index shadow.
+        native_dma_indices = false;
+      }
+      if (downloaded || !snapshot)
+        MemoryInvalidationCallback(address, length, true);
+    }
+  }
+  auto index_source = [&](uint32_t address) -> const void* {
+    return gpu_indices ? gpu_indices + (address - gpu_index_address)
+                       : memory_.TranslatePhysical<const void*>(address);
+  };
   CachedResult cacheable;
   cacheable.host_draw_vertex_count = guest_draw_vertex_count;
   cacheable.host_primitive_reset_enabled = false;
   cacheable.host_index_buffer_handle = SIZE_MAX;
+  // Convert into a normal CPU shadow first. Reading a write-combined upload
+  // mapping for the native bounds proof is expensive, and cached conversions
+  // need to keep the exact indices that their retained GPU buffer contains.
+  struct PendingIndexUpload {
+    void* gpu = nullptr;
+    const void* cpu = nullptr;
+    size_t bytes = 0;
+    std::shared_ptr<std::vector<uint8_t>> shadow;
+    void Flush() {
+      if (gpu) {
+        std::memcpy(gpu, cpu, bytes);
+        gpu = nullptr;
+        shadow.reset();
+      }
+    }
+    ~PendingIndexUpload() { Flush(); }
+  } pending;
+  auto request_converted_indices = [&](xenos::IndexFormat format, uint32_t count, bool coalign,
+                                       uint32_t original, size_t& handle) -> void* {
+    pending.Flush();
+    void* mapping =
+        RequestHostConvertedIndexBufferForCurrentFrame(format, count, coalign, original, handle);
+    if (!mapping || !native_dma_indices)
+      return mapping;
+    size_t bytes = size_t(count) * (format == xenos::IndexFormat::kInt16 ? 2u : 4u);
+    int32_t cache_min = REXCVAR_GET(primitive_processor_cache_min_indices);
+    bool cached = cache_min >= 0 && guest_draw_vertex_count >= uint32_t(cache_min);
+    std::vector<uint8_t>* storage;
+    if (cached) {
+      cacheable.native_index_shadow =
+          std::make_shared<std::vector<uint8_t>>(bytes + XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE);
+      storage = cacheable.native_index_shadow.get();
+    } else {
+      // The default cache policy is off. Reuse the current draw's CPU storage
+      // instead of allocating another vector for every converted stream.
+      native_index_snapshot_.resize(bytes + XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE);
+      storage = &native_index_snapshot_;
+    }
+    cacheable.native_index_shadow_offset =
+        coalign ? uint32_t(GetSimdCoalignmentOffset(storage->data(), original)) : 0;
+    void* shadow = storage->data() + cacheable.native_index_shadow_offset;
+    if (!cached)
+      result_out.native_index_snapshot = shadow;
+    pending.gpu = mapping;
+    pending.cpu = shadow;
+    pending.bytes = bytes;
+    pending.shadow = cacheable.native_index_shadow;
+    return shadow;
+  };
   if (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
       host_vertex_shader_type == Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
     // As two-triangle strips, with guest indices being either autogenerated or
@@ -677,7 +775,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
             ? UINT16_MAX
             : GpuSwap(xenos::kVertexIndexMask, guest_index_endian);
     if (triangle_strip_patches &&
-        shared_memory_.IsRangeGpuWritten(guest_index_base, guest_index_buffer_needed_bytes)) {
+        !gpu_indices &&
+        index_range_gpu_written(guest_index_base, guest_index_buffer_needed_bytes)) {
       // The CPU copy of the indices may be stale - draw the strip as it is.
       triangle_strip_patches = false;
     }
@@ -685,8 +784,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
       // Not cached: the converted copy is also the CPU snapshot the native
       // vertex path scans for the vertex range, and these strips are small.
       host_primitive_type = xenos::PrimitiveType::kTriangleList;
-      trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes);
-      const void* guest_indices_ptr = memory_.TranslatePhysical(guest_index_base);
+      trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes,
+                                    index_source(guest_index_base));
+      const void* guest_indices_ptr = index_source(guest_index_base);
       single_primitive_ranges_.clear();
       uint32_t host_index_count;
       size_t host_index_size;
@@ -749,14 +849,15 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
       // for the shared memory buffer.
       // Writing to the trace irrespective of the cache lookup result because
       // cache behavior depends on runtime configuration and state.
-      trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes);
+      trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes,
+                                    index_source(guest_index_base));
       CacheTransaction cache_transaction(
           *this, CacheKey(guest_index_base, guest_draw_vertex_count, guest_index_format,
                           guest_index_endian, guest_primitive_reset_enabled, guest_primitive_type));
       if (cache_transaction.GetFoundResult()) {
         cacheable = *cache_transaction.GetFoundResult();
       } else {
-        const void* guest_indices_ptr = memory_.TranslatePhysical(guest_index_base);
+        const void* guest_indices_ptr = index_source(guest_index_base);
         cacheable.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
         cacheable.host_primitive_reset_enabled = false;
         std::function<uint32_t(uint32_t)> host_index_count_getter;
@@ -795,10 +896,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
             single_primitive_ranges_.emplace_back(0, guest_draw_vertex_count,
                                                   cacheable.host_draw_vertex_count);
           }
-          auto host_indices =
-              reinterpret_cast<uint16_t*>(RequestHostConvertedIndexBufferForCurrentFrame(
-                  xenos::IndexFormat::kInt16, cacheable.host_draw_vertex_count, false,
-                  guest_index_base, cacheable.host_index_buffer_handle));
+          auto host_indices = reinterpret_cast<uint16_t*>(request_converted_indices(
+              xenos::IndexFormat::kInt16, cacheable.host_draw_vertex_count, false, guest_index_base,
+              cacheable.host_index_buffer_handle));
           if (!host_indices) {
             return false;
           }
@@ -823,10 +923,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
             single_primitive_ranges_.emplace_back(0, guest_draw_vertex_count,
                                                   cacheable.host_draw_vertex_count);
           }
-          auto host_indices =
-              reinterpret_cast<uint32_t*>(RequestHostConvertedIndexBufferForCurrentFrame(
-                  xenos::IndexFormat::kInt32, cacheable.host_draw_vertex_count, false,
-                  guest_index_base, cacheable.host_index_buffer_handle));
+          auto host_indices = reinterpret_cast<uint32_t*>(request_converted_indices(
+              xenos::IndexFormat::kInt32, cacheable.host_draw_vertex_count, false, guest_index_base,
+              cacheable.host_index_buffer_handle));
           if (!host_indices) {
             return false;
           }
@@ -892,7 +991,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
             // because cache behavior depends on runtime configuration and
             // state.
             // Example of 16-bit reset index replacement: 415607D4.
-            trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes);
+            trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes,
+                                    index_source(guest_index_base));
             // Not specifying the primitive type in the cache key because not
             // replacing it, only the reset index in a type-independent way.
             CacheTransaction cache_transaction(
@@ -901,7 +1001,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
             if (cache_transaction.GetFoundResult()) {
               cacheable = *cache_transaction.GetFoundResult();
             } else {
-              auto guest_indices = memory_.TranslatePhysical<const uint16_t*>(guest_index_base);
+              auto guest_indices = static_cast<const uint16_t*>(index_source(guest_index_base));
               bool is_reset_index_used, is_ffff_used_as_vertex_index;
               Get16BitResetIndexUsage(guest_indices, guest_draw_vertex_count,
                                       guest_primitive_reset_index_guest_endian, is_reset_index_used,
@@ -911,7 +1011,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
                 cacheable.host_index_format = is_ffff_used_as_vertex_index
                                                   ? xenos::IndexFormat::kInt32
                                                   : xenos::IndexFormat::kInt16;
-                void* host_indices_ptr = RequestHostConvertedIndexBufferForCurrentFrame(
+                void* host_indices_ptr = request_converted_indices(
                     cacheable.host_index_format, guest_draw_vertex_count, true, guest_index_base,
                     cacheable.host_index_buffer_handle);
                 if (!host_indices_ptr) {
@@ -941,7 +1041,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
           // pre-swapping and pre-masking is done here.
           // Writing to the trace irrespective of the cache lookup result
           // because cache behavior depends on runtime configuration and state.
-          trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes);
+          trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes,
+                                    index_source(guest_index_base));
           // Not specifying the primitive type in the cache key because not
           // replacing it, only the reset index in a type-independent way.
           CacheTransaction cache_transaction(
@@ -950,15 +1051,14 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
           if (cache_transaction.GetFoundResult()) {
             cacheable = *cache_transaction.GetFoundResult();
           } else {
-            auto guest_indices = memory_.TranslatePhysical<const uint32_t*>(guest_index_base);
+            auto guest_indices = static_cast<const uint32_t*>(index_source(guest_index_base));
             if (IsResetUsed(guest_indices, guest_draw_vertex_count,
                             guest_primitive_reset_index_guest_endian,
                             guest_index_mask_guest_endian)) {
               cacheable.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
-              auto host_indices =
-                  reinterpret_cast<uint32_t*>(RequestHostConvertedIndexBufferForCurrentFrame(
-                      xenos::IndexFormat::kInt32, guest_draw_vertex_count, true, guest_index_base,
-                      cacheable.host_index_buffer_handle));
+              auto host_indices = reinterpret_cast<uint32_t*>(request_converted_indices(
+                  xenos::IndexFormat::kInt32, guest_draw_vertex_count, true, guest_index_base,
+                  cacheable.host_index_buffer_handle));
               if (!host_indices) {
                 return false;
               }
@@ -996,7 +1096,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
       if (cacheable.index_buffer_type == ProcessedIndexBufferType::kGuestDMA &&
           guest_index_format == xenos::IndexFormat::kInt32 && !full_32bit_vertex_indices_used_ &&
           host_vertex_shader_type != Shader::HostVertexShaderType::kVertex) {
-        trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes);
+        trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes,
+                                    index_source(guest_index_base));
         // No primitive-type conversion, just index normalization.
         CacheTransaction cache_transaction(
             *this, CacheKey(guest_index_base, guest_draw_vertex_count, guest_index_format,
@@ -1005,11 +1106,10 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
         if (cache_transaction.GetFoundResult()) {
           cacheable = *cache_transaction.GetFoundResult();
         } else {
-          auto guest_indices = memory_.TranslatePhysical<const uint32_t*>(guest_index_base);
-          auto host_indices =
-              reinterpret_cast<uint32_t*>(RequestHostConvertedIndexBufferForCurrentFrame(
-                  xenos::IndexFormat::kInt32, guest_draw_vertex_count, true, guest_index_base,
-                  cacheable.host_index_buffer_handle));
+          auto guest_indices = static_cast<const uint32_t*>(index_source(guest_index_base));
+          auto host_indices = reinterpret_cast<uint32_t*>(
+              request_converted_indices(xenos::IndexFormat::kInt32, guest_draw_vertex_count, true,
+                                        guest_index_base, cacheable.host_index_buffer_handle));
           if (!host_indices) {
             return false;
           }
@@ -1035,13 +1135,14 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
       host_vertex_shader_type == Shader::HostVertexShaderType::kVertex &&
       (cacheable.host_index_format == xenos::IndexFormat::kInt16 ||
        full_32bit_vertex_indices_used_) &&
-      !shared_memory_.IsRangeGpuWritten(guest_index_base, guest_index_buffer_needed_bytes)) {
+      (gpu_indices ||
+       !index_range_gpu_written(guest_index_base, guest_index_buffer_needed_bytes))) {
     size_t snapshot_size =
         size_t(cacheable.host_draw_vertex_count) *
         (cacheable.host_index_format == xenos::IndexFormat::kInt16 ? sizeof(uint16_t)
                                                                    : sizeof(uint32_t));
     if (!TryRetainedNativeIndexBuffer(guest_index_base, uint32_t(snapshot_size),
-                                      memory_.TranslatePhysical<const void*>(guest_index_base),
+                                      index_source(guest_index_base),
                                       cacheable.host_index_buffer_handle,
                                       result_out.native_index_snapshot)) {
       void* host_indices = RequestHostConvertedIndexBufferForCurrentFrame(
@@ -1052,7 +1153,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
       }
       native_index_snapshot_.resize(snapshot_size);
       std::memcpy(native_index_snapshot_.data(),
-                  memory_.TranslatePhysical<const void*>(guest_index_base), snapshot_size);
+                  index_source(guest_index_base), snapshot_size);
       std::memcpy(host_indices, native_index_snapshot_.data(), snapshot_size);
       result_out.native_index_snapshot = native_index_snapshot_.data();
     }
@@ -1070,10 +1171,31 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
     }
   }
 
+  if (native_shader_indices &&
+      cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA &&
+      (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
+       host_vertex_shader_type == Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) &&
+      (gpu_indices ||
+       !index_range_gpu_written(guest_index_base, guest_index_buffer_needed_bytes))) {
+    // Keep the guest stream, rather than the strip adapter, for shader-side
+    // index loading and its vertex bounds proof. The backend binds a snapshot
+    // containing these bytes or explicitly requests the compatibility range.
+    uint32_t prefix = guest_index_base & 3u;
+    uint32_t snapshot_size = (guest_index_buffer_needed_bytes + prefix + 3u) & ~3u;
+    native_index_snapshot_.resize(snapshot_size);
+    std::memcpy(native_index_snapshot_.data(),
+                index_source(guest_index_base & ~3u), snapshot_size);
+    result_out.native_index_snapshot = native_index_snapshot_.data() + prefix;
+    result_out.shader_index_buffer_deferred = true;
+    trace_writer_.WriteMemoryRead(guest_index_base & ~3u, snapshot_size,
+                                  native_index_snapshot_.data());
+  }
+
   // Request the indices in the shared memory if they need to be accessed from
   // there on the GPU.
-  if (cacheable.index_buffer_type == ProcessedIndexBufferType::kGuestDMA ||
-      cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) {
+  if (!result_out.shader_index_buffer_deferred &&
+      (cacheable.index_buffer_type == ProcessedIndexBufferType::kGuestDMA ||
+       cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA)) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.
     // Only read by this draw, so pages the game rewrites every frame may be
@@ -1086,6 +1208,12 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool native_dma_i
       return false;
     }
   }
+
+  pending.Flush();
+  native_converted_index_snapshot_ = cacheable.native_index_shadow;
+  if (native_converted_index_snapshot_)
+    result_out.native_index_snapshot =
+        native_converted_index_snapshot_->data() + cacheable.native_index_shadow_offset;
 
   result_out.guest_primitive_type = guest_primitive_type;
   result_out.host_primitive_type = host_primitive_type;
@@ -1718,6 +1846,7 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
                 }
               }
               // Make the entry free for reuse.
+              entry.result.native_index_shadow.reset();
               entry.free_next = cache_bucket_free_first_entry_;
               cache_bucket_free_first_entry_ = entry_index;
             }

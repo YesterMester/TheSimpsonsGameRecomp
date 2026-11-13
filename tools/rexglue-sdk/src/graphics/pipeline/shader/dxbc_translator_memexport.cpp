@@ -622,6 +622,12 @@ void DxbcShaderTranslator::ExportToMemory(uint8_t export_eM) {
   // with 0 below).
   a_.OpIShL(dxbc::Dest::R(temp, 0b1000),
             dxbc::Src::R(system_temp_memexport_address_, dxbc::Src::kXXXX), dxbc::Src::LU(2));
+  // Keep the guest's stream constants and all ALU uses of them intact. Only
+  // the final storage address is made relative to its native resource.
+  a_.OpIAdd(
+      dxbc::Dest::R(temp, 0b1000), dxbc::Src::R(temp, dxbc::Src::kWWWW),
+      -LoadSystemConstant(SystemConstants::Index::kNativeMemexportBase,
+                          offsetof(SystemConstants, native_memexport_base), dxbc::Src::kXXXX));
   dxbc::Src base_address_src(dxbc::Src::R(temp, dxbc::Src::kWWWW));
 
   uint8_t export_eM14 = export_eM >> 1;

@@ -1,0 +1,32 @@
+{
+  "id": "examples.camera-workshop",
+  "name": "Camera workshop",
+  "author": "",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "state",
+  "description": "Capture and preview native camera shots from an original in-game Options page.",
+  "requires_operations": [
+    "system.try_call",
+    "world.status",
+    "camera.status",
+    "camera.pose",
+    "camera.free",
+    "camera.photo",
+    "camera.set_pose",
+    "camera.release",
+    "ui.register_page",
+    "log.info"
+  ],
+  "requires_events": [
+    "initialize",
+    "level.ready",
+    "level.unloading",
+    "code.reloaded",
+    "state.loaded",
+    "save.restored",
+    "ui.action"
+  ]
+}

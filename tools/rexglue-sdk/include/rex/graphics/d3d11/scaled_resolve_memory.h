@@ -15,6 +15,7 @@ class ScaledResolveMemory {
                       uint32_t scale_y)
       : device_(device), draws_(draws), area_(scale_x * scale_y) {}
   bool Ensure(uint32_t start, uint32_t length, std::string& error);
+  bool Contains(uint32_t start, uint32_t length) const;
   Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> Read(uint32_t start, uint32_t length,
                                                         uint32_t element_size_log2,
                                                         std::string& error);

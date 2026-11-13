@@ -1,0 +1,22 @@
+{
+  "mission.title": "There and back",
+  "mission.description": "Move 12 units away, then bring an exploring family member back to their starting point.",
+  "objective.outbound": "Explore away from the starting point",
+  "objective.return": "Return to the starting point",
+  "page.title": "Mission example",
+  "page.state": "Mission: {state}",
+  "page.progress": "{title}: {progress}/{goal}",
+  "page.start": "Start mission",
+  "page.retry": "Retry from objective checkpoint",
+  "page.replay": "Start again from the beginning",
+  "page.checkpoint": "Record objective retry point",
+  "status.idle": "Not started",
+  "status.active": "In progress",
+  "status.completed": "Complete",
+  "status.failed": "Failed",
+  "error.no_level": "Load a level and a playable family member first.",
+  "error.health": "All loaded family members are down.",
+  "error.timeout": "The 90 second time limit expired.",
+  "error.level": "The level unloaded.",
+  "log.change": "{title}: {state}"
+}

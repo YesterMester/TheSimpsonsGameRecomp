@@ -88,6 +88,20 @@ if(WIN32)
     target_link_libraries(rexruntime PRIVATE ws2_32)
 endif()
 
+if(UNIX AND NOT APPLE AND NOT ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    # Code 2 MB aligned in the file as in memory, so Linux can map it with huge
+    # pages (see MapCodeWithHugePages in windowed_app_main_posix.cpp).
+    target_link_options(rexruntime PRIVATE -Wl,-z,max-page-size=0x200000)
+endif()
+
+if(ANDROID)
+    # FFmpeg's ARM64 assembly references its bundled tables directly. Keep the
+    # private decoder archives local to this DSO so those PIC references cannot
+    # be interposed by another library in the app.
+    target_link_options(rexruntime PRIVATE
+        "LINKER:--exclude-libs,liblibavcodec.a:liblibavutil.a")
+endif()
+
 if(REXGLUE_USE_D3D12)
     target_link_libraries(rexruntime PUBLIC dxgi dxguid dxc-headers)
     target_compile_definitions(rexruntime PUBLIC REX_HAS_D3D12=1)

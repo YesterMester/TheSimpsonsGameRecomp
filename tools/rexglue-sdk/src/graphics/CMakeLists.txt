@@ -18,14 +18,18 @@ set(REXGRAPHICS_CORE_SOURCES
 # GPU system files - full backend
 set(REXGRAPHICS_SYSTEM_SOURCES
     graphics_system.cpp
+    shader_storage.cpp
     command_processor.cpp
     native_records.cpp
+    native_gpu_calls.cpp
     native_gpu_diagnostics.cpp
     trace_writer.cpp
     pipeline/texture/extent.cpp
     pipeline/texture/util.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
+    util/buffer_hash.cpp
+    util/guest_write_tracker.cpp
     packet_disassembler.cpp
     primitive_processor.cpp
     pipeline/render_target/cache.cpp
@@ -36,6 +40,10 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     pipeline/shader/translator.cpp
     pipeline/shader/translator_disasm.cpp
 )
+
+# The ISA dispatcher includes xxHash with its own per-function target flags.
+# It must precede any inline implementation that a precompiled header contains.
+set_source_files_properties(util/buffer_hash.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 # SPIR-V shader translation
 set(REXGRAPHICS_SPIRV_SOURCES
@@ -167,6 +175,7 @@ list(APPEND REX_TRANSLATOR_HASH_INPUTS
     ${CMAKE_CURRENT_SOURCE_DIR}/format/ucode.cpp
     ${REXGLUE_ROOT}/include/rex/graphics/format/ucode.h
     ${REXGLUE_ROOT}/include/rex/graphics/xenos.h
+    ${REXGLUE_ROOT}/include/rex/graphics/util/native_vertex_fetch.h
 )
 string(REPLACE ";" "|" REX_TRANSLATOR_HASH_INPUTS_ARG "${REX_TRANSLATOR_HASH_INPUTS}")
 set(REX_TRANSLATOR_HASH_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/rex/graphics/translator_hash.h)

@@ -12,7 +12,9 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <atomic>
 #include <string>
+#include <vector>
 
 #include <rex/platform.h>
 #include <rex/thread/fiber.h>
@@ -368,6 +370,27 @@ class XThread : public XObject {
   uint32_t suspend_count();
   X_STATUS Resume(uint32_t* out_suspend_count = nullptr);
   X_STATUS Suspend(uint32_t* out_suspend_count = nullptr);
+
+  // Freezing a title's guest threads at kernel waits (exact game saves). A
+  // guest thread blocked in a wait can't run guest code until the wait
+  // returns; while a freeze is requested, a returning wait parks the thread
+  // before it gets back to guest code. Wrap every blocking host wait in a
+  // WaitScope.
+  class WaitScope {
+   public:
+    WaitScope();
+    ~WaitScope();
+    WaitScope(const WaitScope&) = delete;
+    WaitScope& operator=(const WaitScope&) = delete;
+
+   private:
+    XThread* thread_ = nullptr;
+  };
+  static void RequestFreeze();
+  static void ReleaseFreeze();
+  // Whether every guest thread but the caller is blocked in a wait or parked.
+  // The ids of those still running guest code go in busy.
+  static bool AllFrozen(std::vector<uint32_t>* busy = nullptr);
 #if REX_PLATFORM_LINUX
   // Increment suspend count and block until another thread resumes us.
   uint32_t SelfSuspend();
@@ -411,6 +434,8 @@ class XThread : public XObject {
   uint32_t stack_limit_ = 0;       // Low address
   bool guest_thread_ = false;
   bool main_thread_ = false;  // Entry-point thread
+  // 0: running guest code, 1: blocked in a wait, 2: parked by a freeze.
+  std::atomic<uint8_t> freeze_state_{0};
   bool running_ = false;
 
   std::string thread_name_;

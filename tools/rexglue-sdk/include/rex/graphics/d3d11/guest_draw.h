@@ -2,6 +2,7 @@
 
 #include <unordered_map>
 
+#include <rex/graphics/d3d11/constant_buffer.h>
 #include <rex/graphics/d3d11/guest_sampler.h>
 #include <rex/graphics/d3d11/pipeline_cache.h>
 #include <rex/graphics/d3d11/primitive_processor.h>
@@ -20,7 +21,8 @@ class GuestDraw {
   GuestDraw(const RegisterFile& registers, ui::d3d11::D3D11Device& device, DrawContext& draws,
             D3D11SharedMemory& memory, D3D11TextureCache& textures,
             D3D11RenderTargetCache& render_targets, D3D11PrimitiveProcessor& primitives,
-            PipelineCache& pipelines)
+            PipelineCache& pipelines, uint64_t buffer_cache_budget = 8 * 1024 * 1024,
+            bool constant_ranges = true)
       : registers_(registers),
         device_(device),
         draws_(draws),
@@ -29,14 +31,17 @@ class GuestDraw {
         render_targets_(render_targets),
         primitives_(primitives),
         pipelines_(pipelines),
-        buffers_(device),
-        samplers_(device) {}
-  bool Submit(D3D11Shader* vertex, D3D11Shader* pixel, std::string& error);
+        buffers_(device, buffer_cache_budget),
+        samplers_(device),
+        constant_ranges_(constant_ranges && ConstantBuffer::SupportsRanges(device)) {}
+  bool Submit(D3D11Shader* vertex, D3D11Shader* pixel, std::string& error,
+              bool readback_memexport = true);
   void ClearCache();
 
  private:
   struct Bindings {
     std::array<ID3D11Buffer*, 4> constant_views;
+    std::array<uint32_t, 4> constant_first, constant_count;
     std::vector<ID3D11ShaderResourceView*> resources;
     std::vector<TextureSwizzle> swizzles;
     std::vector<Microsoft::WRL::ComPtr<ID3D11SamplerState>> samplers;
@@ -47,17 +52,24 @@ class GuestDraw {
                        Bindings& output, std::string& error);
   bool PrepareIndices(const PrimitiveProcessor::ProcessingResult& primitive, DrawCommand& command,
                       std::string& error);
+  bool PrepareNativeVertexStreams(const D3D11Shader& vertex, const D3D11Shader* pixel,
+                                  const PrimitiveProcessor::ProcessingResult& primitive,
+                                  bool memexport, std::string& error);
   // Constant blocks: system, vertex floats, pixel floats, bool and loop, and
-  // fetch. Each exact size has its own dynamic buffer, so reads past a block
-  // still return zero. A changed block is rewritten with WRITE_DISCARD, which
-  // leaves queued draws their own copy; an unchanged one keeps its buffer.
-  enum ConstantBlock { kSystemConstants, kVertexFloats, kPixelFloats, kBoolLoop, kFetch, kCount };
-  struct ConstantBuffer {
-    Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;
-    std::vector<uint8_t> contents;
+  // fetch. Each block and exact size has its own buffer. Shared system and
+  // bool/loop data are identical in both stages, so one draw never changes
+  // a page after preparing another stage's binding into that same page.
+  enum ConstantBlock {
+    kSystemConstants,
+    kVertexFloats,
+    kPixelFloats,
+    kBoolLoop,
+    kVertexFetch,
+    kPixelFetch,
+    kCount
   };
-  ID3D11Buffer* UpdateConstants(ConstantBlock block, std::span<const uint8_t> data,
-                                std::string& error);
+  ID3D11Buffer* UpdateConstants(ConstantBlock block, std::span<const uint8_t> data, uint32_t& first,
+                                uint32_t& count, std::string& error);
   // Finds the words of each vertex fetch constant the draw can read, when the
   // shader analysis proves that its attributes fetch at the vertex index.
   void GetVertexRanges(const D3D11Shader& vertex, const D3D11Shader* pixel,
@@ -79,7 +91,16 @@ class GuestDraw {
   std::vector<draw_util::MemExportRange> exports_;
   // Fetch constants with a proven range, and their first and end words.
   std::array<uint64_t, 2> vertex_ranges_valid_ = {};
-  std::array<std::pair<uint32_t, uint32_t>, 96> vertex_ranges_ = {};
+  std::array<std::pair<int32_t, int32_t>, 96> vertex_ranges_ = {};
+  std::array<uint32_t, 32 * 6> native_vertex_fetch_constants_ = {};
+  std::vector<uint8_t> native_vertex_snapshot_;
+  std::shared_ptr<const BufferVersion> native_vertex_buffer_;
+  bool native_vertex_streams_active_ = false;
+  uint64_t native_vertex_draws_ = 0, native_vertex_bytes_ = 0;
+  D3D11SharedMemory::NativeResolveHandle native_memexport_buffer_;
+  Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> native_memexport_write_;
+  bool constant_ranges_ = false;
+  uint32_t constant_ring_bytes_ = 0;
 };
 
 }  // namespace rex::graphics::d3d11

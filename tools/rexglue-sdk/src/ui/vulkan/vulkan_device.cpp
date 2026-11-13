@@ -11,7 +11,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -22,21 +25,31 @@
 #include <rex/platform.h>
 #include <rex/ui/vulkan/device.h>
 
+#if REX_PLATFORM_LINUX
+#include <dlfcn.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
-                    "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
-                    "required for Vulkan GPU emulation")
+REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, false, "UI/Vulkan",
+                    "Require vertexPipelineStoresAndAtomics instead of using compute for "
+                    "vertex memory exports on devices without it")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vulkan_vertex_memexport_compute, false, "UI/Vulkan",
+                    "Disable vertex-stage storage writes to check the compute memory export path")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vulkan_min_storage_buffer_range, false, "UI/Vulkan",
+                    "Limit storage buffer ranges to 128 MiB to check portable native inputs")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, true, "UI/Vulkan",
                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
                     "fallback primitive emulation paths)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, true, "UI/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, false, "UI/Vulkan",
                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
-                    "allow fallback to solid fill for line/point polygon modes)")
+                    "allow solid-fill games on devices without wireframe support)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
@@ -46,6 +59,83 @@ namespace vulkan {
 // The device created with VK_KHR_present_id and VK_KHR_present_wait enabled,
 // for the presenter (kept outside VulkanDevice so its layout stays the same).
 std::atomic<VkDevice> g_present_wait_device{VK_NULL_HANDLE};
+
+namespace {
+// Diagnostic (REX_VULKAN_ALLOCATION_LOG set): device memory still allocated by
+// each call site, logged every few seconds, to find what holds memory.
+PFN_vkAllocateMemory g_allocate_memory = nullptr;
+PFN_vkFreeMemory g_free_memory = nullptr;
+struct AllocationSite {
+  uint64_t live_bytes = 0, live_count = 0, total_count = 0;
+};
+std::mutex g_allocation_mutex;
+std::unordered_map<VkDeviceMemory, std::pair<const void*, uint64_t>> g_allocations;
+std::unordered_map<const void*, AllocationSite> g_allocation_sites;
+uint64_t g_allocation_log_tick = 0;
+
+void LogAllocationSitesLocked() {
+  std::vector<std::pair<const void*, AllocationSite>> sites(g_allocation_sites.begin(),
+                                                            g_allocation_sites.end());
+  std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) {
+    return a.second.live_bytes > b.second.live_bytes;
+  });
+  uint64_t total = 0;
+  for (const auto& site : sites) {
+    total += site.second.live_bytes;
+  }
+  REXLOG_INFO("[vulkan-memory] {} MiB in {} allocations", total >> 20, g_allocations.size());
+  for (size_t i = 0; i < std::min(sites.size(), size_t(8)); ++i) {
+    std::string name = fmt::format("{:p}", sites[i].first);
+#if REX_PLATFORM_LINUX
+    Dl_info info;
+    if (dladdr(sites[i].first, &info) && info.dli_sname) {
+      name = fmt::format("{}+{:#x}", info.dli_sname,
+                         uintptr_t(sites[i].first) - uintptr_t(info.dli_saddr));
+    }
+#endif
+    REXLOG_INFO("[vulkan-memory]   {}: {} MiB live in {} ({} made)", name,
+                sites[i].second.live_bytes >> 20, sites[i].second.live_count,
+                sites[i].second.total_count);
+  }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL TrackedAllocateMemory(VkDevice device,
+                                                     const VkMemoryAllocateInfo* allocate_info,
+                                                     const VkAllocationCallbacks* allocator,
+                                                     VkDeviceMemory* memory) {
+  VkResult result = g_allocate_memory(device, allocate_info, allocator, memory);
+  if (result == VK_SUCCESS) {
+    const void* site = __builtin_return_address(0);
+    std::lock_guard lock(g_allocation_mutex);
+    g_allocations[*memory] = {site, allocate_info->allocationSize};
+    AllocationSite& counts = g_allocation_sites[site];
+    counts.live_bytes += allocate_info->allocationSize;
+    ++counts.live_count;
+    ++counts.total_count;
+    uint64_t now = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+    if (now - g_allocation_log_tick > 3000000000ull) {
+      g_allocation_log_tick = now;
+      LogAllocationSitesLocked();
+    }
+  }
+  return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL TrackedFreeMemory(VkDevice device, VkDeviceMemory memory,
+                                             const VkAllocationCallbacks* allocator) {
+  if (memory != VK_NULL_HANDLE) {
+    std::lock_guard lock(g_allocation_mutex);
+    auto found = g_allocations.find(memory);
+    if (found != g_allocations.end()) {
+      AllocationSite& counts = g_allocation_sites[found->second.first];
+      counts.live_bytes -= found->second.second;
+      --counts.live_count;
+      g_allocations.erase(found);
+    }
+  }
+  g_free_memory(device, memory, allocator);
+}
+}  // namespace
 
 template <typename Structure, VkStructureType StructureType>
 struct VulkanFeatures {
@@ -118,10 +208,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
           properties.deviceName);
       return nullptr;
     }
-    if (!supported_features.vertexPipelineStoresAndAtomics) {
+    if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics) &&
+        !supported_features.vertexPipelineStoresAndAtomics) {
       REXLOG_WARN(
           "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, which "
-          "is required for Vulkan GPU emulation parity",
+          "was explicitly required by vulkan_require_vertex_pipeline_stores_and_atomics",
           properties.deviceName);
       return nullptr;
     }
@@ -647,6 +738,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(nonCoherentAtomSize)
 
   if (with_gpu_emulation) {
+    if (REXCVAR_GET(vulkan_min_storage_buffer_range)) {
+      device->properties_.maxStorageBufferRange =
+          std::min(device->properties_.maxStorageBufferRange, uint32_t(128 * 1024 * 1024));
+      REXLOG_INFO("Storage buffer range limited to 128 MiB for portability checks");
+    }
     XE_UI_VULKAN_FEATURE(robustBufferAccess)
     XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
     XE_UI_VULKAN_FEATURE(independentBlend)
@@ -663,6 +759,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(shaderCullDistance)
     XE_UI_VULKAN_FEATURE(sparseBinding)
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
+    if (REXCVAR_GET(vulkan_vertex_memexport_compute)) {
+      enabled_features.vertexPipelineStoresAndAtomics = VK_FALSE;
+      device->properties_.vertexPipelineStoresAndAtomics = VK_FALSE;
+      REXLOG_INFO("Vertex-stage storage writes disabled; using compute memory exports");
+    }
   }
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -797,6 +898,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   // Vulkan 1.0.
 #include <rex/ui/vulkan/functions/device_1_0.inc>
+  if (std::getenv("REX_VULKAN_ALLOCATION_LOG") && dfn.vkAllocateMemory && dfn.vkFreeMemory) {
+    g_allocate_memory = dfn.vkAllocateMemory;
+    g_free_memory = dfn.vkFreeMemory;
+    dfn.vkAllocateMemory = TrackedAllocateMemory;
+    dfn.vkFreeMemory = TrackedFreeMemory;
+    REXLOG_INFO("[vulkan-memory] tracking device memory by call site");
+  }
 
   // Extensions promoted to a Vulkan version supported by the device.
 #define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name)                                \

@@ -14,48 +14,11 @@ import re
 from copy_free_resolve_check import CVARS
 from replay_ab import compare, read_ppm, run_variant, write_png
 
-DEPENDENCIES = {"edram", "memory_mirror", "scaled_mirror_read", "scaled_mirror_write",
-                "resolve_fallback", "vertex_fallback", "texture_fallback"}
-ALLOCATIONS = {"edram", "memory_mirror", "scaled_mirror"}
+from native_coverage import read_report, validate
 
-
-def read_report(path):
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError) as error:
-        return {"report_error": str(error)}
-
-
-def validate(report):
-    errors = []
-    if report.get("version") != 1 or report.get("backend") != "vulkan":
-        errors.append("missing or unsupported Vulkan coverage report")
-    if report.get("strict") is not True or report.get("complete") is not True:
-        errors.append("strict validation did not finish")
-    if report.get("failed") is not False:
-        errors.append("native validation reported a failure")
-    if report.get("frames", 0) < 1:
-        errors.append("no frames were rendered")
-    dependencies = report.get("dependencies", {})
-    allocations = report.get("allocations", {})
-    if not DEPENDENCIES.issubset(dependencies) or not ALLOCATIONS.issubset(allocations):
-        errors.append("coverage report is missing dependency or allocation counters")
-    for kind, value in dependencies.items():
-        if not all(isinstance(value.get(key), int) for key in ("calls", "bytes")):
-            errors.append(f"invalid dependency counter: {kind}")
-        if value.get("calls", 0):
-            errors.append(f"legacy dependency: {kind}: {value.get('first_detail', '')}")
-    for kind, value in allocations.items():
-        if not all(isinstance(value.get(key), int)
-                   for key in ("calls", "virtual_bytes", "resident_bytes")):
-            errors.append(f"invalid allocation counter: {kind}")
-        if any(value.get(key, 0) for key in ("calls", "virtual_bytes", "resident_bytes")):
-            errors.append(f"legacy allocation: {kind}")
-    operations = report.get("operations", {})
-    if not operations.get("vertex_streams", 0) or not operations.get("resolve", 0):
-        errors.append("native vertex streams and resolves were not both exercised")
-    return errors
-
+# Qualification must preserve the stable game's resolve/timing defaults.
+# Explicit --set values follow these defaults rather than being overwritten.
+CVARS += ";native_resolve_copy_free=false;native_buffer_write_watches=false"
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -96,7 +59,7 @@ def main():
         for scale in args.scales:
             name = f"{index:02d}-{trace.stem}-{scale}x"
             report_path = args.output / (name + ".coverage.json")
-            cvars = (CVARS + settings + f";resolution_scale={scale};native_resolve_copy_free=true;"
+            cvars = (CVARS + settings + f";resolution_scale={scale};"
                      "native_resolve_surface_aliases=true;native_gpu_strict=true;"
                      f"native_gpu_report_path={report_path}")
             native = run_variant(str(args.replayer.resolve()), str(trace.resolve()),
@@ -115,7 +78,7 @@ def main():
                 reference = run_variant(
                     str(args.replayer.resolve()), str(trace.resolve()),
                     str(args.output / (name + "-reference")),
-                    CVARS + settings + f";resolution_scale={scale};native_resolve_copy_free=true;"
+                    CVARS + settings + f";resolution_scale={scale};"
                     "native_resolve_surface_aliases=false;native_gpu_strict=false;"
                     "native_gpu_report_path=", args.iterations, args.timeout)
                 result["reference"] = reference

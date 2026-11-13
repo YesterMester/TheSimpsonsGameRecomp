@@ -31,6 +31,9 @@ class SpirvBuilder : public spv::Builder {
   // Make public rather than protected.
   using spv::Builder::createSelectionMerge;
 
+  spv::Id createTriOp(spv::Op op_code, spv::Id type_id, spv::Id operand1, spv::Id operand2,
+                      spv::Id operand3);
+
   spv::Id createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id operand1, spv::Id operand2,
                        spv::Id operand3, spv::Id operand4);
 

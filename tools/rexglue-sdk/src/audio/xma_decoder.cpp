@@ -165,6 +165,7 @@ void XmaDecoder::WorkerThreadMain() {
       if (worked) {
         context.SignalWorkDone();
         PROFILE_XMA_FRAME_DECODED();
+        rex_audio_yield_realtime_budget();
       }
       did_work = did_work || worked;
     }

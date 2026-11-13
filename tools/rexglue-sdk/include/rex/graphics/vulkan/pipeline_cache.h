@@ -11,6 +11,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdio>
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/shader/cache_key.h>
 #include <rex/hash.h>
 #include <rex/platform.h>
 #include <rex/thread.h>
@@ -89,6 +91,8 @@ class VulkanPipelineCache {
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);
+  VkPipeline GetVertexMemExportComputePipeline(VulkanShader& shader, VkPipelineLayout layout,
+                                               bool native_vertex_streams = false);
   // TODO(Triang3l): Return a deferred creation handle.
   bool ConfigurePipeline(
       VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
@@ -366,7 +370,7 @@ class VulkanPipelineCache {
   bool SetUpTranslatedShader(VulkanShader::VulkanTranslation& translation);
   // The directory of the ahead-of-time shader set (aot_shader_path) made for
   // the current draw resolution scale and render target path, or empty.
-  std::filesystem::path FindAotShaderSet() const;
+  std::filesystem::path FindAotShaderSet(const std::filesystem::path& root = {}) const;
   // The base directory of ahead-of-time shader sets (aot_shader_path, or
   // native_shaders next to the executable), empty if there is none.
   std::filesystem::path GetAotShaderRoot() const;
@@ -375,9 +379,9 @@ class VulkanPipelineCache {
   // translated sets record it (translator_configuration.txt).
   std::string GetTranslatorConfiguration() const;
   // The set of modules exported from runtime translations (translated/ in the
-  // ahead-of-time shader root), used only if made with exactly this
-  // translator version and configuration, or empty.
-  std::filesystem::path FindTranslatedShaderSet() const;
+  // ahead-of-time shader root). Differences that don't affect a particular
+  // shader are checked again by TryLoadAotTranslation before serving it.
+  std::filesystem::path FindTranslatedShaderSet();
   // Serves a translation from the ahead-of-time shader set if it has it.
   bool TryLoadAotTranslation(VulkanShader::VulkanTranslation& translation, const char* stage);
   // With aot_export_path, writes a runtime translation to the ahead-of-time
@@ -448,12 +452,14 @@ class VulkanPipelineCache {
       texture_binding_layout_map_;
 
   // Ucode hash -> shader.
-  std::unordered_map<uint64_t, VulkanShader*, rex::IdentityHasher<uint64_t>> shaders_;
+  std::unordered_map<ShaderCacheKey, VulkanShader*, ShaderCacheKeyHasher> shaders_;
 
   // Geometry shaders for Xenos primitive types not supported by Vulkan.
   // Stores VK_NULL_HANDLE if failed to create.
   std::unordered_map<GeometryShaderKey, VkShaderModule, GeometryShaderKey::Hasher>
       geometry_shaders_;
+  std::map<std::pair<VulkanShader::VulkanTranslation*, VkPipelineLayout>, VkPipeline>
+      vertex_memexport_compute_pipelines_;
 
   // Fixed-function emulation shaders for tessellation.
   bool tessellation_indexed_vertex_shader_attempted_ = false;
@@ -502,6 +508,8 @@ class VulkanPipelineCache {
   // (see FindAotShaderSet), empty if none; looked up on first use.
   std::filesystem::path aot_set_dir_;
   std::filesystem::path translated_set_dir_;
+  bool translated_set_vertex_writes_differ_ = false;
+  bool translated_set_memory_bindings_differ_ = false;
   bool aot_set_checked_ = false;
   // aot_export_path: translations may be exported from several threads (the
   // shader storage is translated by worker threads).
@@ -524,6 +532,10 @@ class VulkanPipelineCache {
 
   // Currently open shader storage path.
   std::filesystem::path shader_storage_cache_root_;
+  // Translations made for this device configuration, separate from the
+  // packaged native replacements and from opaque driver pipeline binaries.
+  std::filesystem::path device_aot_root_;
+  std::filesystem::path device_aot_set_dir_;
   uint32_t shader_storage_title_id_ = 0;
 
   // Shader storage output stream, for preload in the next emulator runs.
@@ -547,8 +559,16 @@ class VulkanPipelineCache {
   std::deque<PipelineStoredDescription> storage_write_pipeline_queue_;
   bool storage_write_flush_shaders_ = false;
   bool storage_write_flush_pipelines_ = false;
+  bool storage_write_save_driver_cache_ = false;
   bool storage_write_thread_shutdown_ = false;
   std::unique_ptr<rex::thread::Thread> storage_write_thread_;
+
+  // The driver's compiled pipelines are saved now and then, not only at a
+  // clean shutdown: phones usually end the game by killing its process.
+  void SaveDriverPipelineCache();
+  std::mutex driver_cache_save_mutex_;
+  size_t driver_cache_saved_pipelines_ = 0;
+  std::chrono::steady_clock::time_point driver_cache_saved_at_{};
 
   mutable std::mutex creation_request_lock_;
   std::condition_variable creation_request_cond_;

@@ -167,12 +167,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   if (!provider_) {
     CreateProvider(false);
     provider_supports_presentation_ = false;
+    if (!provider_) {
+      REXGPU_ERROR("Unable to create graphics provider");
+      return X_STATUS_UNSUCCESSFUL;
+    }
   }
 
   // Create command processor. This will spin up a thread to process all
   // incoming ringbuffer packets.
   command_processor_ = CreateCommandProcessor();
-  if (!command_processor_->Initialize()) {
+  if (!command_processor_ || !command_processor_->Initialize()) {
     REXGPU_ERROR("Unable to initialize command processor");
     return X_STATUS_UNSUCCESSFUL;
   }

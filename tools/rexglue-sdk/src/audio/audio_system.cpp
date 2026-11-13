@@ -32,6 +32,12 @@
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_thread.h>
 #include <SDL3/SDL_timer.h>
+#if REX_PLATFORM_ANDROID
+#include <SDL3/SDL_system.h>
+#include <jni.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#endif
 #if REX_PLATFORM_LINUX
 #include <SDL3/SDL_system.h>
 #include <sys/syscall.h>
@@ -66,19 +72,141 @@ REXCVAR_DEFINE_BOOL(audio_callback_pacing, true, "Audio",
 #include <unistd.h>
 #include <cerrno>
 #endif
+#if REX_PLATFORM_GNU_LINUX && !REX_PLATFORM_ANDROID
+#include <sched.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <time.h>
+
+#include <mutex>
+
+namespace {
+thread_local uint64_t audio_realtime_budget_ns = 0;
+thread_local uint64_t audio_realtime_start_ns = 0;
+thread_local uint64_t audio_realtime_check_wall_ns = 0;
+thread_local uint32_t audio_realtime_calls = 0;
+
+uint64_t AudioThreadCpuNs() {
+  timespec now{};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0)
+    return 0;
+  return uint64_t(now.tv_sec) * 1000000000u + uint64_t(now.tv_nsec);
+}
+
+// The soft realtime CPU limit (RLIMIT_RTTIME) was reached: a realtime thread
+// ran for its whole budget without blocking, for instance spinning on a lock
+// that a thread it keeps off the CPU holds. The default action ends the game,
+// and at the hard limit RTKit's SIGKILL would. The signal goes to the thread
+// that overran: put it back on normal scheduling, which no longer counts the
+// limit, and let the game carry on.
+void OnRealtimeLimit(int) {
+  sched_param param{};
+  syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &param);
+  static const char kMessage[] =
+      "[audio] a realtime thread overran its CPU budget; it now runs at normal priority\n";
+  (void)!write(2, kMessage, sizeof(kMessage) - 1);
+}
+
+void StartAudioRealtimeBudget() {
+  static std::once_flag handler_once;
+  std::call_once(handler_once, [] {
+    struct sigaction action{};
+    action.sa_handler = OnRealtimeLimit;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    sigaction(SIGXCPU, &action, nullptr);
+  });
+  // RTKit usually grants 100 ms before SIGXCPU and 200 ms before SIGKILL.
+  // Keep its limits and scheduling priority; sleep at safe work boundaries
+  // well before that continuous CPU budget. sched_yield does not reset it.
+  audio_realtime_budget_ns = 20000000;
+  rlimit limit{};
+  if (getrlimit(RLIMIT_RTTIME, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY)
+    audio_realtime_budget_ns =
+        std::min(audio_realtime_budget_ns, std::max<uint64_t>(1, limit.rlim_cur / 4) * 1000);
+  audio_realtime_start_ns = AudioThreadCpuNs();
+}
+}  // namespace
+#endif
+
+extern "C" bool rex_audio_yield_realtime_budget() {
+#if REX_PLATFORM_GNU_LINUX && !REX_PLATFORM_ANDROID
+  if (!audio_realtime_budget_ns)
+    return false;
+  // Voice-state polling can call this thousands of times per millisecond.
+  // Look at the wall clock on every 16th call only (the guest's own timebase
+  // reads around it cost a clock read each already), and ask for the more
+  // expensive thread CPU clock at most once per millisecond, still well
+  // inside the RT budget.
+  if (++audio_realtime_calls & 15)
+    return false;
+  timespec wall{};
+  if (clock_gettime(CLOCK_MONOTONIC, &wall) != 0)
+    return false;
+  const uint64_t wall_ns = uint64_t(wall.tv_sec) * 1000000000u + uint64_t(wall.tv_nsec);
+  if (wall_ns < audio_realtime_check_wall_ns)
+    return false;
+  audio_realtime_check_wall_ns = wall_ns + 1000000;
+  const uint64_t now = AudioThreadCpuNs();
+  if (!now || now - audio_realtime_start_ns < audio_realtime_budget_ns)
+    return false;
+  timespec remaining{0, 100000};
+  while (nanosleep(&remaining, &remaining) != 0) {
+    if (errno != EINTR)
+      return false;
+  }
+  audio_realtime_start_ns = AudioThreadCpuNs();
+  return true;
+#else
+  return false;
+#endif
+}
 
 extern "C" bool rex_audio_set_thread_priority() {
 #if defined(_WIN32)
   return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) != 0;
+#elif REX_PLATFORM_ANDROID
+  // SCHED_FIFO is privileged, and SDL's pthread fallback leaves SCHED_OTHER's
+  // nice level unchanged on Android. Use Android's audio priority for both the
+  // mixer and XMA decoder, as SDL already does for the device output thread.
+  auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+  if (!env) {
+    return SDL_SetError("Android audio thread could not attach to the Java VM");
+  }
+  jclass process = env->FindClass("android/os/Process");
+  if (!process) {
+    env->ExceptionClear();
+    return SDL_SetError("Android audio thread could not find Process");
+  }
+  jmethodID set_priority = env->GetStaticMethodID(process, "setThreadPriority", "(I)V");
+  if (!set_priority) {
+    env->ExceptionClear();
+    env->DeleteLocalRef(process);
+    return SDL_SetError("Android audio thread could not find setThreadPriority");
+  }
+  env->CallStaticVoidMethod(process, set_priority, jint(-16));  // THREAD_PRIORITY_AUDIO
+  const bool failed = env->ExceptionCheck();
+  if (failed)
+    env->ExceptionClear();
+  env->DeleteLocalRef(process);
+  if (failed)
+    return SDL_SetError("Android denied the audio thread priority request");
+  REXAPU_INFO("Android audio worker scheduling: nice {}",
+              getpriority(PRIO_PROCESS, id_t(syscall(SYS_gettid))));
+  return true;
 #else
   struct sched_param sp{};
   sp.sched_priority = 10;
   if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0) {
+#if REX_PLATFORM_GNU_LINUX
+    StartAudioRealtimeBudget();
+#endif
     return true;
   }
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_GNU_LINUX
   if (SDL_SetLinuxThreadPriorityAndPolicy(syscall(SYS_gettid), SDL_THREAD_PRIORITY_TIME_CRITICAL,
                                           SCHED_RR)) {
+    StartAudioRealtimeBudget();
     return true;
   }
 #endif
@@ -155,6 +283,7 @@ void AudioSystem::WorkerThreadMain() {
   // spread out to just under the frame duration, which keeps the queue full.
   constexpr auto kCallbackInterval = std::chrono::microseconds(5333 * 39 / 40);
   std::chrono::steady_clock::time_point next_callback[kMaximumClientCount] = {};
+  std::chrono::steady_clock::time_point last_callback[kMaximumClientCount] = {};
 
   // audio_log_underruns: callbacks per second, how long the game's callback
   // runs and how late the paced wait wakes (a coarse timer shows here).
@@ -168,6 +297,16 @@ void AudioSystem::WorkerThreadMain() {
   // Main run loop.
   uint32_t diag_pump_count = 0;
   while (worker_running_) {
+    // Client semaphores have lower wait indices and can stay ready while the
+    // device consumes audio. Acknowledge pause before selecting another client
+    // so a busy queue cannot starve it. A callback already selected below is
+    // allowed to finish, preserving its queue permit and guest synchronization.
+    if (paused_) {
+      pause_fence_.Signal();
+      thread::Wait(resume_event_.get(), false);
+      continue;
+    }
+    rex_audio_yield_realtime_budget();
     // These handles signify the number of submitted samples. Once we reach
     // 64 samples, we wait until our audio backend releases a semaphore
     // (signaling a sample has finished playing)
@@ -185,12 +324,8 @@ void AudioSystem::WorkerThreadMain() {
     }
 
     if (result.first == thread::WaitResult::kSuccess && result.second == kMaximumClientCount) {
-      // Shutdown event signaled.
-      if (paused_) {
-        pause_fence_.Signal();
-        thread::Wait(resume_event_.get(), false);
-      }
-
+      // Wake for shutdown or pause. The next loop checks these requests before
+      // consuming another client's queue capacity.
       continue;
     }
 
@@ -207,16 +342,19 @@ void AudioSystem::WorkerThreadMain() {
       if (client_callback) {
         if (REXCVAR_GET(audio_callback_pacing)) {
           auto now = std::chrono::steady_clock::now();
-          if (now < next_callback[index]) {
+          // Keep the playback deadline separate from the minimum spacing.
+          // Moving the deadline forward after every late wake permanently
+          // loses those samples, even when the worker has time to recover.
+          const auto wake =
+              std::max(next_callback[index], last_callback[index] + kCallbackInterval / 2);
+          if (now < wake) {
             // SDL uses a high-resolution timer on Windows. Keep the existing
             // schedule and measure the actual wake rather than the deadline.
-            SDL_DelayNS(uint64_t(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(next_callback[index] - now)
-                    .count()));
+            SDL_DelayNS(
+                uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(wake - now).count()));
             now = std::chrono::steady_clock::now();
             if (REXCVAR_GET(audio_log_underruns)) {
-              const double late =
-                  std::chrono::duration<double, std::micro>(now - next_callback[index]).count();
+              const double late = std::chrono::duration<double, std::micro>(now - wake).count();
               pacing_diag.late_sum_us += std::max(0.0, late);
               pacing_diag.late_max_us = std::max(pacing_diag.late_max_us, late);
               ++pacing_diag.waits;
@@ -224,12 +362,18 @@ void AudioSystem::WorkerThreadMain() {
           } else if (REXCVAR_GET(audio_log_underruns)) {
             ++pacing_diag.unpaced;
           }
-          // Keep the schedule, so waking late cannot lower the average rate
-          // below the hardware's, but never ask again within half a frame:
-          // called again right away, the game's mixer returns silence. After
-          // a stall, this restarts from now instead of catching up in a burst.
-          next_callback[index] =
-              std::max(next_callback[index] + kCallbackInterval, now + kCallbackInterval / 2);
+          // Catch up gradually after scheduling jitter, with at least half a
+          // frame between callback starts. A pause longer than the entire
+          // queue starts a new schedule rather than retaining stale deadlines.
+          if (next_callback[index] == std::chrono::steady_clock::time_point{} ||
+              now - next_callback[index] > kCallbackInterval * queued_frames_) {
+            next_callback[index] = now;
+          }
+          next_callback[index] += kCallbackInterval;
+          last_callback[index] = now;
+        }
+        if (!worker_running_) {
+          break;
         }
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
@@ -309,23 +453,30 @@ int AudioSystem::FindFreeClient() {
 void AudioSystem::Initialize() {}
 
 void AudioSystem::Shutdown() {
-  if (!worker_running_) {
+  if (!worker_thread_ && !worker_running_) {
     return;
-  }
-
-  // Shut down XMA decoder first - its worker can stall in FFmpeg
-  if (xma_decoder_) {
-    xma_decoder_->Shutdown();
   }
 
   worker_running_ = false;
   shutdown_event_->Set();
+  // A paused mixer may already be waiting here instead of on shutdown_event_.
+  resume_event_->Set();
   if (worker_thread_) {
-    // The worker may be stuck inside a guest callback that is itself blocked
-    // on guest objects (e.g. KeWaitForMultipleObjects).
-    // Terminate the thread to break the deadlock.
-    worker_thread_->Terminate(0);
+    // Keep the decoder alive while the current callback finishes. Cancelling
+    // normal native work asynchronously can unwind through noexcept functions
+    // and abort the process. Only a callback blocked on stopped guest threads
+    // needs the existing forced termination path.
+    auto result =
+        rex::thread::Wait(worker_thread_->thread(), false, std::chrono::milliseconds(2000));
+    if (result != rex::thread::WaitResult::kSuccess) {
+      REXAPU_WARN("Audio worker did not stop cooperatively; terminating the blocked callback");
+      worker_thread_->Terminate(0);
+    }
     worker_thread_.reset();
+  }
+
+  if (xma_decoder_) {
+    xma_decoder_->Shutdown();
   }
 
   // Destroy all active client drivers (closes SDL audio devices, stopping
@@ -376,6 +527,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
 
 void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
   SCOPE_profile_cpu_f("apu");
+  rex_audio_yield_realtime_budget();
 
   static uint32_t submit_count = 0;
   if (submit_count < 10) {
@@ -482,7 +634,7 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
 }
 
 void AudioSystem::Pause() {
-  if (paused_) {
+  if (paused_ || !worker_running_) {
     return;
   }
   paused_ = true;

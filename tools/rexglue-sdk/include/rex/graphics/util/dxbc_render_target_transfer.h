@@ -154,6 +154,9 @@ class DxbcRenderTargetTransferShader {
       // swapping of 40-sample columns as opposed to the host render target -
       // this is done only for the color source).
       uint32_t host_depth_source_is_copy : 1;
+      uint32_t dest_original_resolution : 1;
+      uint32_t source_original_resolution : 1;
+      uint32_t host_depth_source_original_resolution : 1;
 
       // Last bits because this affects the root signature - after sorting, only
       // change it as fewer times as possible. Depth buffers have an additional

@@ -12,7 +12,9 @@
 
 #include <cstddef>
 #include <functional>
+#include <vector>
 
+#include <rex/input/device.h>
 #include <rex/input/input.h>
 #include <rex/kernel.h>
 #include <rex/ui/window.h>
@@ -39,6 +41,10 @@ class InputDriver {
                                 X_INPUT_KEYSTROKE* out_keystroke) = 0;
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
+
+  // Physical inputs available to the player assignment menu. Driver indices
+  // stay private to the driver; InputSystem maps these devices to players.
+  virtual std::vector<InputDevice> GetDevices() { return {}; }
 
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;

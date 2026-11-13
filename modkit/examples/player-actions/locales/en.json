@@ -1,0 +1,6 @@
+{
+  "title": "Player actions",
+  "heal": "Refill my character’s health",
+  "shortcuts": "Enable shoulder + Y shortcut",
+  "no_actor": "Load a level and join a character first."
+}

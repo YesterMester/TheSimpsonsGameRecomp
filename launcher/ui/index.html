@@ -2,13 +2,15 @@
 <html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>The Simpsons Game — Recompiled</title>
 <script>
   // The theme is set before the first paint so the page doesn't flash the
   // other one. The server fills in the saved choice: system, light or dark.
   (function () {
-    var pref = "__THEME__";
+    var android = typeof window.AndroidLauncher !== "undefined";
+    if (android) document.documentElement.dataset.platform = "android";
+    var pref = android ? window.AndroidLauncher.theme() : "__THEME__";
     var forced = /[?&]theme=(light|dark)/.exec(location.search);
     if (forced) pref = forced[1];
     var dark = pref === "dark" || (pref !== "light" && window.matchMedia &&
@@ -130,6 +132,22 @@
     background:radial-gradient(circle, var(--surface) 0 3px, var(--ink) 3px 4.5px, var(--pink) 4.5px 100%)}
   h3{font-family:var(--display); font-weight:normal; font-size:16px; letter-spacing:.6px; color:var(--blue);
     margin:22px 0 12px}
+  /* Settings cards and their subsections fold away under their headings. */
+  .settings-tools{justify-content:flex-end; margin-bottom:12px}
+  .collapsible > h2, .subsection > h3{cursor:pointer; user-select:none}
+  .subsection > h3{display:flex; align-items:center; gap:8px}
+  /* A chevron drawn with two borders (the display font has no arrow glyphs):
+     pointing down while open, right while folded. */
+  .collapsible > h2::after, .subsection > h3::after{content:""; flex:none; margin-left:auto;
+    margin-right:6px; width:9px; height:9px; border-right:3px solid var(--text-dim);
+    border-bottom:3px solid var(--text-dim); transform:translateY(-3px) rotate(45deg);
+    transition:transform .15s}
+  .collapsible.collapsed > h2::after, .subsection.collapsed > h3::after{
+    transform:rotate(-45deg)}
+  .collapsible.collapsed > h2, .subsection.collapsed > h3{margin-bottom:0}
+  .collapsed > .collapse-body{display:none}
+  .collapsible > h2:focus-visible, .subsection > h3:focus-visible{outline:2px dashed var(--blue);
+    outline-offset:4px}
   .muted{color:var(--text-dim); font-size:14px; line-height:1.6}
   .ok{color:var(--green); font-weight:700} .err{color:var(--red); font-weight:700}
   .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
@@ -171,6 +189,7 @@
     box-shadow:0 3px 0 var(--ink)}
   .badge.ready{background:var(--green-soft); color:var(--green-ink)}
   .badge.experimental{background:var(--yellow-soft); color:var(--yellow-soft-ink)}
+  .badge.preview{background:var(--yellow-soft); color:var(--yellow-soft-ink)}
   .badge .dot{display:none}
 
   /* --------------------------------------------------------------- buttons */
@@ -233,8 +252,9 @@
     background:var(--surface); border:2.5px solid var(--ink); border-radius:12px; box-shadow:0 5px 0 var(--ink);
     max-height:270px; overflow-y:auto; padding:5px}
   .customselect.open .customselect-panel{display:block}
-  .customselect-option{padding:9px 10px; border-radius:8px; font-size:14px; font-weight:600; color:var(--text);
-    cursor:pointer; line-height:1.4}
+  .customselect-option{display:block;width:100%;min-height:44px;padding:9px 10px;border:0;border-radius:8px;background:transparent;text-align:left;font-family:var(--body);font-size:14px;font-weight:600;color:var(--text);
+    cursor:pointer;line-height:1.4}
+  .customselect-option:focus{outline:2px solid var(--yellow);outline-offset:-2px}
   .customselect-option:hover{background:var(--surface-3)}
   .customselect-option.sel{background:var(--yellow); color:var(--yellow-ink)}
 
@@ -309,6 +329,73 @@
   .capturebox .sub{font-size:13px; color:var(--text-dim); font-weight:500; margin-top:10px}
 
   @media (max-width:760px){ .grid{grid-template-columns:1fr} h1{font-size:28px} }
+
+  [data-android-only]{display:none}
+  html[data-platform="android"] [data-desktop-only]{display:none!important}
+  html[data-platform="android"] [data-android-only]{display:block}
+  html[data-platform="android"] body{padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
+  /* The sky's clouds are sized for a desktop window; on a phone each would be
+     as wide as the screen and they would pile up behind the cards. Scale them
+     to the screen's shorter side and keep them toward the edges. */
+  html[data-platform="android"] body::before{will-change:auto;
+    background-size:46vmin auto, 54vmin auto, 40vmin auto, 58vmin auto, 220px 220px, 100% 100%;
+    background-position:-10vmin 9vh, calc(100% + 12vmin) 2vh, calc(100% + 8vmin) 56vh, -14vmin 90vh, 0 0, 0 0}
+  html[data-platform="android"] .hero{background-size:44vmin auto, 52vmin auto, 100% 100%}
+  html[data-platform="android"] button,html[data-platform="android"] .customselect-trigger{min-height:48px;touch-action:manipulation}
+  html[data-platform="android"] .collapsible > h2,html[data-platform="android"] .subsection > h3{min-height:48px;touch-action:manipulation}
+  html[data-platform="android"] .themebtn{width:48px;height:48px;flex:none}
+  html[data-platform="android"] input[type="range"]{height:40px}
+  html[data-platform="android"] .customselect-panel{max-height:45vh;overflow:auto;overscroll-behavior:contain}
+  html[data-platform="android"] .customselect-option{padding-top:14px;padding-bottom:14px}
+  html[data-platform="android"] .console{max-height:220px;overflow-wrap:anywhere}
+  .installprogress{margin-top:14px;padding-bottom:6px}
+  .installprogress .row{justify-content:space-between;gap:6px}
+  .installprogress progress{display:block;width:100%;height:18px;margin:8px 0 12px;
+    border:2px solid var(--ink);border-radius:999px;background:var(--surface-3);accent-color:var(--yellow)}
+  .installprogress progress::-webkit-progress-bar{background:var(--surface-3);border-radius:999px}
+  .installprogress progress::-webkit-progress-value{background:var(--yellow);border-radius:999px}
+  .installprogress progress::-moz-progress-bar{background:var(--yellow);border-radius:999px}
+  @media(max-width:600px){
+    html[data-platform="android"] .wrap{padding:16px 14px 40px;min-width:0}
+    html[data-platform="android"] header{display:grid;grid-template-columns:58px minmax(0,1fr) 48px;gap:8px 12px}
+    html[data-platform="android"] .donut{grid-column:1;grid-row:1 / span 2}
+    html[data-platform="android"] .titles{min-width:0;grid-column:2;grid-row:1}
+    html[data-platform="android"] h1{font-size:clamp(24px,7vw,32px);line-height:1.15}
+    html[data-platform="android"] .subtitle{font-size:11px;letter-spacing:1px;padding:4px 10px 2px}
+    html[data-platform="android"] .headerspacer{display:none}
+    html[data-platform="android"] .verchip{grid-column:2;grid-row:2;justify-self:start;font-size:11px;white-space:nowrap}
+    html[data-platform="android"] .themebtn{grid-column:3;grid-row:1;width:48px;height:48px;align-self:start}
+    html[data-platform="android"] .grid{grid-template-columns:1fr}
+    html[data-platform="android"] .row{flex-wrap:wrap;min-width:0}
+    html[data-platform="android"] .row>*{min-width:0;max-width:100%}
+    html[data-platform="android"] .field{min-width:0}
+    html[data-platform="android"] .card{padding:16px}
+    html[data-platform="android"] nav{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 8px;
+      overflow:visible;margin:18px 0 20px;padding:2px 0 6px}
+    html[data-platform="android"] nav button{min-width:0;font-size:14px;padding:9px 6px 6px;line-height:1.25}
+    html[data-platform="android"] .hero{height:clamp(330px,46svh,410px)}
+    html[data-platform="android"] .hero .placeholder{font-size:25px;padding:24px 22px 170px}
+    html[data-platform="android"] .hero .inner{left:18px;right:18px;bottom:22px;flex-direction:column;align-items:stretch;gap:12px}
+    html[data-platform="android"] .hero .inner>div:last-child{width:100%}
+    html[data-platform="android"] .statusline{max-width:none;font-size:13px;line-height:1.5}
+    html[data-platform="android"] .playbtn{width:100%;padding:12px 24px 9px;font-size:30px}
+    html[data-platform="android"] h2{flex-wrap:wrap;font-size:19px;line-height:1.3}
+    html[data-platform="android"] .bigbtn{max-width:100%;white-space:normal;line-height:1.35}
+    html[data-platform="android"] .badge{max-width:100%;white-space:normal}
+    html[data-platform="android"] .patchrow{flex-direction:column;align-items:stretch}
+    html[data-platform="android"] .patchrow>div{min-width:0!important;max-width:100%}
+    html[data-platform="android"] .patchrow .customselect{max-width:100%}
+    html[data-platform="android"] .callout{padding:14px;flex-direction:column;gap:10px;align-items:flex-start}
+    html[data-platform="android"] .console{font-size:12px;line-height:1.55;overflow-wrap:break-word;word-break:normal}
+  }
+  .creator-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:14px;margin:16px 0}
+  .creator-grid input{width:100%;min-width:0;box-sizing:border-box}
+  #projectsource{display:block;width:100%;box-sizing:border-box;min-height:300px;resize:vertical;margin:14px 0;padding:12px;border:2px solid var(--ink);border-radius:10px;background:var(--surface-2);color:var(--text);font:14px/1.55 monospace;tab-size:4}
+  #projectcreate summary{cursor:pointer;font-weight:700}
+  #projecteditor .row{margin-top:12px}
+  #projectclose{scroll-margin-bottom:16px}
+  #missionproperties .field{min-width:0}
+  #missionparents label{display:flex;align-items:flex-start;gap:8px;max-width:100%;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -382,8 +469,16 @@
         <input type="text" id="isopath" placeholder="/path/to/Simpsons_Game.iso">
         <button class="bigbtn alt" id="browsebtn">Browse…</button>
         <button class="bigbtn gold" id="installbtn">Extract &amp; install</button>
+        <button class="bigbtn" id="importfolderbtn" data-android-only>Import extracted folder</button>
       </div>
       <p class="muted" id="installstate" style="margin-top:10px"></p>
+      <div class="installprogress hidden" id="installprogress" role="status" aria-live="polite">
+        <div class="row"><b id="installpercent"></b><span class="muted" id="installcounts"></span></div>
+        <progress id="installbar" max="100" aria-label="Installation progress"></progress>
+        <p class="muted" id="installdetail"></p>
+        <p class="muted" data-android-only>You can leave the app while your game installs. Allow notifications to see progress in the background.</p>
+        <button class="smallbtn hidden" id="cancelinstall" style="margin-top:10px">Cancel import</button>
+      </div>
       <div class="console" id="installlog" style="margin-top:10px">–</div>
     </div>
     <div class="card">
@@ -406,6 +501,10 @@
 
   <!-- =========================== SETTINGS =========================== -->
   <section id="tab-settings" class="hidden">
+    <div class="row settings-tools">
+      <button class="smallbtn" id="settingsexpand">Expand all</button>
+      <button class="smallbtn" id="settingscollapse">Collapse all</button>
+    </div>
     <div class="card">
       <h2>Display</h2>
       <div class="grid">
@@ -459,6 +558,7 @@
         <div class="field" style="display:flex; flex-direction:column; gap:14px; justify-content:center">
           <label class="switch"><input type="checkbox" id="s-vsync"> VSync</label>
           <label class="switch"><input type="checkbox" id="s-present_letterbox"> Letterbox non-native aspect ratios</label>
+          <label class="switch"><input type="checkbox" id="s-native_gpu_calls"> GPU API calls (faster renderer)</label>
         </div>
       </div>
       <h3>Quality</h3>
@@ -664,8 +764,8 @@
     </div>
 
     <div class="card">
-      <h2>In-game overlay keys</h2>
-      <p class="muted">The keys that open the game's own overlays, one keyboard key each. They work
+      <h2>In-game shortcut keys</h2>
+      <p class="muted">The keys that open menus and overlays, one keyboard key each. They work
         whether you play with a controller or with keyboard &amp; mouse.</p>
       <table class="ctrltable" id="overlaytable"></table>
     </div>
@@ -690,6 +790,12 @@
           <div class="hint">Shows subtitles from the very first cutscene of a new game, before the
             in-game option can be reached. While on, the in-game subtitle option has no effect.</div>
         </div>
+        <div class="field">
+          <label class="switch"><input type="checkbox" id="s-freeroam_coop"> Two players in Springfield</label>
+          <div class="hint">Join with Start on the second player's controller to explore Springfield
+            in split screen. Assign controllers or keyboard and mouse under Options → Players.
+            Requires restarting the game.</div>
+        </div>
       </div>
     </div>
 
@@ -707,6 +813,16 @@
             <option value="64">Large — most stutter-resistant</option>
           </select>
         </div>
+        <div class="field">
+          <label>Dialogue</label>
+          <select id="s-audio_dialogue_level">
+            <option value="1">As on the Xbox 360</option>
+            <option value="1.4">Clearer voices</option>
+            <option value="2">Loudest voices</option>
+          </select>
+          <div class="hint">How loud voices are on stereo speakers and headphones, against music and
+            effects. Surround systems get the game's own mix. Restart needed.</div>
+        </div>
       </div>
     </div>
 
@@ -722,6 +838,31 @@
           </select>
         </div>
       </div>
+    </div>
+
+    <div class="card" data-android-only>
+      <h2>Controls</h2>
+      <div class="field"><label for="s-touch_scheme">Play with</label>
+        <select id="s-touch_scheme">
+          <option value="simple">Simple touch (recommended)</option>
+          <option value="gamepad">Touch gamepad</option>
+          <option value="off">Controller only (no touch controls)</option>
+        </select></div>
+      <p class="hint" id="touchschemehint"></p>
+      <div class="row" style="margin:12px 0"><button class="bigbtn gold" id="edittouchlayout">Edit control layout</button></div>
+      <p class="hint">Drag, resize, fade or hide individual controls in the landscape editor, or switch schemes there. The gear button in the game opens it too. Layout changes apply when you return to the game.</p>
+      <div class="grid">
+        <div class="field"><label for="s-touch_size">Control size</label><input id="s-touch_size" type="range" min="0.8" max="1.3" step="0.05" value="1"></div>
+        <div class="field"><label for="s-touch_opacity">Control opacity</label><input id="s-touch_opacity" type="range" min="0.2" max="0.85" step="0.05" value="0.5"></div>
+        <div class="field"><label class="switch"><input id="s-floating_stick" type="checkbox" checked> Floating movement stick (touch gamepad)</label></div>
+        <div class="field"><label class="switch"><input id="s-touch_haptics" type="checkbox" checked> Button haptics</label></div>
+        <div class="field"><label class="switch"><input id="s-hide_with_controller" type="checkbox" checked> Hide touch controls with a controller</label></div>
+        <div class="field"><label for="s-touch_deadzone">Stick deadzone</label><input id="s-touch_deadzone" type="range" min="0" max="0.35" step="0.01" value="0.12"></div>
+        <div class="field"><label for="s-touch_camera_sensitivity">Camera sensitivity</label><input id="s-touch_camera_sensitivity" type="range" min="0.5" max="2" step="0.05" value="1"></div>
+        <div class="field"><label class="switch"><input id="s-touch_camera_invert_y" type="checkbox"> Invert camera Y</label></div>
+        <div class="field"><label class="switch"><input id="s-touch_show_editor" type="checkbox" checked> Show the controls (gear) button in game</label></div>
+      </div>
+      <p class="hint">Controls respect screen cutouts and gesture edges. Changes apply the next time you start the game.</p>
     </div>
     <p class="autosave">Changes are saved as you make them. Ones marked "Restart needed" apply the
       next time the game starts.</p>
@@ -742,18 +883,64 @@
       <p class="muted">One-click tweaks applied to your installed copy. Everything is reversible.</p>
       <div id="patchlist"></div>
     </div>
+    <div class="card">
+      <h2>Quick launch level (dev)</h2>
+      <p class="muted">Boot straight into any episode or hub map for testing, skipping the intro logos, title screen, main menu, and opening cutscene.</p>
+      <div class="row" style="gap:12px; align-items:center; flex-wrap:wrap">
+        <div style="min-width:280px; flex:1">
+          <select id="quicklaunchselect">
+            <option value="SPR_HUB">Springfield Hub (spr_hub)</option>
+            <option value="LAND_OF_CHOCOLATE">1. The Land of Chocolate (loc)</option>
+            <option value="BARTMAN_BEGINS">2. Bartman Begins (brt)</option>
+            <option value="EIGHTY_BITES">3. Around the World in 80 Bites (eighty_bites)</option>
+            <option value="TREEHUGGER">4. Lisa the Tree Hugger (tree_hugger)</option>
+            <option value="MOB_RULES">5. Mob Rules (mob_rules)</option>
+            <option value="CHEATER">6. Enter the Cheatrix (cheater)</option>
+            <option value="DOLPHINS">7. The Day of the Dolphins (dayofthedolphins)</option>
+            <option value="COLOSSAL_DONUT">8. Shadow of the Colossal Donut (colossaldonut)</option>
+            <option value="SPRINGFIELD_STOOD_STILL">9. Invasion of the Yokel-Snatchers (dayspringfieldstoodstill)</option>
+            <option value="BARGAIN_BIN">10. Bargain Bin (bargainbin)</option>
+            <option value="GAME_HUB">Game Engine Hub (gamehub)</option>
+            <option value="NEVERQUEST">11. NeverQuest (neverquest)</option>
+            <option value="GRAND_THEFT_SCRATCHY">12. Grand Theft Scratchy (grand_theft_scratchy)</option>
+            <option value="MEDAL_OF_HOMER:MODE_STANDARD:1">13. Medal of Homer — Part 1</option>
+            <option value="MEDAL_OF_HOMER:MODE_STANDARD:2">13. Medal of Homer — Part 2</option>
+            <option value="MEDAL_OF_HOMER:MODE_STANDARD:3">13. Medal of Homer — Part 3</option>
+            <option value="BIG_SUPER">14. Big Super Happy Fun Fun Game (bigsuperhappy)</option>
+            <option value="RHYMES_WITH_COMPLAINING">15. Five Characters in Search of an Author (rhymes)</option>
+            <option value="MEET_THY_PLAYER">16. Game Over / Meet Thy Player (meetthyplayer)</option>
+          </select>
+        </div>
+        <button class="bigbtn gold" id="quicklaunchbtn">Quick Launch Level</button>
+      </div>
+      <p class="muted" id="quicklaunchmsg" style="margin-top:8px"></p>
+    </div>
   </section>
 
   <!-- ============================= MODS ============================= -->
   <section id="tab-mods" class="hidden">
     <div class="card">
-      <div class="lockart">Not yet available</div>
-      <h2 style="justify-content:center">Mods — coming soon</h2>
-      <p class="muted" style="text-align:center">
-        A mod loader (texture packs, model swaps, gameplay tweaks) is planned.<br>
-        Drop files into <code>launcher/mods/</code> — they'll be listed here, ready for the loader.
-      </p>
+      <h2>Mods</h2>
+      <p class="muted">Install a mod package, enable it, then start the game. Close the game before
+        changing mods. Settings pages appear in the game's Options → Extras → Mods.</p>
+      <button class="bigbtn gold" id="modinstallbtn">Install mod from ZIP</button>
+      <div class="field" style="margin-top:14px">
+        <label for="s-mods_language">Mod text language</label>
+        <input id="s-mods_language" type="text" maxlength="35" placeholder="Follow game language" autocomplete="off" spellcheck="false">
+        <p class="muted">Language code for mod menus and dialogue, such as fr or pt-BR. Leave blank to follow the game. Changes apply next launch. Game text replacement packs use the base language named by their creator.</p>
+      </div>
+      <p class="muted" id="modstatus" aria-live="polite"></p>
+      <div id="modprogress" class="hidden">
+        <progress id="modbar" max="100" style="width:100%"></progress>
+        <p class="muted" id="moddetail"></p>
+        <button class="smallbtn" id="cancelmodinstall">Cancel import</button>
+      </div>
       <table id="modtable" style="margin-top:14px"></table>
+    </div>
+    <div class="card" id="openmodkitcard">
+      <h2>Modkit</h2>
+      <p class="muted">Create and edit projects in the separate desktop Modkit application included with this package.</p>
+      <button class="bigbtn gold" id="openmodkit">Open Modkit</button>
     </div>
   </section>
 
@@ -898,16 +1085,27 @@
 </div>
 
 <script>
+const IS_ANDROID = typeof window.AndroidLauncher !== "undefined";
+const TOUCH_SCHEME_HINTS = {
+  simple: "Put your thumb anywhere on the left to move and swipe on the right to look around. Jump, Attack, Power, Use and Lock are named buttons on the right; the shoulder buttons sit small along the top.",
+  gamepad: "Both sticks, the directional pad and every button of an Xbox controller, for players who know the controller layout.",
+  off: "No touch controls: play with a Bluetooth or USB controller. Choose a touch scheme again here to bring them back.",
+};
+function updateTouchSchemeHint() {
+  const hint = document.getElementById("touchschemehint");
+  const scheme = document.getElementById("s-touch_scheme");
+  if (hint && scheme) hint.textContent = TOUCH_SCHEME_HINTS[scheme.value] || "";
+}
 const TOKEN = "__TOKEN__";
 const $ = s => document.querySelector(s);
 const api = {
-  get: p => fetch(p, {headers:{"X-Token":TOKEN}}).then(r => r.json()),
-  post: (p, body) => fetch(p, {method:"POST", headers:{"X-Token":TOKEN,"Content-Type":"application/json"},
+  get: p => IS_ANDROID ? Promise.resolve().then(() => JSON.parse(AndroidLauncher.request("GET", p, "{}"))) : fetch(p, {headers:{"X-Token":TOKEN}}).then(r => r.json()),
+  post: (p, body) => IS_ANDROID ? Promise.resolve().then(() => JSON.parse(AndroidLauncher.request("POST", p, JSON.stringify(body || {})))) : fetch(p, {method:"POST", headers:{"X-Token":TOKEN,"Content-Type":"application/json"},
                               body: JSON.stringify(body||{})}).then(r => r.json()),
 };
 
 /* theme */
-let themePref = "__THEME__";
+let themePref = IS_ANDROID ? AndroidLauncher.theme() : "__THEME__";
 {
   const forced = /[?&]theme=(light|dark)/.exec(location.search);
   if (forced) themePref = forced[1];
@@ -952,20 +1150,31 @@ function enhanceSelects(){
     const trigger = document.createElement("button");
     trigger.type = "button";
     trigger.className = "customselect-trigger";
-    trigger.innerHTML = '<span class="label"></span><span class="arrow">▼</span>';
+    trigger.setAttribute("role", "combobox");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.setAttribute("aria-haspopup", "listbox");
+    trigger.innerHTML = '<span class="label"></span><span class="arrow" aria-hidden="true">▼</span>';
+    trigger.querySelector(".label").id = sel.id + "-value";
     wrap.appendChild(trigger);
 
     const panel = document.createElement("div");
     panel.className = "customselect-panel";
+    panel.id = sel.id + "-options";
+    panel.setAttribute("role", "listbox");
+    trigger.setAttribute("aria-controls", panel.id);
+    const label = document.querySelector('label[for="' + sel.id + '"]');
+    if (label) { label.id = label.id || sel.id + "-label"; trigger.setAttribute("aria-labelledby", label.id + " " + sel.id + "-value"); }
     wrap.appendChild(panel);
 
     const closeAll = () => document.querySelectorAll(".customselect.open")
-      .forEach(w => w.classList.remove("open"));
+      .forEach(w => { w.classList.remove("open"); w.querySelector(".customselect-trigger").setAttribute("aria-expanded", "false"); });
 
     const rebuildPanel = () => {
       panel.innerHTML = "";
       [...sel.options].forEach(opt => {
-        const row = document.createElement("div");
+        const row = document.createElement("button");
+        row.type = "button"; row.tabIndex = -1; row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", String(opt.value === sel.value)); row.disabled = opt.disabled;
         row.className = "customselect-option" + (opt.value === sel.value ? " sel" : "");
         row.textContent = opt.textContent;
         row.onclick = () => {
@@ -973,7 +1182,21 @@ function enhanceSelects(){
           sel.dispatchEvent(new Event("change", {bubbles:true}));
           syncSelectLabel(sel);
           closeAll();
+          trigger.focus();
         };
+        row.addEventListener("keydown", event => {
+          const choices = [...panel.querySelectorAll("button:not(:disabled)")], index = choices.indexOf(row);
+          if (["ArrowDown","ArrowUp","Home","End"].includes(event.key)) {
+            event.preventDefault();
+            const next = event.key === "Home" ? 0 : event.key === "End" ? choices.length - 1 :
+              (index + (event.key === "ArrowDown" ? 1 : -1) + choices.length) % choices.length;
+            choices[next].focus();
+          } else if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault(); row.click();
+          } else if (event.key === "Escape") {
+            event.preventDefault(); event.stopPropagation(); closeAll(); trigger.focus();
+          } else if (event.key === "Tab") closeAll();
+        });
         panel.appendChild(row);
       });
     };
@@ -982,17 +1205,26 @@ function enhanceSelects(){
       const isOpen = wrap.classList.contains("open");
       closeAll();
       if (!isOpen) { rebuildPanel(); wrap.classList.add("open"); }
+      trigger.setAttribute("aria-expanded", String(!isOpen));
     };
+    trigger.addEventListener("keydown", event => {
+      if (!["ArrowDown","ArrowUp","Home","End"].includes(event.key)) return;
+      event.preventDefault(); closeAll(); rebuildPanel(); wrap.classList.add("open"); trigger.setAttribute("aria-expanded", "true");
+      const choices = [...panel.querySelectorAll("button:not(:disabled)")];
+      const selected = panel.querySelector('[aria-selected="true"]:not(:disabled)');
+      const row = event.key === "End" ? choices[choices.length - 1] : event.key === "Home" ? choices[0] : selected || choices[0];
+      if (row) row.focus();
+    });
 
     syncSelectLabel(sel);
   });
   document.addEventListener("click", e => {
     if (!e.target.closest(".customselect")) document.querySelectorAll(".customselect.open")
-      .forEach(w => w.classList.remove("open"));
+      .forEach(w => { w.classList.remove("open"); w.querySelector(".customselect-trigger").setAttribute("aria-expanded", "false"); });
   });
   document.addEventListener("keydown", e => {
     if (e.key === "Escape") document.querySelectorAll(".customselect.open")
-      .forEach(w => w.classList.remove("open"));
+      .forEach(w => { w.classList.remove("open"); w.querySelector(".customselect-trigger").setAttribute("aria-expanded", "false"); });
   });
 }
 function syncSelectLabel(sel){
@@ -1051,13 +1283,37 @@ setInterval(() => {
   setTimeout(() => { img.src = "/art/" + artList[artIdx] + "?v=" + artVersion; img.style.opacity = 1; }, 500);
 }, 15000);
 
+/* Android hosts this same launcher locally and handles device actions natively. */
+if (IS_ANDROID) {
+  const hide = el => { if (el) el.dataset.desktopOnly = ""; };
+  for (const id of ["steambtn", "steammsg", "stopbtn", "isopath", "browsebtn"]) hide($("#" + id));
+  // The native mod runtime and package manager are shared with Android.
+  for (const id of ["capturebtn"]) hide($("#" + id).closest(".card"));
+  $("#regenart").closest(".row").querySelector("p").textContent = "The pictures on the Play tab are frames from the cutscenes of your installed copy, made on this device.";
+  for (const id of ["s-fullscreen", "s-resolution", "s-vulkan_device"]) hide($("#" + id).closest(".field"));
+  hide($("#s-mnk_mode").closest(".card"));
+  hide($("#ctrlresetall").closest(".card"));
+  hide($("#overlaytable").closest(".card"));
+  $("#s-resolution_scale option[value='1']").textContent = "1× — 720p (recommended on phones)";
+  $("#s-swap_post_effect option[value='fxaa']").textContent = "FXAA — smooth edges";
+  $("#s-swap_post_effect").closest(".field").querySelector(".hint").textContent = "Smooths jagged edges at the render resolution. Higher strength can soften text; higher render scales already smooth edges and need more GPU power. Restart needed.";
+  $("#s-native_rt_original_resolution_targets").closest(".field").querySelector(".hint").textContent = "Original-resolution shadows use less GPU memory and work at 2× and 3×. No effect at 1×. Restart needed.";
+  $("#s-gpu").innerHTML = '<option value="vulkan">Vulkan (Android)</option>';
+  $("#installbtn").textContent = "Choose game ISO";
+  $("#tab-install .callout div").innerHTML = 'Choose your own <b>The Simpsons Game (Xbox 360) ISO</b>; the app extracts and installs it on this device. Already extracted? Import the game folder or its parent instead. Your saves and settings are kept separately.';
+  $("#tab-install .card h2").textContent = "Install your game";
+  $("#tab-about h3").nextElementSibling.innerHTML = '• <b>Android ARM64</b> — development build. Vulkan rendering and touch controls; phone validation is still in progress.<br>• <b>Windows / Linux</b> — desktop builds are available separately.';
+}
+
 /* status polling */
 let lastStatus = null;
 let lastPatchSig = "";  /* last patch list drawn by refresh() */
 async function refresh(){
   try{
     const st = await api.get("/api/status");
+    const gameEnded = lastStatus && lastStatus.running && !st.running;
     lastStatus = st;
+    if (gameEnded && settingsLoaded && !savePending && !savingSettings) loadSettings().catch(() => {});
     renderCapture(st.capture_armed);
     artList = st.art || [];
     artVersion = st.art_version || 0;
@@ -1082,13 +1338,15 @@ async function refresh(){
       regenBtn.textContent = st.art_running ? "Generating…" : "Regenerate";
     }
     const ready = st.engine_ready && st.gamedata_ready;
-    $("#playbtn").disabled = !ready || st.running;
+    $("#playbtn").disabled = !ready || st.running || (IS_ANDROID && st.install.running);
     $("#playbtn").textContent = st.running ? "Running…" : "Play";
     $("#stopbtn").classList.toggle("hidden", !st.running);
     $("#playstatus").textContent = st.running ? "Game is running — have fun in Springfield!" :
+      st.preparing ? st.install.message || "Preparing the game…" :
+      IS_ANDROID && st.install.running ? st.install.message || "Importing your game…" :
       ready ? `Ready to play · engine build ${st.engine_date} · launcher v${st.version}` :
       !st.engine_ready ? "Engine binary missing — build the project first" :
-      "Game data not installed — open the Install tab and use your ISO";
+      IS_ANDROID ? "Open the Install tab and choose your game ISO or folder" : "Game data not installed — open the Install tab and use your ISO";
     $("#platformbadges").innerHTML = st.platforms.map(p =>
       `<span class="badge ${p.state}"><span class="dot"></span>${p.name} — ${p.state}</span>`).join("");
     $("#verlabel").textContent = "v" + st.version;
@@ -1115,19 +1373,39 @@ async function refresh(){
       if (iStuck) ilog.scrollTop = 1e9;
     }
     $("#installbtn").disabled = inst.running;
+    $("#importfolderbtn").disabled = inst.running;
     $("#installstate").innerHTML = inst.running ? "Working…" :
       inst.ok === true ? '<span class="ok">Installed successfully.</span>' :
       inst.ok === false ? '<span class="err">Install failed — see log below.</span>' :
-      st.gamedata_ready ? "Game data is installed. You can re-install over it from another ISO." :
+      st.gamedata_ready ? (IS_ANDROID ? "Game files are imported. Import another folder to replace them; saves are kept." : "Game data is installed. You can re-install over it from another ISO.") :
       "No game data found yet.";
+    if (IS_ANDROID && inst.running) $("#installstate").textContent = inst.message || "Preparing the import…";
+    const hasProgress = IS_ANDROID && (inst.running || inst.ok === true);
+    $("#installprogress").classList.toggle("hidden", !hasProgress);
+    if (hasProgress) {
+      const percent = Number.isFinite(inst.percent) && inst.percent >= 0 ? inst.percent : null;
+      if (percent === null) $("#installbar").removeAttribute("value");
+      else $("#installbar").value = percent;
+      $("#installpercent").textContent = percent === null ? "Scanning folders…" : percent + "%";
+      $("#installcounts").textContent = inst.total_files ? `${inst.files || 0} / ${inst.total_files} files` : "";
+      const bytes = n => n >= 1024 ** 3 ? (n / 1024 ** 3).toFixed(2) + " GB" : (n / 1024 ** 2).toFixed(1) + " MB";
+      const parts = [];
+      if (inst.bytes != null && inst.total_bytes >= 0) parts.push(`${bytes(inst.bytes)} / ${bytes(inst.total_bytes)} · ${bytes(Math.max(0, inst.total_bytes - inst.bytes))} left`);
+      else if (inst.bytes) parts.push(`${bytes(inst.bytes)} copied · source does not report file sizes`);
+      if (Number.isFinite(inst.remaining_seconds)) {
+        const seconds = Math.max(1, inst.remaining_seconds);
+        parts.push(seconds >= 60 ? `about ${Math.ceil(seconds / 60)} min left` : `about ${seconds} sec left`);
+      }
+      $("#installdetail").textContent = parts.join(" · ");
+    }
+    $("#cancelinstall").classList.toggle("hidden", !IS_ANDROID || !inst.running || inst.phase === "preparing" || inst.phase === "finishing");
     /* backups */
     $("#backuptable").innerHTML = (st.backups||[]).map(b =>
       `<tr><td>${b.name}</td><td>${b.date}</td><td>${b.size_kb} KB</td>
        <td><button class="smallbtn" onclick="restoreSave('${b.name}')">Restore</button></td></tr>`).join("") ||
       "<tr><td class='muted'>No backups yet.</td></tr>";
     /* mods */
-    $("#modtable").innerHTML = (st.mods||[]).map(m => `<tr><td>${m}</td><td class="muted">waiting for mod loader</td></tr>`).join("") ||
-      "<tr><td class='muted'>No mod files found.</td></tr>";
+    renderMods(st);
     /* patches (redrawn only when they change: a redraw would close an open dropdown) */
     const patchSig = JSON.stringify(st.patches||[]);
     if (patchSig !== lastPatchSig) {
@@ -1148,11 +1426,25 @@ async function refresh(){
     }
   }catch(e){ $("#playstatus").textContent = "launcher backend unreachable"; }
 }
-setInterval(refresh, 2000); refresh();
+setInterval(() => { if (document.visibilityState === "visible") refresh(); }, IS_ANDROID ? 750 : 2000); refresh();
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh(); });
+$("#cancelinstall").onclick = () => api.post("/api/cancel-install").then(r => {
+  if (!r.ok) showToast(r.msg || "Could not cancel the import.");
+  refresh();
+});
+$("#cancelmodinstall").onclick = $("#cancelinstall").onclick;
+$("#importfolderbtn").onclick = () => api.post("/api/import-folder").then(r => {
+  if (!r.ok) showToast(r.msg || "Could not open the game folder picker.");
+  refresh();
+});
 
 /* input banner reflects mnk setting */
 function updateBanner(mnk){
   const b = $("#inputbanner"), t = $("#inputbannertext");
+  if (IS_ANDROID) {
+    t.innerHTML = "Use the <u>touch gamepad</u> or connect a controller. Adjust sticks, button size and opacity in Settings → Touch controls.";
+    return;
+  }
   if (mnk){
     b.classList.add("kbm");
     t.innerHTML = "Playing with <u>keyboard &amp; mouse</u> — press F1 in the game to see the controls. A controller also works.";
@@ -1225,23 +1517,45 @@ $("#copylogbtn").onclick = async () => {
 /* play / stop / steam */
 $("#playbtn").onclick = async () => {
   // A setting changed a moment ago is written before the game reads it.
-  await flushSettings();
+  if (!await flushSettings()) return;
   api.post("/api/launch").then(r => {
     $("#playstatus").textContent = r.ok ? "" : ("Launch failed: " + (r.msg || r.error || "unknown error"));
     refresh();
   }).catch(e => { $("#playstatus").textContent = "Launch request failed: " + e; });
+};
+$("#quicklaunchbtn").onclick = async () => {
+  if (!await flushSettings()) return;
+  const target = $("#quicklaunchselect").value;
+  $("#quicklaunchmsg").textContent = "Quick-launching " + target + "…";
+  api.post("/api/launch", {quick_launch: target}).then(r => {
+    $("#quicklaunchmsg").textContent = r.ok ? ("Launched " + target + "!") : ("Launch failed: " + (r.msg || r.error || "unknown error"));
+    refresh();
+  }).catch(e => { $("#quicklaunchmsg").textContent = "Launch request failed: " + e; });
 };
 $("#stopbtn").onclick = () => api.post("/api/stop").then(r => {
   if (!r.ok) $("#playstatus").textContent = "Stop failed: " + (r.msg || r.error || "unknown error");
   refresh();
 }).catch(e => { $("#playstatus").textContent = "Stop request failed: " + e; });
 $("#steambtn").onclick = async () => {
-  const r = await api.post("/api/add-to-steam");
-  $("#steammsg").textContent = r.msg;
+  const button = $("#steambtn");
+  button.disabled = true;
+  $("#steammsg").textContent = "Adding the launcher to Steam…";
+  try {
+    const r = await api.post("/api/add-to-steam");
+    $("#steammsg").textContent = r.msg || r.error || "Steam did not return a result.";
+  } catch (e) {
+    $("#steammsg").textContent = "Could not contact the launcher: " + e;
+  } finally {
+    button.disabled = false;
+  }
 };
 
 /* install + browse modal */
 $("#installbtn").onclick = () => {
+  if (IS_ANDROID) {
+    api.post("/api/install").then(r => { if (!r.ok) showToast(r.msg || "Could not open the game folder picker."); refresh(); });
+    return;
+  }
   const iso = $("#isopath").value.trim();
   if (!iso) { alert("Choose your ISO file first (Browse…)."); return; }
   api.post("/api/install", {iso_path: iso}).then(refresh);
@@ -1252,15 +1566,26 @@ $("#regenart").onclick = () => {
   b.textContent = "Generating…";
   api.post("/api/regen-art").then(refresh);
 };
+let browseKind = "iso";
 function closeBrowse(){ $("#browsemodal").classList.add("hidden"); }
-$("#browsebtn").onclick = () => { $("#browsemodal").classList.remove("hidden"); loadBrowse("").catch(closeBrowse); };
+$("#browsebtn").onclick = () => { browseKind = "iso"; $("#browsemodal").classList.remove("hidden"); loadBrowse("").catch(closeBrowse); };
+$("#modinstallbtn").onclick = async () => {
+  if (IS_ANDROID) {
+    const r = await api.post("/api/mods", {action:"install"});
+    if (!r.ok) showToast(r.msg || "Could not open the mod picker.");
+  } else {
+    browseKind = "mod";
+    $("#browsemodal").classList.remove("hidden");
+    loadBrowse("").catch(closeBrowse);
+  }
+};
 $("#browseclose").addEventListener("click", closeBrowse);
 $("#browsemodal").addEventListener("click", e => { if (e.target === $("#browsemodal")) closeBrowse(); });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape"){ closeBrowse(); $("#updatemodal").classList.add("hidden"); }
 });
 async function loadBrowse(path){
-  const d = await api.get("/api/browse?path=" + encodeURIComponent(path));
+  const d = await api.get("/api/browse?path=" + encodeURIComponent(path) + "&kind=" + browseKind);
   $("#browsepath").textContent = d.path || "Choose a starting location";
   const list = $("#browselist");
   list.textContent = "";
@@ -1275,14 +1600,85 @@ async function loadBrowse(path){
   if (d.up !== null && d.path) addEntry("..", "", () => loadBrowse(d.up));
   for (const e of d.entries){
     if (e.dir) addEntry(e.name, "", () => loadBrowse(e.path));
-    else addEntry(e.name, e.size_mb + " MB", () => pickIso(e.path));
+    else addEntry(e.name, e.size_mb + " MB", () => browseKind === "mod" ? installMod(e.path) : pickIso(e.path));
   }
   if (!d.entries.length && !(d.up !== null && d.path)){
     const div = document.createElement("div"); div.className = "entry muted";
-    div.textContent = "No folders or ISO files here."; list.appendChild(div);
+    div.textContent = browseKind === "mod" ? "No folders or ZIP packages here." : "No folders or ISO files here."; list.appendChild(div);
   }
 }
 function pickIso(p){ $("#isopath").value = p; closeBrowse(); }
+
+let lastModSignature = "";
+$("#openmodkitcard").classList.toggle("hidden", IS_ANDROID);
+$("#openmodkit").onclick = async () => {
+  const result = await api.post("/api/open-modkit", {});
+  $("#modstatus").textContent = result.msg || "Could not open Modkit.";
+};
+async function changeMod(body){
+  const r = await api.post("/api/mods", body);
+  $("#modstatus").textContent = r.msg || (r.ok ? "Mods updated." : "Could not update mods.");
+  if (r.conflicts && r.conflicts.length) {
+    $("#modstatus").textContent += " " + r.conflicts.map(c => `${c.winner} takes priority for ${c.path}.`).join(" ");
+  }
+  lastModSignature = "";
+  await refresh();
+}
+async function installMod(path){ closeBrowse(); await changeMod({action:"install",path}); }
+function renderMods(st){
+  const importing = IS_ANDROID && st.install && st.install.target === "mod";
+  const busy = importing && st.install.running;
+  const changing = !!st.running || !!(st.install && st.install.running);
+  $("#s-mods_language").disabled = changing;
+  $("#modprogress").classList.toggle("hidden", !busy);
+  $("#modinstallbtn").disabled = !!st.running || !!(st.install && st.install.running);
+  if (importing) {
+    const inst = st.install;
+    $("#modstatus").textContent = inst.message || (busy ? "Importing mod…" : inst.ok ? "Mod installed. Enable it when you are ready." : "Mod import stopped.");
+    if (Number.isFinite(inst.percent) && inst.percent >= 0) $("#modbar").value = inst.percent;
+    else $("#modbar").removeAttribute("value");
+    const amount = n => (n / 1024 ** 2).toFixed(1) + " MB";
+    const counts = inst.total_bytes > 0 ? `${amount(inst.bytes || 0)} / ${amount(inst.total_bytes)}` : `${inst.files || 0} files`;
+    $("#moddetail").textContent = (inst.percent >= 0 ? inst.percent + "% · " : "") + counts;
+    $("#cancelmodinstall").disabled = inst.phase === "finishing";
+  }
+  const signature = JSON.stringify([st.mods,st.modkit_ready,st.running,changing]);
+  if (signature === lastModSignature) return;
+  lastModSignature = signature;
+  const table = $("#modtable"); table.textContent = "";
+  const mods = (st.mods || []).slice().sort((a,b) => {
+    const ap = a.requested ? a.priority : 100000, bp = b.requested ? b.priority : 100000;
+    return ap - bp || String(a.name).localeCompare(String(b.name));
+  });
+  const selected = mods.filter(m => m.requested).map(m => m.id);
+  for (const mod of mods) {
+    const row = document.createElement("tr"), info = document.createElement("td"), controls = document.createElement("td");
+    const name = document.createElement("b"); name.textContent = mod.name; info.appendChild(name);
+    const detail = document.createElement("div"); detail.className = "muted";
+    detail.textContent = mod.error || [mod.version, mod.author ? `by ${mod.author}` : "", mod.description].filter(Boolean).join(" · ");
+    info.appendChild(detail);
+    if (mod.id) {
+      const toggle = document.createElement("button"); toggle.className = "smallbtn";
+      toggle.textContent = mod.enabled ? (mod.requested ? "Disable" : "Required") : "Enable";
+      toggle.disabled = changing || (!mod.requested && mod.enabled) || (!mod.enabled && !st.modkit_ready);
+      toggle.onclick = () => changeMod({action:"enable",id:mod.id,enabled:!mod.enabled}); controls.appendChild(toggle);
+      if (mod.requested) for (const delta of [-1,1]) {
+        const button = document.createElement("button"); button.className = "smallbtn";
+        button.textContent = delta < 0 ? "↑" : "↓"; button.setAttribute("aria-label", delta < 0 ? "Higher priority" : "Lower priority");
+        const index = selected.indexOf(mod.id), next = index + delta;
+        button.disabled = changing || next < 0 || next >= selected.length;
+        button.onclick = () => {const order=selected.slice(); [order[index],order[next]]=[order[next],order[index]]; changeMod({action:"order",enabled:order});};
+        controls.appendChild(button);
+      }
+    }
+    row.append(info,controls); table.appendChild(row);
+  }
+  if (!mods.length) {
+    const row = table.insertRow(), cell = row.insertCell(); cell.className = "muted";
+    cell.textContent = "No mods installed.";
+  }
+  if (!st.modkit_ready && !st.running) $("#modstatus").textContent = "Install a game build with Modkit support to enable mods.";
+}
 
 /* saves */
 $("#backupbtn").onclick = async () => {
@@ -1322,7 +1718,8 @@ async function refreshDiag(){
   const d = await api.get("/api/diagnostics").catch(()=>null);
   if (!d) return;
   $("#diagtoggle").checked = d.enabled;
-  $("#diagstate").innerHTML = d.enabled
+  if (IS_ANDROID) $("#diagtoggle").closest("label").dataset.desktopOnly = "";
+  $("#diagstate").innerHTML = IS_ANDROID ? "Game logs are stored on this device. Create a support bundle after reproducing a rendering or audio problem." : d.enabled
     ? 'Diagnostic logging is <b class="ok">ON</b> — every Play session records the game\'s ' +
       'output plus CPU, RAM and GPU samples every 2 seconds. The overhead is negligible, ' +
       'so it\'s fine to leave on.'
@@ -1398,10 +1795,15 @@ function maybePromptUpdate(u, currentVersion){
   }
   if (u.update_available && !u.applying && !updatePromptShown){
     updatePromptShown = true;
-    $("#updatemodaltext").innerHTML =
-      `A new version of the launcher &amp; game engine is out: <b>${u.latest_tag}</b> ` +
-      `(you're on <b>v${currentVersion}</b>).<br><br>Updating takes a minute and doesn't ` +
-      `touch your saves, settings or installed game data. Update now?`;
+    /* An updater from before 0.0.7.0 leaves out the files added since. */
+    $("#updatemodaltext").innerHTML = u.repair
+      ? `The update to <b>v${currentVersion}</b> is not finished: the previous launcher could ` +
+        `not install the files this version added, so mods and the Modkit are unavailable.` +
+        `<br><br>Finishing downloads the release once more and doesn't touch your saves, ` +
+        `settings or installed game data. Finish now?`
+      : `A new version of the launcher &amp; game engine is out: <b>${u.latest_tag}</b> ` +
+        `(you're on <b>v${currentVersion}</b>).<br><br>Updating takes a minute and doesn't ` +
+        `touch your saves, settings or installed game data. Update now?`;
     $("#updatenowbtn").disabled = false;
     $("#updatemodalprogress").textContent = "";
     modal.classList.remove("hidden");
@@ -1461,6 +1863,7 @@ const CONTROLS = [
 ];
 const OVERLAY_KEYS = [
   ["bind_controls", "Keyboard & mouse controls list"],
+  ["bind_debug_menu", "Debug menu (controller: RB + Left)"],
   ["bind_settings", "Settings, keys can be changed there too"],
   ["bind_debug_overlay", "FPS & debug overlay"],
   ["bind_console", "Console"],
@@ -1574,7 +1977,8 @@ $("#ctrlresetall").onclick = () => {
 
 /* settings: every change is saved straight away (a Save button at the bottom
    of the page was easy to miss, and changes were lost without it - #34) */
-let settingsLoaded = false, saveTimer = null, savePending = false;
+let settingsLoaded = false, saveTimer = null, savePending = false, savingSettings = null;
+let settingsBaseline = {}, settingsRevision = 0, settingsLoadGeneration = 0;
 function updateSharpnessField(){
   $("#fsrsharpfield").classList.toggle("hidden", $("#s-present_effect").value !== "fsr");
 }
@@ -1585,8 +1989,68 @@ const COLOR_PRESETS = {
   punchy: {color_vibrance: 0.5, color_saturation: 1.15, color_contrast: 1.1, color_brightness: 0},
   soft: {color_vibrance: -0.1, color_saturation: 0.95, color_contrast: 0.95, color_brightness: 0.02},
 };
+// Settings: every card, and every subsection inside a card, folds away under
+// its heading (click, Enter or Space). Folded by default; what was opened is
+// remembered in this browser.
+function makeSettingsCollapsible(){
+  const tab = document.getElementById("tab-settings");
+  if (!tab) return;
+  let state = {};
+  try { state = JSON.parse(localStorage.getItem("settingsCollapsed") || "{}") || {}; } catch (e) { state = {}; }
+  if (typeof state !== "object" || Array.isArray(state)) state = {};
+  const save = () => { try { localStorage.setItem("settingsCollapsed", JSON.stringify(state)); } catch (e) {} };
+  const holders = [];
+  const foldable = (holder, heading, key) => {
+    heading.setAttribute("role", "button");
+    heading.tabIndex = 0;
+    const set = collapsed => {
+      holder.classList.toggle("collapsed", collapsed);
+      heading.setAttribute("aria-expanded", String(!collapsed));
+      state[key] = collapsed;
+    };
+    set(state[key] !== false);
+    const toggle = () => { set(!holder.classList.contains("collapsed")); save(); };
+    heading.addEventListener("click", toggle);
+    heading.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
+    });
+    holders.push(set);
+  };
+  tab.querySelectorAll(":scope > .card").forEach(card => {
+    const h2 = card.querySelector(":scope > h2");
+    if (!h2) return;
+    const body = document.createElement("div");
+    body.className = "collapse-body";
+    while (h2.nextSibling) body.appendChild(h2.nextSibling);
+    card.appendChild(body);
+    card.classList.add("collapsible");
+    foldable(card, h2, "card:" + h2.textContent.trim());
+    let subBody = null;
+    for (const el of [...body.children]) {
+      if (el.tagName === "H3") {
+        const sub = document.createElement("div");
+        sub.className = "subsection";
+        subBody = document.createElement("div");
+        subBody.className = "collapse-body";
+        el.before(sub);
+        sub.appendChild(el);
+        sub.appendChild(subBody);
+        foldable(sub, el, "sub:" + el.textContent.trim());
+      } else if (subBody) {
+        subBody.appendChild(el);
+      }
+    }
+  });
+  const all = collapsed => { holders.forEach(set => set(collapsed)); save(); };
+  document.getElementById("settingsexpand").addEventListener("click", () => all(false));
+  document.getElementById("settingscollapse").addEventListener("click", () => all(true));
+}
+makeSettingsCollapsible();
+
 async function loadSettings(){
+  const generation = ++settingsLoadGeneration, revision = settingsRevision;
   const s = await api.get("/api/settings"); const v = s.values;
+  if (generation !== settingsLoadGeneration || revision !== settingsRevision || savePending || savingSettings) return;
   $("#s-fullscreen").value = String(v.fullscreen);
   $("#s-resolution").value = v.resolution || "";
   $("#s-gpu").value = v.gpu || "";
@@ -1594,6 +2058,7 @@ async function loadSettings(){
   $("#s-vulkan_device").value = v.vulkan_device || "";
   $("#s-vsync").checked = v.vsync;
   $("#s-present_letterbox").checked = v.present_letterbox;
+  $("#s-native_gpu_calls").checked = v.native_gpu_calls !== false;
   $("#s-resolution_scale").value = String(v.resolution_scale);
   $("#s-native_rt_original_resolution_targets").value =
       v.native_rt_original_resolution_targets || "";
@@ -1632,15 +2097,32 @@ async function loadSettings(){
   for (const [key] of CONTROLS.concat(OVERLAY_KEYS)) { binds[key] = v[key] ?? ""; bindDefaults[key] = (s.defaults || {})[key] ?? ""; }
   renderControls();
   $("#s-user_language").value = String(v.user_language);
+  $("#s-mods_language").value = v.mods_language || "";
   $("#s-subtitles").checked = !!v.subtitles;
+  $("#s-freeroam_coop").checked = v.freeroam_coop !== false;
   $("#s-audio_mute").checked = v.audio_mute;
   $("#s-audio_maxqframes").value = String(v.audio_maxqframes);
+  $("#s-audio_dialogue_level").value =
+      ["1", "1.4", "2"].includes(String(v.audio_dialogue_level)) ? String(v.audio_dialogue_level) : "1";
   updateBanner(v.mnk_mode);
   updateSharpnessField();
   syncAllSelectLabels();
+  if (IS_ANDROID) {
+    for (const key of ["touch_size", "touch_opacity", "touch_deadzone", "touch_camera_sensitivity"]) $(`#s-${key}`).value = v[key];
+    for (const key of ["floating_stick", "touch_haptics", "hide_with_controller", "touch_camera_invert_y", "touch_show_editor"]) $(`#s-${key}`).checked = !!v[key];
+    $("#s-touch_scheme").value = ["simple", "gamepad", "off"].includes(v.touch_scheme) ? v.touch_scheme : "simple";
+    updateTouchSchemeHint();
+  }
+  settingsBaseline = settingsValues();
   settingsLoaded = true;
 }
 loadSettings();
+window.addEventListener("focus", () => {
+  if (settingsLoaded && !savePending && !savingSettings) loadSettings().catch(() => {});
+});
+document.querySelector('nav button[data-tab="settings"]').addEventListener("click", () => {
+  if (settingsLoaded && !savePending && !savingSettings) loadSettings().catch(() => {});
+});
 function settingsValues(){
   return {
     fullscreen: $("#s-fullscreen").value === "true",
@@ -1650,6 +2132,7 @@ function settingsValues(){
     vulkan_device: $("#s-vulkan_device").value,
     vsync: $("#s-vsync").checked,
     present_letterbox: $("#s-present_letterbox").checked,
+    native_gpu_calls: $("#s-native_gpu_calls").checked,
     resolution_scale: Number($("#s-resolution_scale").value),
     native_rt_original_resolution_targets: $("#s-native_rt_original_resolution_targets").value,
     swap_post_effect: $("#s-swap_post_effect").value,
@@ -1669,39 +2152,79 @@ function settingsValues(){
     mnk_invert_y: $("#s-mnk_invert_y").checked,
     ...binds,
     user_language: Number($("#s-user_language").value),
+    mods_language: $("#s-mods_language").value.trim(),
     subtitles: $("#s-subtitles").checked,
+    freeroam_coop: $("#s-freeroam_coop").checked,
     audio_mute: $("#s-audio_mute").checked,
     audio_maxqframes: Number($("#s-audio_maxqframes").value),
+    audio_dialogue_level: Number($("#s-audio_dialogue_level").value),
+    ...(IS_ANDROID ? {
+      touch_size: Number($("#s-touch_size").value),
+      touch_opacity: Number($("#s-touch_opacity").value),
+      touch_deadzone: Number($("#s-touch_deadzone").value),
+      touch_camera_sensitivity: Number($("#s-touch_camera_sensitivity").value),
+      touch_camera_invert_y: $("#s-touch_camera_invert_y").checked,
+      touch_show_editor: $("#s-touch_show_editor").checked,
+      touch_scheme: $("#s-touch_scheme").value,
+      floating_stick: $("#s-floating_stick").checked,
+      touch_haptics: $("#s-touch_haptics").checked,
+      hide_with_controller: $("#s-hide_with_controller").checked,
+    } : {}),
   };
 }
 async function saveSettings(){
-  savePending = false;
-  try {
-    const values = settingsValues();
-    await api.post("/api/settings", {values});
-    savedInkColor = values.ink_outline_color;
-    updateBanner($("#s-mnk_mode").checked);
-    showToast(lastStatus && lastStatus.running ? "Saved — restart the game to apply" : "Saved");
-  } catch (e) {
-    showToast("Couldn't save settings");
+  if (savingSettings) {
+    const ok = await savingSettings;
+    return ok && savePending ? saveSettings() : ok;
   }
+  savePending = false;
+  savingSettings = (async () => {
+    try {
+      // Save only what changed here, so an open launcher cannot overwrite
+      // settings the player has just changed in the game's Options menu.
+      const current = settingsValues();
+      const values = Object.fromEntries(Object.entries(current).filter(
+        ([key, value]) => value !== settingsBaseline[key]));
+      if (!Object.keys(values).length) return true;
+      const result = await api.post("/api/settings", {values});
+      if (result && result.ok === false) throw new Error(result.msg || "Couldn't save settings");
+      Object.assign(settingsBaseline, values);
+      if ("ink_outline_color" in values) savedInkColor = values.ink_outline_color;
+      updateBanner($("#s-mnk_mode").checked);
+      showToast(lastStatus && lastStatus.running ? "Saved — restart the game to apply" : "Saved");
+      return true;
+    } catch (e) {
+      savePending = true;
+      showToast(e.message || "Couldn't save settings");
+      return false;
+    }
+  })().finally(() => { savingSettings = null; });
+  return savingSettings;
 }
 function scheduleSave(){
   if (!settingsLoaded) return;
+  ++settingsRevision;
   savePending = true;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveSettings, 250);
 }
 async function flushSettings(){
-  if (!savePending) return;
   clearTimeout(saveTimer);
-  await saveSettings();
+  if (savingSettings && !await savingSettings) return false;
+  return savePending ? saveSettings() : true;
 }
 document.querySelectorAll("#tab-settings select, #tab-settings input").forEach(el => {
   if (el.id === "s-ui_theme") return;
   el.addEventListener("change", scheduleSave);
 });
+$("#s-mods_language").addEventListener("change", () => {
+  const input = $("#s-mods_language");
+  const valid = !input.value.trim() || /^[a-z]{2,8}(?:[-_][a-z0-9]{1,8}){0,3}$/i.test(input.value.trim());
+  input.setCustomValidity(valid ? "" : "Use a language code such as fr or pt-BR");
+  if (valid) scheduleSave(); else input.reportValidity();
+});
 $("#s-present_effect").addEventListener("change", updateSharpnessField);
+$("#s-touch_scheme").addEventListener("change", updateTouchSchemeHint);
 function updateVulkanGraphicsFields(){
   const gpu = $("#s-gpu").value;
   const unavailable = gpu !== "" && gpu !== "vulkan";
@@ -1773,6 +2296,12 @@ $("#s-mnk_sensitivity").addEventListener("input", e => {
   $("#senslabel").textContent = Number(e.target.value).toFixed(1);
 });
 $("#s-ui_theme").addEventListener("change", e => saveTheme(e.target.value));
+$("#edittouchlayout").onclick = async () => {
+  if (!await flushSettings()) return;
+  const result = await api.post("/api/edit-touch-layout");
+  if (!result.ok) showToast(result.msg || "Could not open the control editor.");
+};
 </script>
+
 </body>
 </html>

@@ -20,6 +20,11 @@ std::unique_ptr<D3D11Provider> D3D11Provider::Create() {
     REXGPU_ERROR("DX11 initialization failed: {}", error);
     return nullptr;
   }
+  const auto& features = device->features();
+  REXGPU_INFO("DX11 adapter: {} (vendor {:04X}, device {:04X}), feature level {}.{}, {} MiB VRAM",
+              features.adapter_name, features.vendor_id, features.device_id,
+              uint32_t(features.level) >> 12, (uint32_t(features.level) >> 8) & 15,
+              features.dedicated_video_memory / (1024 * 1024));
   return std::unique_ptr<D3D11Provider>(new D3D11Provider(std::move(device)));
 }
 std::unique_ptr<Presenter> D3D11Provider::CreatePresenter(Presenter::HostGpuLossCallback callback) {

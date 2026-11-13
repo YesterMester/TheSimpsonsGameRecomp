@@ -1,0 +1,13 @@
+{
+  "id": "examples.health-tools",
+  "name": "Health tools",
+  "author": "",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "state",
+  "default_locale": "en",
+  "locales": {"en": "locales/en.json"},
+  "description": "A native menu and gameplay example using the public game API."
+}

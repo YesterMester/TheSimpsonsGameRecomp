@@ -14,7 +14,9 @@ class RenderTargetEncoder {
  public:
   RenderTargetEncoder(ui::d3d11::D3D11Device& device, DrawContext& draws)
       : device_(device), draws_(draws), shaders_(device), buffers_(device, 1024 * 1024) {}
-  bool Initialize(const DxbcRenderTargetDumpShader::Options& options, std::string& error);
+  bool Initialize(const DxbcRenderTargetDumpShader::Options& options, std::string& error,
+                  bool defer_buffer = false);
+  bool EnsureBuffer(std::string& error);
   bool Encode(const RenderTargetSurface& source, uint32_t first_tile, uint32_t source_base,
               uint32_t destination_pitch, uint32_t source_pitch, uint32_t width_tiles,
               uint32_t height_tiles, std::string& error);
@@ -44,6 +46,7 @@ class RenderTargetEncoder {
   bool downsample_attempted_ = false;
   std::string downsample_error_;
   uint32_t byte_size_ = 0;
+  bool initialized_ = false;
 };
 
 }  // namespace rex::graphics::d3d11

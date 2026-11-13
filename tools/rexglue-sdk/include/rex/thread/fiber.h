@@ -51,6 +51,22 @@ struct Fiber {
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
+#elif REX_PLATFORM_ANDROID
+  // AAPCS64 callee-saved registers, stack and floating-point environment.
+  // Android's libc does not provide makecontext/swapcontext.
+  struct alignas(16) Context {
+    uint64_t x[12]{};  // x19..x30
+    uint64_t sp = 0;
+    uint64_t fpcr = 0;
+    uint64_t fpsr = 0;
+    uint64_t padding = 0;
+    uint64_t d[8]{};  // d8..d15
+  } context_;
+  std::vector<uint8_t> stack_;
+  void (*entry_)(void*) = nullptr;
+  void* arg_ = nullptr;
+  bool is_thread_fiber_ = false;
+  static void Trampoline();
 #elif REX_PLATFORM_LINUX
   ucontext_t context_{};
   std::vector<uint8_t> stack_;

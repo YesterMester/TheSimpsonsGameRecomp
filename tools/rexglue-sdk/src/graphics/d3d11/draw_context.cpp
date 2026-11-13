@@ -352,6 +352,91 @@ void DrawContext::SetResources(DrawStage stage, uint32_t first, uint32_t count,
   }
 }
 
+void DrawContext::SetConstants(DrawStage stage, uint32_t first, uint32_t count,
+                               ID3D11Buffer* const* buffers, const uint32_t* offsets,
+                               const uint32_t* lengths) {
+  if (offsets) {
+    auto* context = constant_context_.Get();
+    switch (stage) {
+      case DrawStage::kVertex:
+        context->VSSetConstantBuffers1(first, count, buffers, offsets, lengths);
+        break;
+      case DrawStage::kHull:
+        context->HSSetConstantBuffers1(first, count, buffers, offsets, lengths);
+        break;
+      case DrawStage::kDomain:
+        context->DSSetConstantBuffers1(first, count, buffers, offsets, lengths);
+        break;
+      case DrawStage::kGeometry:
+        context->GSSetConstantBuffers1(first, count, buffers, offsets, lengths);
+        break;
+      case DrawStage::kPixel:
+        context->PSSetConstantBuffers1(first, count, buffers, offsets, lengths);
+        break;
+      default:
+        break;
+    }
+  } else {
+    auto* context = device_.context();
+    switch (stage) {
+      case DrawStage::kVertex:
+        context->VSSetConstantBuffers(first, count, buffers);
+        break;
+      case DrawStage::kHull:
+        context->HSSetConstantBuffers(first, count, buffers);
+        break;
+      case DrawStage::kDomain:
+        context->DSSetConstantBuffers(first, count, buffers);
+        break;
+      case DrawStage::kGeometry:
+        context->GSSetConstantBuffers(first, count, buffers);
+        break;
+      case DrawStage::kPixel:
+        context->PSSetConstantBuffers(first, count, buffers);
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+void DrawContext::BindConstants(DrawStage stage, const StageBindings& source) {
+  auto& cached = bindings_[size_t(stage)];
+  constexpr size_t kSlots = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
+  std::array<ID3D11Buffer*, kSlots> values = {};
+  std::array<uint32_t, kSlots> offsets = {}, lengths = {};
+  std::array<bool, kSlots> changed = {};
+  uint32_t count = uint32_t(source.constants.size());
+  uint32_t total = std::max(count, cached.constant_count);
+  bool ranged = !source.constant_first.empty();
+  for (uint32_t i = 0; i < total; ++i) {
+    if (i < count) {
+      values[i] = source.constants[i];
+      offsets[i] = ranged ? source.constant_first[i] : 0;
+      lengths[i] = ranged ? source.constant_count[i] : D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT;
+    }
+    changed[i] = cached.constants[i].Get() != values[i] || cached.constant_first[i] != offsets[i] ||
+                 cached.constant_lengths[i] != lengths[i];
+    cached.constants[i] = values[i];
+    cached.constant_first[i] = offsets[i];
+    cached.constant_lengths[i] = lengths[i];
+  }
+  for (uint32_t i = 0; i < total;) {
+    if (!changed[i]) {
+      ++i;
+      continue;
+    }
+    uint32_t first = i++;
+    while (i < total && changed[i])
+      ++i;
+    SetConstants(stage, first, i - first, values.data() + first,
+                 ranged ? offsets.data() + first : nullptr,
+                 ranged ? lengths.data() + first : nullptr);
+    ++statistics_.binding_updates;
+  }
+  cached.constant_count = count;
+}
+
 void DrawContext::BindStage(DrawStage stage, const StageBindings& source) {
   auto& cached = bindings_[size_t(stage)];
   auto* context = device_.context();
@@ -361,30 +446,7 @@ void DrawContext::BindStage(DrawStage stage, const StageBindings& source) {
         SetResources(stage, first, count, values);
       },
       statistics_.binding_updates);
-  Bind(
-      source.constants, cached.constants, cached.constant_count,
-      [&](uint32_t first, uint32_t count, auto* values) {
-        switch (stage) {
-          case DrawStage::kVertex:
-            context->VSSetConstantBuffers(first, count, values);
-            break;
-          case DrawStage::kHull:
-            context->HSSetConstantBuffers(first, count, values);
-            break;
-          case DrawStage::kDomain:
-            context->DSSetConstantBuffers(first, count, values);
-            break;
-          case DrawStage::kGeometry:
-            context->GSSetConstantBuffers(first, count, values);
-            break;
-          case DrawStage::kPixel:
-            context->PSSetConstantBuffers(first, count, values);
-            break;
-          default:
-            break;
-        }
-      },
-      statistics_.binding_updates);
+  BindConstants(stage, source);
   Bind(
       source.samplers, cached.samplers, cached.sampler_count,
       [&](uint32_t first, uint32_t count, auto* values) {
@@ -522,6 +584,18 @@ bool DrawContext::Draw(const DrawCommand& command, std::string& error) {
         stage.resources.size() > D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT ||
         stage.samplers.size() > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT)
       return reject("The DX11 draw input register range is invalid");
+    bool ranged = !stage.constant_first.empty() || !stage.constant_count.empty();
+    if (ranged) {
+      if (!constant_context_ || stage.constant_first.size() != stage.constants.size() ||
+          stage.constant_count.size() != stage.constants.size())
+        return reject("The DX11 constant buffer windows are unavailable or incomplete");
+      for (size_t i = 0; i < stage.constants.size(); ++i) {
+        uint32_t first = stage.constant_first[i], count = stage.constant_count[i];
+        if ((first & 15) || (count & 15) || count > D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT ||
+            first > UINT32_MAX - count)
+          return reject("The DX11 constant buffer window is invalid");
+      }
+    }
   }
   if (command.indices) {
     auto kind = command.indices->kind();

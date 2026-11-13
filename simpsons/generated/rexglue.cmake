@@ -60,9 +60,11 @@ endif()
 
 # Codegen target - run 'cmake --build . --target simpsons_codegen'
 # Uses the manifest to drive codegen for all modules (entrypoint + DLLs).
+if(NOT ANDROID)
 add_custom_target(simpsons_codegen
     COMMAND $<TARGET_FILE:rex::rexglue> codegen ${CMAKE_CURRENT_SOURCE_DIR}/simpsons_manifest.toml
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "Generating recompiled code for simpsons"
     VERBATIM
 )
+endif()

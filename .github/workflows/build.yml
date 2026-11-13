@@ -26,6 +26,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check launcher patches and saved settings
         run: python3 tools/bench/launcher_patch_check.py
+      - name: Check updating from an older launcher and the example mods
+        run: python3 tools/bench/launcher_update_check.py
+      - name: Check installing with the launcher's own ISO extractor
+        run: python3 tools/bench/xiso_extract_check.py
       # A translator change makes the game ignore the shipped shader set until
       # it is rebuilt on a machine with the game (build_translated_set.sh).
       - name: Check the shader set matches the translator
@@ -50,10 +54,23 @@ jobs:
         run: |
           cmake --preset linux-amd64-relwithdebinfo \
             -DREXSDK_DIR="$GITHUB_WORKSPACE/tools/rexglue-sdk" \
+            -DSIMPSONS_MODKIT_TOOLS=ON \
             -DSDL_DBUS=ON \
             -DREXGLUE_ENABLE_LTO=ON \
             "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
-          cmake --build --preset linux-amd64-relwithdebinfo --target simpsons
+          cmake --build --preset linux-amd64-relwithdebinfo --target simpsons modkit_streams
+      - name: Check high-FPS camera input through the generated handlers
+        run: |
+          python3 tools/bench/camera_input_check.py --cxx clang++-20 \
+            --output "$RUNNER_TEMP/camera-input-check"
+      - name: Check keyframed collision bodies at high FPS
+        run: |
+          python3 tools/bench/physics_keyframes_check.py --cxx clang++-20 \
+            --output "$RUNNER_TEMP/physics-keyframes-check"
+      - name: Check animation catalogs against the original native lookup
+        run: |
+          python3 tools/bench/animation_catalog_check.py --cxx clang++-20 \
+            --output "$RUNNER_TEMP/animation-catalog-check"
 
   windows:
     name: Windows (x86_64)
@@ -62,6 +79,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check launcher patches and saved settings
         run: python tools/bench/launcher_patch_check.py
+      - name: Check installing with the launcher's own ISO extractor
+        run: python tools/bench/xiso_extract_check.py
       - name: Install LLVM/Clang ${{ env.LLVM_VERSION }}
         shell: pwsh
         run: |
@@ -77,7 +96,8 @@ jobs:
         run: |
           cmake --preset win-amd64-relwithdebinfo `
             -DREXSDK_DIR="$env:GITHUB_WORKSPACE/tools/rexglue-sdk" `
+            -DSIMPSONS_MODKIT_TOOLS=ON `
             -DREXGLUE_USE_D3D11=ON `
             -DREXGLUE_ENABLE_LTO=ON `
             "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
-          cmake --build --preset win-amd64-relwithdebinfo --target simpsons
+          cmake --build --preset win-amd64-relwithdebinfo --target simpsons modkit_streams

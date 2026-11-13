@@ -20,6 +20,13 @@ bool Check(HRESULT result, const char* operation, std::string& error) {
 }
 }  // namespace
 
+bool ScaledResolveMemory::Contains(uint32_t start, uint32_t length) const {
+  if (!length || start >= kPhysicalSize || length > kPhysicalSize - start)
+    return false;
+  auto after = regions_.upper_bound(start);
+  return after != regions_.begin() && std::prev(after)->second.end >= start + length;
+}
+
 bool ScaledResolveMemory::Ensure(uint32_t start, uint32_t length, std::string& error) {
   error.clear();
   if (!area_ || area_ > 9 || !length || start >= kPhysicalSize || length > kPhysicalSize - start) {

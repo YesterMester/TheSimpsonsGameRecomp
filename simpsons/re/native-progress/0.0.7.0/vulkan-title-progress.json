@@ -1,0 +1,417 @@
+{
+  "version": 1,
+  "generated_at": "2026-11-04T20:51:16.745851+00:00",
+  "scope": "Recorded November 4, 2026: E52 private Steam Deck/RADV Vulkan startup and title screen, 1,079 frames at 1x with experimental native_gpu_calls enabled. Recorded command/resource traffic; campaign completion and native Windows/Android hardware are outside this sample.",
+  "valid_input_reports": true,
+  "overall_completion_percent": null,
+  "full_game_native_proven": false,
+  "current_build_qualified": false,
+  "tracked_systems": 12,
+  "exercised_systems": 11,
+  "paired_counters_present": true,
+  "legacy_dependency_events": 0,
+  "legacy_allocation_events": 0,
+  "systems": {
+    "Draw command dispatch": {
+      "native": 3367526,
+      "retained": 0,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 3367526,
+      "in_flight": 0,
+      "executed": 3367526,
+      "percent": 100.0,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1"
+    },
+    "Geometry source selection": {
+      "native": 3365345,
+      "retained": 0,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 3365345,
+      "in_flight": 0,
+      "executed": 3365345,
+      "percent": 100.0,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1",
+      "recorded_native_operations": 3365345,
+      "recorded_dependency_events": 0
+    },
+    "Texture upload commits": {
+      "native": 51,
+      "retained": 0,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 51,
+      "in_flight": 0,
+      "executed": 51,
+      "percent": 100.0,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1",
+      "recorded_native_operations": 51,
+      "recorded_dependency_events": 0
+    },
+    "Host resolve requests": {
+      "native": 2157,
+      "retained": 0,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 2157,
+      "in_flight": 0,
+      "executed": 2157,
+      "percent": 100.0,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1",
+      "recorded_native_operations": 2157,
+      "recorded_dependency_events": 0
+    },
+    "Shader command dispatch": {
+      "native": 10116449,
+      "retained": 10737,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 10127186,
+      "in_flight": 0,
+      "executed": 10127186,
+      "percent": 99.89397844574002,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1"
+    },
+    "GPU synchronization": {
+      "native": 3444820,
+      "retained": 8778,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 3453598,
+      "in_flight": 0,
+      "executed": 3453598,
+      "percent": 99.74583029061286,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1"
+    },
+    "Buffer submissions": {
+      "native": 53687,
+      "retained": 4,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 53691,
+      "in_flight": 0,
+      "executed": 53691,
+      "percent": 99.99254996181855,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1"
+    },
+    "Presentation commands": {
+      "native": 1079,
+      "retained": 0,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 1079,
+      "in_flight": 0,
+      "executed": 1079,
+      "percent": 100.0,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1"
+    },
+    "State and constants": {
+      "native": 20356284,
+      "retained": 92440,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 20448724,
+      "in_flight": 0,
+      "executed": 20448724,
+      "percent": 99.54794245352424,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1"
+    },
+    "Queries": {
+      "native": 0,
+      "retained": 0,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 0,
+      "in_flight": 0,
+      "executed": 0,
+      "percent": null,
+      "reason": "not exercised (no executed attempts)",
+      "measurement": "paired routes v1"
+    },
+    "Other commands": {
+      "native": 0,
+      "retained": 1082,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 13581185,
+      "unclassified": 0,
+      "attempts": 13582267,
+      "in_flight": 0,
+      "executed": 1082,
+      "percent": 0.0,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1"
+    },
+    "Host presentation": {
+      "native": 1072,
+      "retained": 0,
+      "mixed": 0,
+      "failed": 7,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 1079,
+      "in_flight": 0,
+      "executed": 1079,
+      "percent": 99.35125115848007,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1"
+    }
+  },
+  "backends": {
+    "vulkan": {
+      "reports": 1,
+      "native": 3367526,
+      "retained": 0,
+      "mixed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unclassified": 0,
+      "attempts": 3367526,
+      "in_flight": 0,
+      "executed": 3367526,
+      "percent": 100.0,
+      "reason": "native completions / executed attempts; intentional skips excluded",
+      "measurement": "paired routes v1"
+    }
+  },
+  "samples": [
+    {
+      "path": "simpsons/re/native-progress/0.0.7.0/vulkan-title-e52.json",
+      "errors": [],
+      "sha256": "58a7763f6c0b5d115cfb43a02216fa9d31b9111d664ed8e4f2116234b95d10ad",
+      "report": {
+        "version": 1,
+        "backend": "vulkan",
+        "strict": false,
+        "complete": true,
+        "failed": false,
+        "frames": 1079,
+        "dependencies": {
+          "edram": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "memory_mirror": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "scaled_mirror_read": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "scaled_mirror_write": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "resolve_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "vertex_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "texture_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          }
+        },
+        "operations": {
+          "vertex_streams": 3365345,
+          "cpu_texture_upload": 49,
+          "gpu_texture_upload": 2,
+          "resolve": 2157,
+          "alias_transfer": 0,
+          "native_draw_call": 3367526,
+          "legacy_draw_packet": 0
+        },
+        "allocations": {
+          "edram": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          },
+          "memory_mirror": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          },
+          "scaled_mirror": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          }
+        },
+        "diagnostic_readback": {
+          "calls": 8,
+          "bytes": 11304960,
+          "allocations": 5,
+          "virtual_bytes": 547356672,
+          "resident_bytes": 27262976
+        },
+        "route_coverage": {
+          "version": 1,
+          "systems": {
+            "draw_dispatch": {
+              "attempts": 3367526,
+              "in_flight": 0,
+              "native": 3367526,
+              "retained": 0,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "unclassified": 0
+            },
+            "geometry": {
+              "attempts": 3365345,
+              "in_flight": 0,
+              "native": 3365345,
+              "retained": 0,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "unclassified": 0
+            },
+            "textures": {
+              "attempts": 51,
+              "in_flight": 0,
+              "native": 51,
+              "retained": 0,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "unclassified": 0
+            },
+            "resolves": {
+              "attempts": 2157,
+              "in_flight": 0,
+              "native": 2157,
+              "retained": 0,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "unclassified": 0
+            },
+            "shader_commands": {
+              "attempts": 10127186,
+              "in_flight": 0,
+              "native": 10116449,
+              "retained": 10737,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "unclassified": 0
+            },
+            "synchronization": {
+              "attempts": 3453598,
+              "in_flight": 0,
+              "native": 3444820,
+              "retained": 8778,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "unclassified": 0
+            },
+            "submission": {
+              "attempts": 53691,
+              "in_flight": 0,
+              "native": 53687,
+              "retained": 4,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "unclassified": 0
+            },
+            "presentation": {
+              "attempts": 1079,
+              "in_flight": 0,
+              "native": 1079,
+              "retained": 0,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "unclassified": 0
+            },
+            "state_commands": {
+              "attempts": 20448724,
+              "in_flight": 0,
+              "native": 20356284,
+              "retained": 92440,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "unclassified": 0
+            },
+            "queries": {
+              "attempts": 0,
+              "in_flight": 0,
+              "native": 0,
+              "retained": 0,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 0,
+              "unclassified": 0
+            },
+            "other_commands": {
+              "attempts": 13582267,
+              "in_flight": 0,
+              "native": 0,
+              "retained": 1082,
+              "mixed": 0,
+              "failed": 0,
+              "skipped": 13581185,
+              "unclassified": 0
+            },
+            "host_presentation": {
+              "attempts": 1079,
+              "in_flight": 0,
+              "native": 1072,
+              "retained": 0,
+              "mixed": 0,
+              "failed": 7,
+              "skipped": 0,
+              "unclassified": 0
+            }
+          }
+        }
+      }
+    }
+  ]
+}

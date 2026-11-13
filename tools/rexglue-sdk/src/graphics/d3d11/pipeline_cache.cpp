@@ -239,15 +239,13 @@ bool PipelineCache::PrepareShaders(D3D11Shader& vertex, D3D11Shader* pixel,
   return true;
 }
 
-bool PipelineCache::PrepareDraw(D3D11Shader& vertex, D3D11Shader* pixel,
-                                Shader::HostVertexShaderType vertex_type,
-                                xenos::PrimitiveType primitive_type,
-                                reg::RB_DEPTHCONTROL normalized_depth_control,
-                                uint32_t normalized_color_mask, uint32_t bound_depth_and_color_mask,
-                                DrawCommand& command, draw_util::ViewportInfo& viewport,
-                                PreparedShaders& shaders, std::string& error,
-                                std::span<const TextureSwizzle> vertex_texture_swizzles,
-                                std::span<const TextureSwizzle> pixel_texture_swizzles) {
+bool PipelineCache::PrepareDraw(
+    D3D11Shader& vertex, D3D11Shader* pixel, Shader::HostVertexShaderType vertex_type,
+    xenos::PrimitiveType primitive_type, reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask, uint32_t bound_depth_and_color_mask, DrawCommand& command,
+    draw_util::ViewportInfo& viewport, PreparedShaders& shaders, std::string& error,
+    std::span<const TextureSwizzle> vertex_texture_swizzles,
+    std::span<const TextureSwizzle> pixel_texture_swizzles, bool original_resolution) {
   if (!PrepareShaders(vertex, pixel, vertex_type, primitive_type, normalized_depth_control, shaders,
                       error, vertex_texture_swizzles, pixel_texture_swizzles))
     return false;
@@ -260,11 +258,12 @@ bool PipelineCache::PrepareDraw(D3D11Shader& vertex, D3D11Shader* pixel,
   }
   command.programs[size_t(DrawStage::kGeometry)] = shaders.geometry;
   command.programs[size_t(DrawStage::kPixel)] = shaders.pixel;
-  BuildGuestDrawState(registers_, normalized_depth_control, normalized_color_mask,
-                      bound_depth_and_color_mask, options_.resolution_scale_x,
-                      options_.resolution_scale_y, pixel && pixel->writes_depth(),
-                      options_.depth_float24_convert_in_pixel_shader, options_.msaa_2x_supported,
-                      viewport, command.state);
+  BuildGuestDrawState(
+      registers_, normalized_depth_control, normalized_color_mask, bound_depth_and_color_mask,
+      original_resolution ? 1u : options_.resolution_scale_x,
+      original_resolution ? 1u : options_.resolution_scale_y, pixel && pixel->writes_depth(),
+      options_.depth_float24_convert_in_pixel_shader, options_.msaa_2x_supported, viewport,
+      command.state);
   return true;
 }
 

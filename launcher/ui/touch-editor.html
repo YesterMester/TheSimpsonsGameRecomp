@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src 'self'; img-src data:">
+<title>Touch controls</title>
+<style>
+@font-face{font-family:Luckiest;src:url('/fonts/LuckiestGuy-Regular.ttf')}
+*{box-sizing:border-box}body{margin:0;background:#17213d;color:#f6f2e6;font:14px system-ui,sans-serif;height:100dvh;overflow:hidden}
+main{height:100%;display:flex;flex-direction:column;padding:8px 12px;gap:7px}
+header{display:flex;align-items:center;gap:10px;flex:none}h1{font:24px Luckiest,sans-serif;color:#ffd90f;margin:0;flex:1}
+button,select{min-height:42px;border:2px solid #03050c;border-radius:12px;color:#f6f2e6;background:#2a3a63;padding:8px 14px;font:14px system-ui;cursor:pointer}
+button.primary{background:#ffd90f;color:#2b2100;font-weight:800}button:focus-visible,select:focus-visible{outline:3px solid #6db7ff}
+#previewbox{min-height:80px;flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden}
+svg{display:block;background:linear-gradient(155deg,#090e20,#23335b);border:2px solid #03050c;border-radius:16px;touch-action:none;user-select:none}
+footer{flex:none;display:flex;align-items:center;gap:10px;flex-wrap:wrap}.field{display:flex;align-items:center;gap:7px}.field span{white-space:nowrap}
+input[type=range]{width:130px;height:30px;accent-color:#ffd90f}input[type=checkbox]{width:22px;height:22px;accent-color:#ffd90f}
+#hint{font-size:12px;color:#b6bfd6;flex:1;min-width:190px}#message{color:#ffc4b8;font-size:13px;min-height:0}
+@media(max-height:400px){main{gap:4px;padding:4px 10px}h1{font-size:20px}button,select{min-height:36px;padding:6px 10px}footer{gap:6px}input[type=range]{width:100px}}
+@media(max-width:600px){header{flex-wrap:wrap}h1{font-size:20px}#hint{min-width:100%;font-size:11px}input[type=range]{width:95px}.field{gap:4px}}
+</style>
+</head>
+<body><main>
+<header><h1>Touch controls</h1><select id="scheme" aria-label="Control scheme"></select><button id="resetall">Reset layout</button><button id="cancel">Cancel</button><button id="save" class="primary">Save layout</button></header>
+<div id="previewbox"><svg id="preview" role="img" aria-label="Control layout preview. Drag a control to move it."></svg></div>
+<footer>
+<select id="selected" aria-label="Selected control"></select>
+<label class="field"><span>Size <b id="sizevalue"></b></span><input id="size" type="range" min="0.55" max="1.8" step="0.05"></label>
+<label class="field"><span>Opacity <b id="opacityvalue"></b></span><input id="opacity" type="range" min="0.1" max="1" step="0.05"></label>
+<label class="field"><input id="hidden" type="checkbox">Hide in game</label>
+<button id="resetone">Reset this control</button>
+<span id="hint">Drag a control to move it. Choose hidden controls from the list. In Simple touch, move with your thumb anywhere on the left and swipe on the right to look around. Changes apply when you return to the game.</span>
+</footer><div id="message" role="alert"></div>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let model, layout, selected, geometry = [], drag = null, dirty = false;
+const MOVE_AREA = 7, LOOK_AREA = 8, MENU = 9;
+const OFF = 'off';
+const clamp = (v,min,max) => Math.max(min,Math.min(max,v));
+function custom(id){return layout.controls[id] || {};}
+function edit(id=selected){dirty=true;return layout.controls[id] || (layout.controls[id]={});}
+function definitions(){return model.schema.controls;}
+function frame(){
+  const w=model.viewport.width,h=model.viewport.height;
+  const unit=Math.min(w/860,h/440)*model.scale,margin=12*unit;
+  return {w,h,unit,left:margin,top:margin,width:w-2*margin,height:h-2*margin};
+}
+function areaRect(def){
+  const f=frame(),a=def.area;
+  return {x:f.left+a.left*f.width,y:f.top+a.top*f.height,w:(a.right-a.left)*f.width,h:(a.bottom-a.top)*f.height};
+}
+function gearPath(r){
+  // Eight teeth around a ring, drawn with its centre at the origin.
+  let d='';const teeth=8,outer=r*.62,inner=r*.46;
+  for(let i=0;i<teeth*2;i++){
+    const a0=(i/(teeth*2))*Math.PI*2,a1=((i+1)/(teeth*2))*Math.PI*2,radius=i%2?inner:outer;
+    d+=(i?'L':'M')+(Math.cos(a0)*radius).toFixed(2)+' '+(Math.sin(a0)*radius).toFixed(2)+'L'+(Math.cos(a1)*radius).toFixed(2)+' '+(Math.sin(a1)*radius).toFixed(2);
+  }
+  return d+'Z';
+}
+function controlGeometry(def){
+  const f=frame(),v=custom(def.id),scale=v.size??1;
+  const r=Math.min(def.radius*f.unit*scale,Math.min(f.width,f.height)*.45);
+  const x=f.left+(v.x??(def.x+(def.dx||0)*f.unit/f.width))*f.width;
+  const y=f.top+(v.y??(def.y+(def.dy||0)*f.unit/f.height))*f.height;
+  const stick=def.kind<=2||def.kind===MOVE_AREA;
+  return {def,scale,r,x:clamp(x,f.left+r,f.left+f.width-r),y:clamp(y,f.top+r,f.top+f.height-r-(stick?18*f.unit:0)),opacity:v.opacity??model.opacity,hidden:v.hidden??!!def.hidden};
+}
+function render(){
+  if(!model)return;
+  geometry=definitions().map(controlGeometry);
+  const f=frame(),svg=$('preview');svg.setAttribute('viewBox',`0 0 ${f.w} ${f.h}`);
+  svg.innerHTML='';
+  const ns='http://www.w3.org/2000/svg';
+  for(const c of geometry){
+    if(c.def.area){
+      // The zone a move or look touch can start in.
+      const a=areaRect(c.def),zone=document.createElementNS(ns,'rect');
+      zone.setAttribute('x',a.x);zone.setAttribute('y',a.y);zone.setAttribute('width',a.w);zone.setAttribute('height',a.h);
+      zone.setAttribute('rx',10*f.unit);zone.setAttribute('fill',c.def.kind===LOOK_AREA?'#2f81f7':'#2ea043');
+      zone.setAttribute('fill-opacity',c.hidden?.03:.09);zone.setAttribute('stroke','#f0f4f8');zone.setAttribute('stroke-opacity',.35);
+      zone.setAttribute('stroke-dasharray',`${6*f.unit} ${5*f.unit}`);svg.appendChild(zone);
+      if(c.def.kind===LOOK_AREA){
+        const note=document.createElementNS(ns,'text');note.textContent=c.hidden?'Swipe to look (hidden)':'Swipe here to look around';
+        note.setAttribute('x',a.x+a.w/2);note.setAttribute('y',a.y+a.h-14*f.unit);note.setAttribute('text-anchor','middle');
+        note.setAttribute('fill','#f6f2e6');note.setAttribute('fill-opacity',.55);note.setAttribute('font-size',12*f.unit);svg.appendChild(note);
+      }
+    }
+  }
+  for(const c of geometry){
+    if(c.def.kind===LOOK_AREA)continue;
+    const group=document.createElementNS(ns,'g');group.dataset.control=c.def.id;
+    group.setAttribute('transform',`translate(${c.x} ${c.y})`);
+    group.setAttribute('opacity',c.hidden ? .22 : c.opacity);
+    const circle=document.createElementNS(ns,'circle');circle.setAttribute('r',c.r);
+    circle.setAttribute('fill',c.def.color||'#0c121a');circle.setAttribute('stroke',c.def.id===selected?'#ffd90f':'#f0f4f8');
+    circle.setAttribute('stroke-width',(c.def.id===selected?3:1.5)*f.unit);
+    if(c.hidden)circle.setAttribute('stroke-dasharray',`${5*f.unit} ${4*f.unit}`);
+    group.appendChild(circle);
+    const stick=c.def.kind<=2||c.def.kind===MOVE_AREA;
+    if(stick){const knob=document.createElementNS(ns,'circle');knob.setAttribute('r',c.r*.38);knob.setAttribute('fill','#e6edf3');group.appendChild(knob);}
+    if(c.def.kind===MENU){
+      const gear=document.createElementNS(ns,'path');gear.setAttribute('d',gearPath(c.r));gear.setAttribute('fill','#f6f2e6');group.appendChild(gear);
+      const hole=document.createElementNS(ns,'circle');hole.setAttribute('r',c.r*.2);hole.setAttribute('fill','#0c121a');group.appendChild(hole);
+    }else{
+      const text=document.createElementNS(ns,'text');text.textContent=c.def.kind===3?'✚':c.def.label;
+      text.setAttribute('text-anchor','middle');text.setAttribute('dominant-baseline','central');text.setAttribute('fill','#f6f2e6');
+      text.setAttribute('font-weight','700');
+      text.setAttribute('font-size',(stick?10:c.def.kind===3?28:c.def.label.length>4?9:c.def.label.length>2?11:18)*f.unit*c.scale);
+      text.setAttribute('y',stick||c.def.kind===3&&c.def.label!=='D-PAD'?c.r+12*f.unit:0);
+      if(c.def.kind===3&&c.def.label!=='D-PAD'){
+        const cross=document.createElementNS(ns,'text');cross.textContent='✚';cross.setAttribute('text-anchor','middle');cross.setAttribute('dominant-baseline','central');
+        cross.setAttribute('fill','#f6f2e6');cross.setAttribute('font-size',28*f.unit*c.scale);group.appendChild(cross);
+        text.textContent=c.def.label;text.setAttribute('font-size',10*f.unit*c.scale);
+      }
+      group.appendChild(text);
+    }
+    svg.appendChild(group);
+  }
+  const box=$('previewbox').getBoundingClientRect(),ratio=f.w/f.h;
+  const w=Math.min(box.width,box.height*ratio);svg.style.width=w+'px';svg.style.height=w/ratio+'px';
+}
+function select(id){
+  selected=id;$('selected').value=id;
+  const def=definitions().find(d=>d.id===id);
+  const value=custom(id);$('size').value=value.size??1;$('opacity').value=value.opacity??model.opacity;$('hidden').checked=value.hidden??!!def.hidden;
+  labels();render();
+}
+function labels(){ $('sizevalue').textContent=Math.round(Number($('size').value)*100)+'%';$('opacityvalue').textContent=Math.round(Number($('opacity').value)*100)+'%'; }
+function point(event){const r=$('preview').getBoundingClientRect();return {x:(event.clientX-r.left)*model.viewport.width/r.width,y:(event.clientY-r.top)*model.viewport.height/r.height};}
+$('preview').addEventListener('pointerdown',event=>{
+  if(drag)return;const p=point(event),pixel=model.viewport.width/$('preview').getBoundingClientRect().width;
+  let found=null,nearest=Infinity;
+  for(const c of geometry){if(c.def.kind===LOOK_AREA)continue;const r=Math.max(c.r,22*pixel),distance=((p.x-c.x)**2+(p.y-c.y)**2)/(r*r);if(distance<=1&&distance<nearest){found=c;nearest=distance;}}
+  if(!found)return;
+  select(found.def.id);drag={id:found.def.id,pointer:event.pointerId,dx:p.x-found.x,dy:p.y-found.y};$('preview').setPointerCapture(event.pointerId);event.preventDefault();
+});
+$('preview').addEventListener('pointermove',event=>{
+  if(!drag||drag.pointer!==event.pointerId)return;const p=point(event),f=frame(),value=edit(drag.id);
+  value.x=clamp((p.x-drag.dx-f.left)/f.width,0,1);value.y=clamp((p.y-drag.dy-f.top)/f.height,0,1);render();event.preventDefault();
+});
+for(const name of ['pointerup','pointercancel'])$('preview').addEventListener(name,event=>{if(drag&&drag.pointer===event.pointerId){drag=null;if($('preview').hasPointerCapture(event.pointerId))$('preview').releasePointerCapture(event.pointerId);}});
+$('selected').onchange=()=>select($('selected').value);
+for(const key of ['size','opacity'])$(key).oninput=()=>{edit()[key]=Number($(key).value);labels();render();};
+$('hidden').onchange=()=>{edit().hidden=$('hidden').checked;render();};
+$('resetone').onclick=()=>{delete layout.controls[selected];dirty=true;select(selected);};
+$('resetall').onclick=()=>{if(confirm('Restore all controls to their default positions, sizes and visibility?')){layout.controls={};dirty=true;select(selected);}};
+function requestClose(){if(!dirty||confirm('Discard your unsaved control layout?'))AndroidTouchEditor.close();}
+function names(def){return def.kind===LOOK_AREA?'Swipe to look':def.kind===MOVE_AREA?'Move (anywhere on the left)':def.kind===MENU?'Controls button':def.label;}
+function open(scheme){
+  model=JSON.parse(AndroidTouchEditor.load(scheme));if(model.error)throw new Error(model.error);
+  layout={version:2,controls:model.layout.controls||{}};dirty=false;
+  $('scheme').innerHTML='';
+  for(const item of model.schemes){const option=document.createElement('option');option.value=item.id;option.textContent=item.label;$('scheme').appendChild(option);}
+  const off=document.createElement('option');off.value=OFF;off.textContent='Controller only (no touch controls)';$('scheme').appendChild(off);
+  $('scheme').value=model.scheme;
+  $('selected').innerHTML='';
+  for(const def of definitions()){const option=document.createElement('option');option.value=def.id;option.textContent=names(def);$('selected').appendChild(option);}
+  select(definitions()[0].id);
+}
+$('scheme').onchange=()=>{
+  const choice=$('scheme').value;
+  if(dirty&&!confirm('Discard your unsaved control layout?')){$('scheme').value=model.scheme;return;}
+  if(choice===OFF){
+    if(confirm('Hide the touch controls? Choose a touch scheme again in Settings → Touch controls to bring them back.')){AndroidTouchEditor.turnOff();AndroidTouchEditor.close();}
+    else $('scheme').value=model.scheme;
+    return;
+  }
+  try{open(choice);dirty=true;}catch(error){$('message').textContent=error.message;}
+};
+$('cancel').onclick=requestClose;
+$('save').onclick=()=>{
+  try{const result=JSON.parse(AndroidTouchEditor.save(model.scheme,JSON.stringify(layout)));if(!result.ok)throw new Error(result.msg||'Could not save the layout.');dirty=false;AndroidTouchEditor.close();}
+  catch(error){$('message').textContent=error.message;}
+};
+try{open('');new ResizeObserver(render).observe($('previewbox'));}
+catch(error){$('message').textContent=error.message;$('save').disabled=true;}
+</script></body></html>

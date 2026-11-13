@@ -47,31 +47,77 @@ ShaderBytecodeOptions ShaderCache::GetOptions(bool shared_memory_read_only) cons
   return options;
 }
 
-HRESULT ShaderCache::CreateNative(ShaderProgram& program) {
-  const auto& code = program.bytecode_;
-  auto* device = device_.device();
+std::unique_ptr<ShaderProgram> ShaderProgram::CompileNative(
+    ui::d3d11::D3D11Device& device, std::string_view source,
+    ui::d3d11::D3D11Device::ShaderStage stage, std::string& error) {
+  error.clear();
+  auto program = std::make_unique<ShaderProgram>();
+  using Stage = ui::d3d11::D3D11Device::ShaderStage;
+  switch (stage) {
+    case Stage::kVertex:
+      program->bytecode_.program_type = uint32_t(dxbc::ProgramType::kVertexShader);
+      break;
+    case Stage::kPixel:
+      program->bytecode_.program_type = uint32_t(dxbc::ProgramType::kPixelShader);
+      break;
+    case Stage::kCompute:
+      program->bytecode_.program_type = uint32_t(dxbc::ProgramType::kComputeShader);
+      break;
+    default:
+      error = "Unsupported Direct3D 11 shader stage";
+      return nullptr;
+  }
+  Microsoft::WRL::ComPtr<ID3DBlob> code;
+  if (FAILED(
+          ui::d3d11::D3D11Device::CompileShader(source, "main", stage, code.GetAddressOf(), error)))
+    return nullptr;
+  auto* data = static_cast<const uint8_t*>(code->GetBufferPointer());
+  program->bytecode_.data.assign(data, data + code->GetBufferSize());
+  if (!program->CreateNative(device.device(), error))
+    return nullptr;
+  return program;
+}
+
+bool ShaderProgram::CreateNative(ID3D11Device* device, std::string& error) {
+  const auto& code = bytecode_;
+  HRESULT result;
   switch (code.program_type) {
     case uint32_t(dxbc::ProgramType::kPixelShader):
-      return device->CreatePixelShader(code.data.data(), code.data.size(), nullptr,
-                                       program.pixel_.GetAddressOf());
+      result = device->CreatePixelShader(code.data.data(), code.data.size(), nullptr,
+                                         pixel_.GetAddressOf());
+      break;
     case uint32_t(dxbc::ProgramType::kVertexShader):
-      return device->CreateVertexShader(code.data.data(), code.data.size(), nullptr,
-                                        program.vertex_.GetAddressOf());
+      result = device->CreateVertexShader(code.data.data(), code.data.size(), nullptr,
+                                          vertex_.GetAddressOf());
+      break;
     case uint32_t(dxbc::ProgramType::kGeometryShader):
-      return device->CreateGeometryShader(code.data.data(), code.data.size(), nullptr,
-                                          program.geometry_.GetAddressOf());
+      result = device->CreateGeometryShader(code.data.data(), code.data.size(), nullptr,
+                                            geometry_.GetAddressOf());
+      break;
     case uint32_t(dxbc::ProgramType::kHullShader):
-      return device->CreateHullShader(code.data.data(), code.data.size(), nullptr,
-                                      program.hull_.GetAddressOf());
+      result = device->CreateHullShader(code.data.data(), code.data.size(), nullptr,
+                                        hull_.GetAddressOf());
+      break;
     case uint32_t(dxbc::ProgramType::kDomainShader):
-      return device->CreateDomainShader(code.data.data(), code.data.size(), nullptr,
-                                        program.domain_.GetAddressOf());
+      result = device->CreateDomainShader(code.data.data(), code.data.size(), nullptr,
+                                          domain_.GetAddressOf());
+      break;
     case uint32_t(dxbc::ProgramType::kComputeShader):
-      return device->CreateComputeShader(code.data.data(), code.data.size(), nullptr,
-                                         program.compute_.GetAddressOf());
+      result = device->CreateComputeShader(code.data.data(), code.data.size(), nullptr,
+                                           compute_.GetAddressOf());
+      break;
     default:
-      return E_INVALIDARG;
+      result = E_INVALIDARG;
+      break;
   }
+  if (FAILED(result)) {
+    char message[128];
+    std::snprintf(message, sizeof(message), "Native shader creation failed (0x%08X)",
+                  unsigned(result));
+    error = message;
+    return false;
+  }
+  return true;
 }
 
 const ShaderProgram* ShaderCache::GetOrCreate(std::span<const uint8_t> shader_model_51,
@@ -134,14 +180,8 @@ const ShaderProgram* ShaderCache::GetOrCreate(std::span<const uint8_t> shader_mo
   ShaderBytecodeOptions options = GetOptions(shared_memory_read_only);
   options.texture_swizzles = std::move(mappings);
   if (ConvertShaderBytecode(shader_model_51, options, program->bytecode_, program->error_)) {
-    HRESULT result = CreateNative(*program);
-    if (SUCCEEDED(result)) {
+    if (program->CreateNative(device_.device(), program->error_)) {
       ++statistics_.creations;
-    } else {
-      char message[128];
-      std::snprintf(message, sizeof(message), "Native shader creation failed (0x%08X)",
-                    unsigned(result));
-      program->error_ = message;
     }
   }
   if (!program->error_.empty()) {

@@ -1,7 +1,13 @@
 #include "simpsons_init.h"
+#include <rex/ppc/barriers.h>
+#include "native_gpu_direct_draws.h"
 #include <cstdio>
 #include <sys/mman.h>
 #include <unistd.h>
+
+namespace simpsons::native_gpu_calls {
+bool TryUnlockCoherency(PPCContext&, uint8_t*);
+}
 
 // HAND PATCH support: mirrors simpsons_recomp.17.cpp's
 // HandPatchEnsureWritable (separate translation unit, so duplicated here).
@@ -23888,6 +23894,7 @@ loc_82441334:
 	if (ctx.r11.u32 != 0) {
 		HandPatchEnsureWritable16(base + ctx.r11.u32, 48);
 	}
+	if (simpsons::native_gpu_calls::TryUnlockCoherency(ctx, base)) goto loc_824413A0;
 	// li r9,2609
 	ctx.r9.s64 = 2609;
 	// lwz r8,260(r1)
@@ -24243,6 +24250,7 @@ loc_82441554:
 	sub_8245DA50(ctx, base);
 loc_82441568:
 	// sync 
+	REX_PPC_SYNC();
 	// addi r1,r1,128
 	ctx.r1.s64 = ctx.r1.s64 + 128;
 	// b 0x82a3c418
@@ -51115,7 +51123,7 @@ loc_8244C718:
 	ctx.r6.u64 = ctx.r10.u64 | 18618;
 	// stwu r11,4(r30)
 	ea = 4 + ctx.r30.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingStateHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r30.u32 = ea;
 	// mr r5,r26
 	ctx.r5.u64 = ctx.r26.u64;
@@ -51239,7 +51247,7 @@ loc_8244C718:
 	ctx.r9.u64 = __builtin_rotateleft64(ctx.r24.u32 | (ctx.r24.u64 << 32), 16) & 0xFFFF0000;
 	// stwu r11,4(r30)
 	ea = 4 + ctx.r30.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r30.u32 = ea;
 	// or r11,r10,r9
 	ctx.r11.u64 = ctx.r10.u64 | ctx.r9.u64;
@@ -51332,7 +51340,7 @@ loc_8244C824:
 	ctx.r25.u64 = ctx.r9.u64 | 17921;
 	// stwu r5,4(r11)
 	ea = 4 + ctx.r11.u32;
-	REX_STORE_U32(ea, ctx.r5.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r5.u32));
 	ctx.r11.u32 = ea;
 	// rlwinm r9,r10,0,3,30
 	ctx.r9.u64 = __builtin_rotateleft64(ctx.r10.u32 | (ctx.r10.u64 << 32), 0) & 0x1FFFFFFE;
@@ -51927,7 +51935,7 @@ loc_8244CC2C:
 	ctx.r4.u64 = ctx.r21.u64;
 	// stwu r11,4(r30)
 	ea = 4 + ctx.r30.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingStateHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r30.u32 = ea;
 	// rlwinm r10,r25,12,20,31
 	ctx.r10.u64 = __builtin_rotateleft64(ctx.r25.u32 | (ctx.r25.u64 << 32), 12) & 0xFFF;
@@ -52085,7 +52093,7 @@ loc_8244CD60:
 	ctx.r11.u64 = ctx.r11.u64 | 8705;
 	// stwu r11,4(r30)
 	ea = 4 + ctx.r30.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r30.u32 = ea;
 	// stwu r26,4(r30)
 	ea = 4 + ctx.r30.u32;
@@ -52182,7 +52190,7 @@ loc_8244CDB0:
 	ctx.r23.s64 = 25;
 	// stwu r5,4(r11)
 	ea = 4 + ctx.r11.u32;
-	REX_STORE_U32(ea, ctx.r5.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r5.u32));
 	ctx.r11.u32 = ea;
 	// add r10,r10,r9
 	ctx.r10.u64 = ctx.r10.u64 + ctx.r9.u64;
@@ -52772,7 +52780,7 @@ loc_8244D1E4:
 	ctx.cr6.compare<uint32_t>(ctx.r22.u32, 65535, ctx.xer);
 	// stwu r11,4(r3)
 	ea = 4 + ctx.r3.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingStateHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r3.u32 = ea;
 	// mr r30,r3
 	ctx.r30.u64 = ctx.r3.u64;
@@ -52833,7 +52841,7 @@ loc_8244D220:
 	ctx.r9.u64 = ctx.r25.u32 & 0x3F;
 	// stwu r11,4(r30)
 	ea = 4 + ctx.r30.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r30.u32 = ea;
 	// or r11,r10,r9
 	ctx.r11.u64 = ctx.r10.u64 | ctx.r9.u64;
@@ -52922,7 +52930,7 @@ loc_8244D294:
 	ctx.r9.u64 = __builtin_rotateleft64(ctx.r10.u32 | (ctx.r10.u64 << 32), 0) & 0x1FFFFFFE;
 	// stwu r6,4(r11)
 	ea = 4 + ctx.r11.u32;
-	REX_STORE_U32(ea, ctx.r6.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r6.u32));
 	ctx.r11.u32 = ea;
 	// addi r10,r8,512
 	ctx.r10.s64 = ctx.r8.s64 + 512;
@@ -53367,7 +53375,7 @@ loc_8244D5D8:
 	ctx.cr6.compare<uint32_t>(ctx.r17.u32, 65535, ctx.xer);
 	// stwu r11,4(r3)
 	ea = 4 + ctx.r3.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingStateHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r3.u32 = ea;
 	// mr r27,r3
 	ctx.r27.u64 = ctx.r3.u64;
@@ -53480,7 +53488,7 @@ loc_8244D6A0:
 	ctx.r11.u64 = ctx.r23.u64;
 	// stwu r11,4(r27)
 	ea = 4 + ctx.r27.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r27.u32 = ea;
 	// stwu r26,4(r27)
 	ea = 4 + ctx.r27.u32;
@@ -53567,7 +53575,7 @@ loc_8244D6EC:
 	ctx.r9.u64 = ctx.r9.u64 | 17921;
 	// stwu r6,4(r11)
 	ea = 4 + ctx.r11.u32;
-	REX_STORE_U32(ea, ctx.r6.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r6.u32));
 	ctx.r11.u32 = ea;
 	// stw r9,80(r1)
 	REX_STORE_U32(ctx.r1.u32 + 80, ctx.r9.u32);
@@ -54092,7 +54100,7 @@ loc_8244DABC:
 	ctx.cr6.compare<uint32_t>(ctx.r21.u32, 65535, ctx.xer);
 	// stwu r11,4(r3)
 	ea = 4 + ctx.r3.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingStateHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r3.u32 = ea;
 	// mr r30,r3
 	ctx.r30.u64 = ctx.r3.u64;
@@ -54151,7 +54159,7 @@ loc_8244DAF4:
 	ctx.r9.u64 = ctx.r25.u32 & 0x3F;
 	// stwu r11,4(r30)
 	ea = 4 + ctx.r30.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r30.u32 = ea;
 	// or r11,r10,r9
 	ctx.r11.u64 = ctx.r10.u64 | ctx.r9.u64;
@@ -54240,7 +54248,7 @@ loc_8244DB68:
 	ctx.r9.u64 = __builtin_rotateleft64(ctx.r10.u32 | (ctx.r10.u64 << 32), 0) & 0x1FFFFFFE;
 	// stwu r6,4(r11)
 	ea = 4 + ctx.r11.u32;
-	REX_STORE_U32(ea, ctx.r6.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r6.u32));
 	ctx.r11.u32 = ea;
 	// addi r10,r8,512
 	ctx.r10.s64 = ctx.r8.s64 + 512;
@@ -54844,7 +54852,7 @@ loc_8244DFE0:
 	ctx.cr6.compare<uint32_t>(ctx.r16.u32, 65535, ctx.xer);
 	// stwu r11,4(r3)
 	ea = 4 + ctx.r3.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingStateHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r3.u32 = ea;
 	// mr r26,r3
 	ctx.r26.u64 = ctx.r3.u64;
@@ -54996,7 +55004,7 @@ loc_8244E0F0:
 	ctx.r11.u64 = ctx.r23.u64;
 	// stwu r11,4(r26)
 	ea = 4 + ctx.r26.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r26.u32 = ea;
 	// mr r11,r26
 	ctx.r11.u64 = ctx.r26.u64;
@@ -55083,7 +55091,7 @@ loc_8244E13C:
 	ctx.r9.u64 = ctx.r9.u64 | 17921;
 	// stwu r6,4(r11)
 	ea = 4 + ctx.r11.u32;
-	REX_STORE_U32(ea, ctx.r6.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r6.u32));
 	ctx.r11.u32 = ea;
 	// stw r9,80(r1)
 	REX_STORE_U32(ctx.r1.u32 + 80, ctx.r9.u32);
@@ -65219,6 +65227,7 @@ loc_824521DC:
 DEFINE_REX_FUNC(sub_824521F8) {
 	REX_FUNC_PROLOGUE();
 	// eieio 
+	REX_PPC_EIEIO();
 	// li r11,0
 	ctx.r11.s64 = 0;
 	// stw r11,10888(r3)
@@ -65230,6 +65239,7 @@ DEFINE_REX_FUNC(sub_824521F8) {
 DEFINE_REX_FUNC(sub_82452208) {
 	REX_FUNC_PROLOGUE();
 	// eieio 
+	REX_PPC_EIEIO();
 	// stw r4,10888(r3)
 	REX_STORE_U32(ctx.r3.u32 + 10888, ctx.r4.u32);
 	// blr 
@@ -66836,7 +66846,7 @@ loc_82452C00:
 	ctx.r11.u32 = ea;
 	// stwu r10,4(r11)
 	ea = 4 + ctx.r11.u32;
-	REX_STORE_U32(ea, ctx.r10.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r10.u32));
 	ctx.r11.u32 = ea;
 	// stwu r6,4(r11)
 	ea = 4 + ctx.r11.u32;
@@ -69504,7 +69514,9 @@ loc_82453E38:
 	// stw r11,24848(r10)
 	REX_MM_STORE_U32(ctx.r10.u32 + 24848, ctx.r11.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// sync 
+	REX_PPC_SYNC();
 loc_82453E48:
 	// mftb r10
 	ctx.r10.u64 = REX_QUERY_TIMEBASE();
@@ -69754,7 +69766,9 @@ loc_82453FF4:
 	// stw r27,24848(r11)
 	REX_MM_STORE_U32(ctx.r11.u32 + 24848, ctx.r27.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// sync 
+	REX_PPC_SYNC();
 	// b 0x82454028
 	goto loc_82454028;
 loc_8245401C:

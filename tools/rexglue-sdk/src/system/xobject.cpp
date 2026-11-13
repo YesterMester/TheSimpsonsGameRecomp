@@ -214,7 +214,11 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                                 : std::chrono::milliseconds::max();
 
   rex::perf::TraceSwapThreadEvent("kwait", guest_object() ? guest_object() : handle());
-  auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
+  rex::thread::WaitResult result;
+  {
+    XThread::WaitScope scope;
+    result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
+  }
   rex::perf::TraceSwapThreadEvent("kwait_done", uint64_t(result));
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
@@ -243,9 +247,13 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
   rex::perf::TraceSwapThreadEvent("ksigwait", wait_object->guest_object()
                                                   ? wait_object->guest_object()
                                                   : wait_object->handle());
-  auto result =
-      rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
-                                 alertable ? true : false, timeout_ms);
+  rex::thread::WaitResult result;
+  {
+    XThread::WaitScope scope;
+    result =
+        rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
+                                   alertable ? true : false, timeout_ms);
+  }
   rex::perf::TraceSwapThreadEvent("ksigwait_done", uint64_t(result));
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
@@ -279,8 +287,11 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
 
   rex::perf::TraceSwapThreadEvent("kwaitm", count);
   if (wait_type) {
-    auto result =
-        rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
+    std::pair<rex::thread::WaitResult, size_t> result;
+    {
+      XThread::WaitScope scope;
+      result = rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
+    }
     rex::perf::TraceSwapThreadEvent("kwaitm_done", uint64_t(result.first));
     switch (result.first) {
       case rex::thread::WaitResult::kSuccess:
@@ -300,8 +311,11 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
         return X_STATUS_UNSUCCESSFUL;
     }
   } else {
-    auto result =
-        rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
+    rex::thread::WaitResult result;
+    {
+      XThread::WaitScope scope;
+      result = rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
+    }
     rex::perf::TraceSwapThreadEvent("kwaitm_done", uint64_t(result));
     switch (result) {
       case rex::thread::WaitResult::kSuccess:

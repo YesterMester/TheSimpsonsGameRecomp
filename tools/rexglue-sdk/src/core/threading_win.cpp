@@ -43,8 +43,14 @@ void RequestHighResolutionTimer() {
   throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
   throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
   throttling.StateMask = 0;
-  SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling,
-                        sizeof(throttling));
+  using SetProcessInformationFn = BOOL(WINAPI*)(HANDLE, PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
+  HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+  auto set_process_information = kernel32 ? reinterpret_cast<SetProcessInformationFn>(
+      GetProcAddress(kernel32, "SetProcessInformation")) : nullptr;
+  if (set_process_information) {
+    set_process_information(GetCurrentProcess(), ProcessPowerThrottling, &throttling,
+                            sizeof(throttling));
+  }
 
   using NtQueryTimerResolutionFn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
   using NtSetTimerResolutionFn = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
@@ -329,7 +335,7 @@ class Win32Timer : public Win32Handle<Timer> {
     return SetOnceAt(WClock_::now() + rel_time, std::move(opt_callback));
   }
   bool SetOnceAt(GClock_::time_point due_time, std::function<void()> opt_callback) override {
-    return SetOnceAt(std::chrono::clock_cast<WClock_>(due_time), std::move(opt_callback));
+    return SetOnceAt(rex::chrono::clock_cast<WClock_>(due_time), std::move(opt_callback));
   }
   bool SetOnceAt(WClock_::time_point due_time, std::function<void()> opt_callback) override {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -348,7 +354,7 @@ class Win32Timer : public Win32Handle<Timer> {
   }
   bool SetRepeatingAt(GClock_::time_point due_time, std::chrono::milliseconds period,
                       std::function<void()> opt_callback = nullptr) {
-    return SetRepeatingAt(std::chrono::clock_cast<WClock_>(due_time), period,
+    return SetRepeatingAt(rex::chrono::clock_cast<WClock_>(due_time), period,
                           std::move(opt_callback));
   }
   bool SetRepeatingAt(WClock_::time_point due_time, std::chrono::milliseconds period,

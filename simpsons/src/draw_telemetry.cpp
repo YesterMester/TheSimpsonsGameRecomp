@@ -31,9 +31,9 @@
 //     here is bucketed by the guest frame index, which VdSwap stamps on the
 //     guest thread at the true frame boundary.
 //
-// Behavior is byte-identical to the unhooked game: every call forwards to the
-// original body with untouched registers. When the telemetry cvar is off
-// (the default) each hook costs one relaxed atomic load and a branch.
+// With native_gpu_calls disabled, calls forward to the original body with
+// untouched registers. The experimental native producers handle the bounded
+// writers and prepared BeginVertices when enabled; telemetry records both routes.
 //
 // Argument decode is per-hook and deliberately conservative. (prim = r4 & 0x3F,
 // count = r5 & 0xFFFF) was verified by reading the decode in each body; where
@@ -50,6 +50,8 @@
 #include <rex/logging.h>
 #include <rex/perf/frame_index.h>
 #include <rex/ppc.h>
+
+#include "native_gpu_calls.h"
 
 REXCVAR_DEFINE_BOOL(draw_telemetry, false, "GPU",
                     "Log per-frame draw-call attribution (which guest function issues "
@@ -250,14 +252,16 @@ void RecordDraw(size_t hook, uint32_t lr, uint32_t r4, uint32_t r5) {
 
 }  // namespace
 
-// Strong overrides of the generated weak definitions. Registers pass through
-// to the original bodies untouched.
-#define DRAW_TELEMETRY_HOOK(index, name)                                  \
-  REX_FUNC(name) {                                                        \
-    if (TelemetryEnabled()) {                                             \
-      RecordDraw(index, uint32_t(ctx.lr), ctx.r4.u32, ctx.r5.u32);        \
-    }                                                                     \
-    __imp__##name(ctx, base);                                             \
+// Strong overrides preserve the original whole-function fallback when a native
+// producer cannot handle the call.
+#define DRAW_TELEMETRY_HOOK(index, function)                                             \
+  REX_FUNC(function) {                                                                   \
+    if (TelemetryEnabled()) {                                                            \
+      RecordDraw(index, uint32_t(ctx.lr), ctx.r4.u32, ctx.r5.u32);                       \
+    }                                                                                    \
+    if (!simpsons::native_gpu_calls::TrySimpleDraw(                                      \
+            simpsons::native_gpu_calls::FunctionAddress(kHooks[index].name), ctx, base)) \
+      __imp__##function(ctx, base);                                                      \
   }
 
 DRAW_TELEMETRY_HOOK(0, sub_82462810)

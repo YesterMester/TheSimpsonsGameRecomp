@@ -149,8 +149,8 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
 
   uint32_t actual_user_index = user_index;
   if ((actual_user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
-    // Always pin user to 0.
-    actual_user_index = 0;
+    // Keep the any-user query so player two can join and navigate.
+    actual_user_index = 0xFF;
   }
 
   auto* is = input_system();
@@ -160,7 +160,7 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
 // Same as non-ex, just takes a pointer to user index.
 u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
                                  ppc_ptr_t<X_INPUT_KEYSTROKE> keystroke) {
-  if (!keystroke) {
+  if (!user_index_ptr || !keystroke) {
     return X_ERROR_BAD_ARGUMENTS;
   }
 
@@ -171,8 +171,8 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
 
   uint32_t user_index = *user_index_ptr;
   if ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
-    // Always pin user to 0.
-    user_index = 0;
+    // Return the event and its logical player from any assigned input.
+    user_index = 0xFF;
   }
 
   auto* is = input_system();

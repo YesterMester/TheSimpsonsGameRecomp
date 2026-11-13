@@ -1,4 +1,5 @@
 #include "simpsons_init.h"
+#include <rex/ppc/barriers.h>
 
 // HAND PATCH: declarations for analyzer-missed functions now defined
 // in simpsons_recomp.81.cpp.
@@ -40249,6 +40250,7 @@ loc_82C3C698:
 	ctx.lr = 0x82C3C6B8;
 	sub_82A3CD80(ctx, base);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// addi r1,r1,96
 	ctx.r1.s64 = ctx.r1.s64 + 96;
 	// lwz r12,-8(r1)

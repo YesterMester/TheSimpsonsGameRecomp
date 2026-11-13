@@ -14,10 +14,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <d3dcompiler.h>
 #include <cstring>
 #include <iterator>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <tuple>
 #include <utility>
 
@@ -32,12 +34,26 @@
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/trace_writer.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/dxbc_render_target_transfer.h>
+#include <rex/graphics/util/native_color_resolve.h>
+#include <rex/graphics/util/native_resolve_source.h>
+#include <rex/graphics/util/native_depth_resolve.h>
+
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DEFINE_BOOL(d3d12_native_resolve_memory, true, "GPU/D3D12",
+                    "Keep supported original-resolution resolves in resource-local GPU "
+                    "buffers, materializing compatibility memory only when requested")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(d3d12_native_resolve_debug, false, "GPU/D3D12",
+                    "Log the remaining native resolve planning failures");
+REXCVAR_DEFINE_BOOL(d3d12_native_depth_resolves, true, "GPU/D3D12",
+                    "Pack supported depth and stencil directly from native attachments");
 
 REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
                       "D3D12 render target implementation path")
@@ -198,28 +214,6 @@ bool D3D12RenderTargetCache::Initialize() {
     path_ = Path::kHostRenderTargets;
   }
 
-  // Create the buffer for reinterpreting EDRAM contents.
-  uint32_t edram_buffer_size =
-      xenos::kEdramSizeBytes * (draw_resolution_scale_x() * draw_resolution_scale_y());
-  D3D12_RESOURCE_DESC edram_buffer_desc;
-  ui::d3d12::util::FillBufferResourceDesc(edram_buffer_desc, edram_buffer_size,
-                                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-  // The first operation will likely be depth self-comparison with host render
-  // targets or drawing with ROV.
-  edram_buffer_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  // Creating zeroed for stable initial value with ROV (though on a real
-  // console it has to be cleared anyway probably) and not to leak irrelevant
-  // data to trace dumps when not covered by host render targets entirely.
-  if (FAILED(device->CreateCommittedResource(
-          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &edram_buffer_desc,
-          edram_buffer_state_, nullptr, IID_PPV_ARGS(&edram_buffer_)))) {
-    REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the EDRAM buffer");
-    Shutdown();
-    return false;
-  }
-  edram_buffer_->SetName(L"EDRAM Buffer");
-  edram_buffer_modification_status_ = EdramBufferModificationStatus::kUnmodified;
-
   // Create non-shader-visible descriptors of the EDRAM buffer for copying.
   D3D12_DESCRIPTOR_HEAP_DESC edram_buffer_descriptor_heap_desc;
   edram_buffer_descriptor_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -236,46 +230,14 @@ bool D3D12RenderTargetCache::Initialize() {
   }
   edram_buffer_descriptor_heap_start_ =
       edram_buffer_descriptor_heap_->GetCPUDescriptorHandleForHeapStart();
-  ui::d3d12::util::CreateBufferRawSRV(
-      device,
-      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
-                                    uint32_t(EdramBufferDescriptorIndex::kRawSRV)),
-      edram_buffer_, edram_buffer_size);
-  ui::d3d12::util::CreateBufferTypedSRV(
-      device,
-      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
-                                    uint32_t(EdramBufferDescriptorIndex::kR32UintSRV)),
-      edram_buffer_, DXGI_FORMAT_R32_UINT, edram_buffer_size >> 2);
-  ui::d3d12::util::CreateBufferTypedSRV(
-      device,
-      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
-                                    uint32_t(EdramBufferDescriptorIndex::kR32G32UintSRV)),
-      edram_buffer_, DXGI_FORMAT_R32G32_UINT, edram_buffer_size >> 3);
-  ui::d3d12::util::CreateBufferTypedSRV(
-      device,
-      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
-                                    uint32_t(EdramBufferDescriptorIndex::kR32G32B32A32UintSRV)),
-      edram_buffer_, DXGI_FORMAT_R32G32B32A32_UINT, edram_buffer_size >> 4);
-  ui::d3d12::util::CreateBufferRawUAV(
-      device,
-      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
-                                    uint32_t(EdramBufferDescriptorIndex::kRawUAV)),
-      edram_buffer_, edram_buffer_size);
-  ui::d3d12::util::CreateBufferTypedUAV(
-      device,
-      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
-                                    uint32_t(EdramBufferDescriptorIndex::kR32UintUAV)),
-      edram_buffer_, DXGI_FORMAT_R32_UINT, edram_buffer_size >> 2);
-  ui::d3d12::util::CreateBufferTypedUAV(
-      device,
-      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
-                                    uint32_t(EdramBufferDescriptorIndex::kR32G32UintUAV)),
-      edram_buffer_, DXGI_FORMAT_R32G32_UINT, edram_buffer_size >> 3);
-  ui::d3d12::util::CreateBufferTypedUAV(
-      device,
-      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
-                                    uint32_t(EdramBufferDescriptorIndex::kR32G32B32A32UintUAV)),
-      edram_buffer_, DXGI_FORMAT_R32G32B32A32_UINT, edram_buffer_size >> 4);
+  if (path_ == Path::kPixelShaderInterlock) {
+    if (!EnsureEdramBuffer()) {
+      Shutdown();
+      return false;
+    }
+  } else {
+    UpdateEdramBufferDescriptors();
+  }
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -329,13 +291,6 @@ bool D3D12RenderTargetCache::Initialize() {
     Shutdown();
     return false;
   }
-  // Direct resolve currently shares the root signature shape with the resolve
-  // copy pass (constants + destination UAV + source SRV) and may diverge later.
-  direct_resolve_root_signature_color_ = resolve_copy_root_signature_;
-  direct_resolve_root_signature_depth_ = resolve_copy_root_signature_;
-  direct_resolve_root_signature_color_->AddRef();
-  direct_resolve_root_signature_depth_->AddRef();
-
   // Create the resolve copying pipelines.
   for (size_t i = 0; i < size_t(draw_util::ResolveCopyShaderIndex::kCount); ++i) {
     const draw_util::ResolveCopyShaderInfo& resolve_copy_shader_info =
@@ -956,6 +911,7 @@ bool D3D12RenderTargetCache::Initialize() {
 }
 
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
+  native_depth_snapshots_.clear();
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -973,21 +929,6 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
     }
   }
   dump_pipelines_.clear();
-  for (const auto& direct_resolve_pipeline_pair : direct_resolve_pipelines_) {
-    bool aliased_resolve_copy_pipeline = false;
-    for (ID3D12PipelineState* resolve_copy_pipeline : resolve_copy_pipelines_) {
-      if (direct_resolve_pipeline_pair.second == resolve_copy_pipeline) {
-        aliased_resolve_copy_pipeline = true;
-        break;
-      }
-    }
-    if (direct_resolve_pipeline_pair.second && !aliased_resolve_copy_pipeline) {
-      direct_resolve_pipeline_pair.second->Release();
-    }
-  }
-  direct_resolve_pipelines_.clear();
-  ui::d3d12::util::ReleaseAndNull(direct_resolve_root_signature_depth_);
-  ui::d3d12::util::ReleaseAndNull(direct_resolve_root_signature_color_);
   ui::d3d12::util::ReleaseAndNull(dump_root_signature_depth_);
   ui::d3d12::util::ReleaseAndNull(dump_root_signature_color_);
 
@@ -1026,6 +967,14 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
     ui::d3d12::util::ReleaseAndNull(resolve_copy_pipelines_[i]);
   }
   ui::d3d12::util::ReleaseAndNull(resolve_copy_root_signature_);
+  for (auto& pipeline : native_color_copy_pipeline_)
+    ui::d3d12::util::ReleaseAndNull(pipeline);
+  ui::d3d12::util::ReleaseAndNull(native_color_copy_root_signature_);
+  native_color_copy_attempted_ = {};
+  for (auto& pipeline : native_depth_copy_pipeline_)
+    ui::d3d12::util::ReleaseAndNull(pipeline);
+  ui::d3d12::util::ReleaseAndNull(native_depth_copy_root_signature_);
+  native_depth_copy_attempted_ = {};
 
   edram_snapshot_restore_pool_.reset();
   ui::d3d12::util::ReleaseAndNull(edram_snapshot_download_buffer_);
@@ -1038,7 +987,16 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   }
 }
 
+void D3D12RenderTargetCache::ClearCache() {
+  // Cache clearing is performed with the GPU idle.
+  native_depth_snapshots_.clear();
+  RenderTargetCache::ClearCache();
+}
+
 void D3D12RenderTargetCache::CompletedSubmissionUpdated() {
+  while (!native_depth_snapshots_.empty() &&
+         native_depth_snapshots_.front().first <= command_processor_.GetCompletedSubmission())
+    native_depth_snapshots_.pop_front();
   if (edram_snapshot_restore_pool_) {
     edram_snapshot_restore_pool_->Reclaim(command_processor_.GetCompletedSubmission());
   }
@@ -1089,6 +1047,86 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
       return false;
   }
   return true;
+}
+
+bool D3D12RenderTargetCache::EnsureEdramBuffer() {
+  if (edram_buffer_) {
+    return true;
+  }
+  const auto& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  // Create the buffer for reinterpreting EDRAM contents.
+  uint32_t edram_buffer_size =
+      xenos::kEdramSizeBytes * (draw_resolution_scale_x() * draw_resolution_scale_y());
+  D3D12_RESOURCE_DESC edram_buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(edram_buffer_desc, edram_buffer_size,
+                                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  // The first operation will likely be depth self-comparison with host render
+  // targets or drawing with ROV.
+  edram_buffer_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  // Creating zeroed for stable initial value with ROV (though on a real
+  // console it has to be cleared anyway probably) and not to leak irrelevant
+  // data to trace dumps when not covered by host render targets entirely.
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &edram_buffer_desc,
+          edram_buffer_state_, nullptr, IID_PPV_ARGS(&edram_buffer_)))) {
+    REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the EDRAM buffer");
+    return false;
+  }
+  edram_buffer_->SetName(L"EDRAM Buffer");
+  command_processor_.native_gpu_diagnostics().RecordAllocation(
+      NativeGpuDiagnostics::Allocation::kEdram, edram_buffer_size, edram_buffer_size);
+  edram_buffer_modification_status_ = EdramBufferModificationStatus::kUnmodified;
+
+  UpdateEdramBufferDescriptors();
+  return true;
+}
+
+void D3D12RenderTargetCache::UpdateEdramBufferDescriptors() {
+  const auto& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  uint32_t edram_buffer_size =
+      xenos::kEdramSizeBytes * (draw_resolution_scale_x() * draw_resolution_scale_y());
+  ui::d3d12::util::CreateBufferRawSRV(
+      device,
+      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
+                                    uint32_t(EdramBufferDescriptorIndex::kRawSRV)),
+      edram_buffer_, edram_buffer_size);
+  ui::d3d12::util::CreateBufferTypedSRV(
+      device,
+      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
+                                    uint32_t(EdramBufferDescriptorIndex::kR32UintSRV)),
+      edram_buffer_, DXGI_FORMAT_R32_UINT, edram_buffer_size >> 2);
+  ui::d3d12::util::CreateBufferTypedSRV(
+      device,
+      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
+                                    uint32_t(EdramBufferDescriptorIndex::kR32G32UintSRV)),
+      edram_buffer_, DXGI_FORMAT_R32G32_UINT, edram_buffer_size >> 3);
+  ui::d3d12::util::CreateBufferTypedSRV(
+      device,
+      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
+                                    uint32_t(EdramBufferDescriptorIndex::kR32G32B32A32UintSRV)),
+      edram_buffer_, DXGI_FORMAT_R32G32B32A32_UINT, edram_buffer_size >> 4);
+  ui::d3d12::util::CreateBufferRawUAV(
+      device,
+      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
+                                    uint32_t(EdramBufferDescriptorIndex::kRawUAV)),
+      edram_buffer_, edram_buffer_size);
+  ui::d3d12::util::CreateBufferTypedUAV(
+      device,
+      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
+                                    uint32_t(EdramBufferDescriptorIndex::kR32UintUAV)),
+      edram_buffer_, DXGI_FORMAT_R32_UINT, edram_buffer_size >> 2);
+  ui::d3d12::util::CreateBufferTypedUAV(
+      device,
+      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
+                                    uint32_t(EdramBufferDescriptorIndex::kR32G32UintUAV)),
+      edram_buffer_, DXGI_FORMAT_R32G32_UINT, edram_buffer_size >> 3);
+  ui::d3d12::util::CreateBufferTypedUAV(
+      device,
+      provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
+                                    uint32_t(EdramBufferDescriptorIndex::kR32G32B32A32UintUAV)),
+      edram_buffer_, DXGI_FORMAT_R32G32B32A32_UINT, edram_buffer_size >> 4);
 }
 
 void D3D12RenderTargetCache::WriteEdramRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
@@ -1177,6 +1215,19 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     return false;
   }
 
+  const bool source_original_resolution =
+      draw_resolution_scaled && GetPath() == Path::kHostRenderTargets &&
+      resolve_info.IsCopyingDepth() &&
+      IsOriginalResolutionRenderTarget(resolve_info.depth_original_base,
+                                       resolve_info.depth_edram_info.pitch_tiles, true);
+  if (source_original_resolution) {
+    draw_resolution_scaled = false;
+    if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_, 1, 1,
+                                   fixed_16_truncated_to_minus_1_to_1,
+                                   fixed_16_truncated_to_minus_1_to_1, resolve_info))
+      return false;
+  }
+
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
@@ -1190,36 +1241,47 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =
-        resolve_info.GetCopyShader(draw_resolution_scale_x(), draw_resolution_scale_y(),
+        resolve_info.GetCopyShader(draw_resolution_scaled ? draw_resolution_scale_x() : 1u,
+                                   draw_resolution_scaled ? draw_resolution_scale_y() : 1u,
                                    copy_shader_constants, copy_group_count_x, copy_group_count_y);
     assert_true(copy_group_count_x && copy_group_count_y);
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
-      bool direct_resolved = false;
+      NativeResolveCopy native_copy;
+      bool native_surface_copy = false, native_depth_copy = false;
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
-          direct_resolved =
-              TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
-          if (direct_resolved) {
-            ++direct_resolve_success_count_;
-          } else {
-            ++direct_resolve_fallback_count_;
-          }
+          PlanNativeResolveCopy(resolve_info, texture_cache, native_copy);
+          native_surface_copy =
+              native_copy.source &&
+              GetOrCreateNativeResolvePipeline(
+                  resolve_info.IsCopyingDepth(), native_copy.integer_source,
+                  native_copy.source->key().msaa_samples != xenos::MsaaSamples::k1X);
+          native_depth_copy = native_surface_copy && resolve_info.IsCopyingDepth();
         }
-        if (!direct_resolved) {
-          // Dump the current contents of the render targets owning the affected
-          // range to edram_buffer_.
-          uint32_t dump_base;
-          uint32_t dump_row_length_used;
-          uint32_t dump_rows;
-          uint32_t dump_pitch;
-          resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
-            REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
-            return false;
-          }
+        // Keep the guest-memory copy coherent for consumers outside the native
+        // texture path, including CPU readback and differently shaped aliases.
+        uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
+        resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+        if (!native_surface_copy &&
+            !DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
+          REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
+          return false;
         }
+      }
+
+      if (!native_surface_copy) {
+        command_processor_.native_gpu_diagnostics().RecordDependency(
+            NativeGpuDiagnostics::Dependency::kResolveFallback,
+            resolve_info.copy_dest_extent_length,
+            "D3D12 resolve uses encoded render target samples");
+      }
+      D3D12SharedMemory::NativeResolveHandle native_destination;
+      if (native_surface_copy && !draw_resolution_scaled &&
+          REXCVAR_GET(d3d12_native_resolve_memory)) {
+        native_destination = shared_memory.PrepareNativeResolve(
+            resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length);
       }
 
       // Make sure there is memory to write to.
@@ -1236,8 +1298,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                                             resolve_info.copy_dest_base +
                                                             resolve_info.copy_dest_extent_length);
       } else {
-        copy_dest_committed = shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
-                                                         resolve_info.copy_dest_extent_length);
+        copy_dest_committed =
+            native_destination || shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
+                                                             resolve_info.copy_dest_extent_length);
       }
       if (copy_dest_committed) {
         // Write the descriptors and transition the resources.
@@ -1247,17 +1310,29 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         // (D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP).
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_dest;
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_source;
-        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
-        if (command_processor_.RequestOneUseSingleViewDescriptors(
-                bindless_resources_used_ ? uint32_t(draw_resolution_scaled) : 2, descriptors)) {
+        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_stencil;
+        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[3];
+        uint32_t dest_bpe_log2 = native_surface_copy ? 2 : copy_shader_info.dest_bpe_log2;
+        bool resource_local_destination = draw_resolution_scaled || native_destination;
+        uint32_t descriptor_count = bindless_resources_used_
+                                        ? uint32_t(resource_local_destination) +
+                                              uint32_t(native_surface_copy) +
+                                              uint32_t(native_depth_copy)
+                                        : 2 + uint32_t(native_depth_copy);
+        if (command_processor_.RequestOneUseSingleViewDescriptors(descriptor_count, descriptors)) {
           if (bindless_resources_used_) {
-            if (draw_resolution_scaled) {
+            if (resource_local_destination) {
               descriptor_dest = descriptors[0];
             } else {
-              descriptor_dest = command_processor_.GetSharedMemoryUintPow2BindlessUAVHandlePair(
-                  copy_shader_info.dest_bpe_log2);
+              descriptor_dest =
+                  command_processor_.GetSharedMemoryUintPow2BindlessUAVHandlePair(dest_bpe_log2);
             }
-            if (copy_shader_info.source_is_raw) {
+            if (native_surface_copy) {
+              descriptor_source = descriptors[uint32_t(resource_local_destination)];
+              if (native_depth_copy) {
+                descriptor_stencil = descriptors[uint32_t(resource_local_destination) + 1];
+              }
+            } else if (copy_shader_info.source_is_raw) {
               descriptor_source = command_processor_.GetSystemBindlessViewHandlePair(
                   D3D12CommandProcessor::SystemBindlessView::kEdramRawSRV);
             } else {
@@ -1266,12 +1341,16 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             }
           } else {
             descriptor_dest = descriptors[0];
-            if (!draw_resolution_scaled) {
-              shared_memory.WriteUintPow2UAVDescriptor(descriptor_dest.first,
-                                                       copy_shader_info.dest_bpe_log2);
+            if (!draw_resolution_scaled && !native_destination) {
+              shared_memory.WriteUintPow2UAVDescriptor(descriptor_dest.first, dest_bpe_log2);
             }
             descriptor_source = descriptors[1];
-            if (copy_shader_info.source_is_raw) {
+            if (native_depth_copy) {
+              descriptor_stencil = descriptors[2];
+            }
+            if (native_surface_copy) {
+              // Written below using the host image SRV.
+            } else if (copy_shader_info.source_is_raw) {
               WriteEdramRawSRVDescriptor(descriptor_source.first);
             } else {
               WriteEdramUintPow2SRVDescriptor(descriptor_source.first,
@@ -1279,20 +1358,92 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             }
           }
           if (draw_resolution_scaled) {
-            texture_cache.CreateCurrentScaledResolveRangeUintPow2UAV(
-                descriptor_dest.first, copy_shader_info.dest_bpe_log2);
+            texture_cache.CreateCurrentScaledResolveRangeUintPow2UAV(descriptor_dest.first,
+                                                                     dest_bpe_log2);
             texture_cache.TransitionCurrentScaledResolveRange(
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          } else if (native_destination) {
+            shared_memory.WriteNativeResolveUAV(native_destination, descriptor_dest.first);
           } else {
             shared_memory.UseForWriting();
           }
-          TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          if (native_surface_copy) {
+            command_processor_.GetD3D12Provider().GetDevice()->CopyDescriptorsSimple(
+                1, descriptor_source.first, native_copy.source->descriptor_srv().GetHandle(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            if (native_depth_copy) {
+              command_processor_.GetD3D12Provider().GetDevice()->CopyDescriptorsSimple(
+                  1, descriptor_stencil.first,
+                  native_copy.source->descriptor_srv_stencil().GetHandle(),
+                  D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            }
+            command_processor_.PushTransitionBarrier(
+                native_copy.source->resource(),
+                native_copy.source->SetResourceState(
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          } else {
+            TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          }
 
           // Submit the resolve.
-          command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
+          command_list.D3DSetComputeRootSignature(
+              native_surface_copy ? (native_depth_copy ? native_depth_copy_root_signature_
+                                                       : native_color_copy_root_signature_)
+                                  : resolve_copy_root_signature_);
           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
-          if (draw_resolution_scaled) {
+          if (native_depth_copy) {
+            command_list.D3DSetComputeRootDescriptorTable(3, descriptor_stencil.second);
+          }
+          if (native_surface_copy) {
+            uint32_t width = uint32_t(resolve_info.coordinate_info.width_div_8) << 3;
+            uint32_t height = resolve_info.height_div_8 << 3;
+            auto samples = native_copy.source->key().msaa_samples;
+            uint32_t sample_map =
+                samples == xenos::MsaaSamples::k4X
+                    ? 0xD8u
+                    : draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_supported_) |
+                          (draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_supported_)
+                           << 2);
+            uint32_t values[20] = {
+                width,
+                height,
+                uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5,
+                draw_resolution_scaled
+                    ? (resolve_info.copy_dest_base_raw - resolve_info.copy_dest_base) *
+                          native_copy.scale_x * native_copy.scale_y
+                    : resolve_info.copy_dest_base_raw -
+                          (native_destination ? native_destination->address : 0),
+                native_copy.scale_x,
+                native_copy.scale_y,
+                native_depth_copy ? uint32_t(native_copy.source->key().GetDepthFormat() ==
+                                             xenos::DepthRenderTargetFormat::kD24FS8)
+                                  : native_copy.color_packing,
+                uint32_t(resolve_info.copy_dest_info.copy_dest_endian),
+                native_depth_copy
+                    ? uint32_t(!depth_float24_convert_in_pixel_shader() && depth_float24_round())
+                    : uint32_t(native_copy.red_blue_swapped),
+                uint32_t(!draw_resolution_scaled),
+                resolve_info.rect_x0,
+                resolve_info.rect_y0,
+                uint32_t(resolve_info.copy_dest_coordinate_info.height_aligned_div_32) << 5,
+                uint32_t(resolve_info.copy_dest_info.copy_dest_slice),
+                uint32_t(resolve_info.copy_dest_info.copy_dest_array),
+                uint32_t(127 + int32_t(resolve_info.copy_dest_info.copy_dest_exp_bias)) << 23,
+                uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select),
+                sample_map,
+                native_depth_copy
+                    ? 0u
+                    : uint32_t(draw_util::GetNativeColorResolvePacking(
+                          xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format))),
+                native_copy.source_layout};
+            command_list.D3DSetComputeRoot32BitConstants(0, 20, values, 0);
+            copy_group_count_x =
+                (width * (draw_resolution_scaled ? native_copy.scale_x : 1) + 7) / 8;
+            copy_group_count_y =
+                (height * (draw_resolution_scaled ? native_copy.scale_y : 1) + 7) / 8;
+          } else if (draw_resolution_scaled) {
             command_list.D3DSetComputeRoot32BitConstants(
                 0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
                 &copy_shader_constants.dest_relative, 0);
@@ -1300,20 +1451,46 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             command_list.D3DSetComputeRoot32BitConstants(
                 0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
           }
-          command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
+          command_processor_.SetExternalPipeline(
+              native_surface_copy
+                  ? (native_depth_copy
+                         ? native_depth_copy_pipeline_[native_copy.source->key().msaa_samples !=
+                                                       xenos::MsaaSamples::k1X]
+                         : native_color_copy_pipeline_[uint32_t(native_copy.integer_source) |
+                                                       (uint32_t(native_copy.source->key()
+                                                                     .msaa_samples !=
+                                                                 xenos::MsaaSamples::k1X)
+                                                        << 1)])
+                  : resolve_copy_pipelines_[size_t(copy_shader)]);
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
+          if (native_surface_copy) {
+            command_processor_.native_gpu_diagnostics().RecordOperation(
+                NativeGpuDiagnostics::Operation::kResolve);
+            if (++native_color_pack_count_ <= 8 || !(native_color_pack_count_ & 4095)) {
+              REXGPU_INFO("[d3d12-native-resolve] {} attachment resolves packed from host images",
+                          native_color_pack_count_);
+            }
+          }
 
           // Order the resolve with other work using the destination as a UAV.
           if (draw_resolution_scaled) {
             texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+          } else if (native_destination) {
+            shared_memory.MarkNativeResolveUAVWrites(native_destination);
           } else {
             shared_memory.MarkUAVWritesCommitNeeded();
           }
 
           // Invalidate textures and mark the range as scaled if needed.
+          if (native_destination)
+            shared_memory.BeginNativeResolveWrite(native_destination);
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
+                                            resolve_info.copy_dest_extent_length,
+                                            source_original_resolution);
+          if (native_destination && !shared_memory.EndNativeResolveWrite())
+            return false;
+          PerformNativeResolveCopy(native_copy, texture_cache);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
@@ -1710,9 +1887,10 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   D3D12_RESOURCE_DESC resource_desc;
   resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   resource_desc.Alignment = 0;
-  resource_desc.Width = key.GetWidth() * draw_resolution_scale_x();
-  resource_desc.Height =
-      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) * draw_resolution_scale_y();
+  resource_desc.Width = key.GetWidth() * GetRenderTargetScaleX(key);
+  resource_desc.Height = GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples,
+                                               GetRenderTargetScaleY(key)) *
+                         GetRenderTargetScaleY(key);
   resource_desc.DepthOrArraySize = 1;
   resource_desc.MipLevels = 1;
   if (key.is_depth) {
@@ -1870,6 +2048,11 @@ void D3D12RenderTargetCache::RequestPixelShaderInterlockBarrier() {
 }
 
 void D3D12RenderTargetCache::TransitionEdramBuffer(D3D12_RESOURCE_STATES new_state) {
+  if (!EnsureEdramBuffer()) {
+    throw std::runtime_error("Could not allocate D3D12 compatibility render target storage");
+  }
+  command_processor_.native_gpu_diagnostics().RecordDependency(
+      NativeGpuDiagnostics::Dependency::kEdram, 0, "use D3D12 EDRAM-layout buffer");
   if (command_processor_.PushTransitionBarrier(edram_buffer_, edram_buffer_state_, new_state)) {
     // Resetting edram_buffer_modification_status_ only if the barrier has been
     // truly inserted - in particular, not resetting it for UAV > UAV as
@@ -1927,1888 +2110,40 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                                                        ? mode.root_signature_with_stencil_ref
                                                        : mode.root_signature_no_stencil_ref)];
 
-  // If not dest_is_color, it's depth, or stencil bit - 40-sample columns are
-  // swapped as opposed to color source.
-  bool dest_is_color = (mode.output == TransferOutput::kColor);
+  const bool dest_is_color = mode.output == TransferOutput::kColor;
+  const auto dest_color_format = xenos::ColorRenderTargetFormat(key.dest_resource_format);
+  const auto dest_depth_format = xenos::DepthRenderTargetFormat(key.dest_resource_format);
+  const auto source_color_format = xenos::ColorRenderTargetFormat(key.source_resource_format);
+  const auto source_depth_format = xenos::DepthRenderTargetFormat(key.source_resource_format);
 
-  xenos::ColorRenderTargetFormat dest_color_format =
-      xenos::ColorRenderTargetFormat(key.dest_resource_format);
-  xenos::DepthRenderTargetFormat dest_depth_format =
-      xenos::DepthRenderTargetFormat(key.dest_resource_format);
-  bool dest_is_64bpp = dest_is_color && xenos::IsColorRenderTargetFormat64bpp(dest_color_format);
-
-  xenos::ColorRenderTargetFormat source_color_format =
-      xenos::ColorRenderTargetFormat(key.source_resource_format);
-  xenos::DepthRenderTargetFormat source_depth_format =
-      xenos::DepthRenderTargetFormat(key.source_resource_format);
-  // If not source_is_color, it's depth / stencil - 40-sample columns are
-  // swapped as opposed to color destination.
-  bool source_is_color = (rs & kTransferUsedRootParameterColorSRVBit) != 0;
-  bool source_is_64bpp;
-  uint32_t source_color_format_component_count;
-  uint32_t source_color_srv_component_mask;
-  bool source_color_is_uint;
-  if (source_is_color) {
-    assert_zero(rs & kTransferUsedRootParameterDepthSRVBit);
-    assert_zero(rs & kTransferUsedRootParameterStencilSRVBit);
-    source_is_64bpp = xenos::IsColorRenderTargetFormat64bpp(source_color_format);
-    source_color_format_component_count =
-        xenos::GetColorRenderTargetFormatComponentCount(source_color_format);
-    if (dest_is_stencil_bit) {
-      if (source_is_64bpp && !dest_is_64bpp) {
-        // Need one component, but choosing from the two 32bpp halves of the
-        // 64bpp sample.
-        source_color_srv_component_mask = 0b1 | (0b1 << (source_color_format_component_count >> 1));
-      } else {
-        // Red is at least 8 bits per component in all formats.
-        source_color_srv_component_mask = 0b1;
-      }
-    } else {
-      source_color_srv_component_mask = (uint32_t(1) << source_color_format_component_count) - 1;
-    }
-    GetColorOwnershipTransferDXGIFormat(source_color_format, &source_color_is_uint);
-  } else {
-    source_is_64bpp = false;
-    source_color_format_component_count = 0;
-    source_color_srv_component_mask = 0;
-    source_color_is_uint = false;
+  // DX11 and DX12 share the sample-address and format-preservation contract.
+  // Generate it once so fixes to aliases and resolution transitions agree.
+  using Generator = DxbcRenderTargetTransferShader;
+  Generator::TransferShaderKey shader_key;
+  shader_key.dest_msaa_samples = key.dest_msaa_samples;
+  shader_key.dest_resource_format = key.dest_resource_format;
+  shader_key.source_msaa_samples = key.source_msaa_samples;
+  shader_key.host_depth_source_msaa_samples = key.host_depth_source_msaa_samples;
+  shader_key.source_resource_format = key.source_resource_format;
+  shader_key.host_depth_source_is_copy = key.host_depth_source_is_copy;
+  shader_key.dest_original_resolution = key.dest_original_resolution;
+  shader_key.source_original_resolution = key.source_original_resolution;
+  shader_key.host_depth_source_original_resolution = key.host_depth_source_original_resolution;
+  shader_key.mode = Generator::TransferMode(uint32_t(key.mode));
+  Generator::Options options;
+  options.resolution_scale_x = draw_resolution_scale_x();
+  options.resolution_scale_y = draw_resolution_scale_y();
+  options.msaa_2x_supported = msaa_2x_supported_;
+  options.stencil_reference_output = use_stencil_reference_output_;
+  options.depth_float24_convert_in_pixel_shader = depth_float24_convert_in_pixel_shader();
+  options.depth_float24_round = depth_float24_round();
+  options.portable_integer_division = true;
+  std::string error;
+  if (!Generator::Create(shader_key, options, built_shader_, error)) {
+    REXGPU_ERROR("D3D12 render target transfer shader: {}", error);
+    return nullptr;
   }
-
-  bool shader_uses_stencil_reference_output =
-      mode.output == TransferOutput::kDepth && use_stencil_reference_output_;
-
-  // Because of built_shader_.resize(), pointers can't be kept persistently
-  // here! Resizing also zeroes the memory.
-
-  built_shader_.clear();
-
-  // RDEF, ISGN, OSGN, SHEX, optionally SFI0, STAT.
-  uint32_t blob_count = 5 + uint32_t(shader_uses_stencil_reference_output);
-
-  // Allocate space for the container header and the blob offsets.
-  built_shader_.resize(sizeof(dxbc::ContainerHeader) / sizeof(uint32_t) + blob_count);
-  uint32_t blob_offset_position_dwords = sizeof(dxbc::ContainerHeader) / sizeof(uint32_t);
-  uint32_t blob_position_dwords = uint32_t(built_shader_.size());
-  constexpr uint32_t kBlobHeaderSizeDwords = sizeof(dxbc::BlobHeader) / sizeof(uint32_t);
-
-  uint32_t name_ptr;
-
-  // ***************************************************************************
-  // Resource definition
-  // ***************************************************************************
-
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
-  uint32_t rdef_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-  // Not needed, as the next operation done is resize, to allocate the space for
-  // both the blob header and the resource definition header.
-  // built_shader_.resize(rdef_position_dwords);
-
-  // Allocate space for the RDEF header.
-  built_shader_.resize(rdef_position_dwords + sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
-  // Generator name.
-  dxbc::AppendAlignedString(built_shader_, "Xenia");
-
-  // Constant types - uint (aka "dword" when it's scalar) only.
-  // Names.
-  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
-  uint32_t rdef_dword_name_ptr = name_ptr;
-  name_ptr += dxbc::AppendAlignedString(built_shader_, "dword");
-  // Types.
-  uint32_t rdef_type_uint_position_dwords = uint32_t(built_shader_.size());
-  uint32_t rdef_type_uint_ptr =
-      uint32_t((rdef_type_uint_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
-  built_shader_.resize(rdef_type_uint_position_dwords + sizeof(dxbc::RdefType) / sizeof(uint32_t));
-  {
-    auto& rdef_type_uint =
-        *reinterpret_cast<dxbc::RdefType*>(built_shader_.data() + rdef_type_uint_position_dwords);
-    rdef_type_uint.variable_class = dxbc::RdefVariableClass::kScalar;
-    rdef_type_uint.variable_type = dxbc::RdefVariableType::kUInt;
-    rdef_type_uint.row_count = 1;
-    rdef_type_uint.column_count = 1;
-    rdef_type_uint.name_ptr = rdef_dword_name_ptr;
-  }
-
-  // Constants, if needed:
-  // - uint xe_transfer_stencil_mask
-  // - uint xe_transfer_address
-  // - uint xe_transfer_host_depth_address
-  uint32_t rdef_constant_count = 0;
-  uint32_t rdef_constant_index_stencil_mask =
-      (rs & kTransferUsedRootParameterStencilMaskConstantBit) ? rdef_constant_count++ : UINT32_MAX;
-  assert_false(dest_is_stencil_bit && rdef_constant_index_stencil_mask == UINT32_MAX);
-  uint32_t rdef_constant_index_address =
-      (rs & kTransferUsedRootParameterAddressConstantBit) ? rdef_constant_count++ : UINT32_MAX;
-  assert_true(rdef_constant_index_address != UINT32_MAX);
-  uint32_t rdef_constant_index_host_depth_address =
-      (rs & kTransferUsedRootParameterHostDepthAddressConstantBit) ? rdef_constant_count++
-                                                                   : UINT32_MAX;
-  // Names.
-  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
-  uint32_t rdef_xe_transfer_stencil_mask_name_ptr = name_ptr;
-  if (rdef_constant_index_stencil_mask != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_stencil_mask");
-  }
-  uint32_t rdef_xe_transfer_address_name_ptr = name_ptr;
-  if (rdef_constant_index_address != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_address");
-  }
-  uint32_t rdef_xe_transfer_host_depth_address_name_ptr = name_ptr;
-  if (rdef_constant_index_host_depth_address != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_host_depth_address");
-  }
-  // Constants.
-  uint32_t rdef_constants_position_dwords = uint32_t(built_shader_.size());
-  uint32_t rdef_constants_ptr =
-      uint32_t((rdef_constants_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
-  built_shader_.resize(rdef_constants_position_dwords +
-                       sizeof(dxbc::RdefVariable) / sizeof(uint32_t) * rdef_constant_count);
-  {
-    auto rdef_constants = reinterpret_cast<dxbc::RdefVariable*>(built_shader_.data() +
-                                                                rdef_constants_position_dwords);
-    // uint xe_transfer_stencil_mask
-    if (rdef_constant_index_stencil_mask != UINT32_MAX) {
-      dxbc::RdefVariable& rdef_constant_stencil_mask =
-          rdef_constants[rdef_constant_index_stencil_mask];
-      rdef_constant_stencil_mask.name_ptr = rdef_xe_transfer_stencil_mask_name_ptr;
-      rdef_constant_stencil_mask.size_bytes = sizeof(uint32_t);
-      rdef_constant_stencil_mask.flags = dxbc::kRdefVariableFlagUsed;
-      rdef_constant_stencil_mask.type_ptr = rdef_type_uint_ptr;
-      rdef_constant_stencil_mask.start_texture = UINT32_MAX;
-      rdef_constant_stencil_mask.start_sampler = UINT32_MAX;
-    }
-    // uint xe_transfer_address
-    if (rdef_constant_index_address != UINT32_MAX) {
-      dxbc::RdefVariable& rdef_constant_address = rdef_constants[rdef_constant_index_address];
-      rdef_constant_address.name_ptr = rdef_xe_transfer_address_name_ptr;
-      rdef_constant_address.size_bytes = sizeof(uint32_t);
-      rdef_constant_address.flags = dxbc::kRdefVariableFlagUsed;
-      rdef_constant_address.type_ptr = rdef_type_uint_ptr;
-      rdef_constant_address.start_texture = UINT32_MAX;
-      rdef_constant_address.start_sampler = UINT32_MAX;
-    }
-    // uint xe_transfer_host_depth_address
-    if (rdef_constant_index_host_depth_address != UINT32_MAX) {
-      dxbc::RdefVariable& rdef_constant_host_depth_address =
-          rdef_constants[rdef_constant_index_host_depth_address];
-      rdef_constant_host_depth_address.name_ptr = rdef_xe_transfer_host_depth_address_name_ptr;
-      rdef_constant_host_depth_address.size_bytes = sizeof(uint32_t);
-      rdef_constant_host_depth_address.flags = dxbc::kRdefVariableFlagUsed;
-      rdef_constant_host_depth_address.type_ptr = rdef_type_uint_ptr;
-      rdef_constant_host_depth_address.start_texture = UINT32_MAX;
-      rdef_constant_host_depth_address.start_sampler = UINT32_MAX;
-    }
-  }
-
-  // Constant buffers, if needed:
-  // - xe_transfer_stencil_mask { uint xe_transfer_stencil_mask; }
-  // - xe_transfer_address { uint xe_transfer_address; }
-  // - xe_transfer_host_depth_address { uint xe_transfer_host_depth_address; }
-  // Reusing the constant names for constant buffers.
-  uint32_t rdef_cbuffer_count = 0;
-  uint32_t cbuffer_index_stencil_mask =
-      rdef_constant_index_stencil_mask != UINT32_MAX ? rdef_cbuffer_count++ : UINT32_MAX;
-  uint32_t cbuffer_index_address =
-      rdef_constant_index_address != UINT32_MAX ? rdef_cbuffer_count++ : UINT32_MAX;
-  uint32_t cbuffer_index_host_depth_address =
-      rdef_constant_index_host_depth_address != UINT32_MAX ? rdef_cbuffer_count++ : UINT32_MAX;
-  uint32_t rdef_cbuffer_position_dwords = uint32_t(built_shader_.size());
-  built_shader_.resize(rdef_cbuffer_position_dwords +
-                       sizeof(dxbc::RdefCbuffer) / sizeof(uint32_t) * rdef_cbuffer_count);
-  {
-    auto rdef_cbuffers =
-        reinterpret_cast<dxbc::RdefCbuffer*>(built_shader_.data() + rdef_cbuffer_position_dwords);
-    // xe_transfer_stencil_mask
-    if (cbuffer_index_stencil_mask != UINT32_MAX) {
-      dxbc::RdefCbuffer& rdef_cbuffer_stencil_mask = rdef_cbuffers[cbuffer_index_stencil_mask];
-      rdef_cbuffer_stencil_mask.name_ptr = rdef_xe_transfer_stencil_mask_name_ptr;
-      rdef_cbuffer_stencil_mask.variable_count = 1;
-      rdef_cbuffer_stencil_mask.variables_ptr = uint32_t(
-          rdef_constants_ptr + sizeof(dxbc::RdefVariable) * rdef_constant_index_stencil_mask);
-      rdef_cbuffer_stencil_mask.size_vector_aligned_bytes = sizeof(uint32_t) * 4;
-    }
-    // xe_transfer_address
-    if (cbuffer_index_address != UINT32_MAX) {
-      dxbc::RdefCbuffer& rdef_cbuffer_address = rdef_cbuffers[cbuffer_index_address];
-      rdef_cbuffer_address.name_ptr = rdef_xe_transfer_address_name_ptr;
-      rdef_cbuffer_address.variable_count = 1;
-      rdef_cbuffer_address.variables_ptr =
-          uint32_t(rdef_constants_ptr + sizeof(dxbc::RdefVariable) * rdef_constant_index_address);
-      rdef_cbuffer_address.size_vector_aligned_bytes = sizeof(uint32_t) * 4;
-    }
-    // xe_transfer_host_depth_address
-    if (cbuffer_index_host_depth_address != UINT32_MAX) {
-      dxbc::RdefCbuffer& rdef_cbuffer_host_depth_address =
-          rdef_cbuffers[cbuffer_index_host_depth_address];
-      rdef_cbuffer_host_depth_address.name_ptr = rdef_xe_transfer_host_depth_address_name_ptr;
-      rdef_cbuffer_host_depth_address.variable_count = 1;
-      rdef_cbuffer_host_depth_address.variables_ptr = uint32_t(
-          rdef_constants_ptr + sizeof(dxbc::RdefVariable) * rdef_constant_index_host_depth_address);
-      rdef_cbuffer_host_depth_address.size_vector_aligned_bytes = sizeof(uint32_t) * 4;
-    }
-  }
-
-  // Bindings.
-  // - Texture2D/Texture2DMS<floatN/uintN> xe_transfer_color
-  // - Texture2D/Texture2DMS<float> xe_transfer_depth
-  // - Texture2D/Texture2DMS<uint2> xe_transfer_stencil
-  // - Texture2D<float>/Texture2DMS<float>/Buffer<uint> xe_transfer_host_depth
-  // - Constant buffers
-  uint32_t rdef_srv_count = 0;
-  uint32_t srv_index_color =
-      (rs & kTransferUsedRootParameterColorSRVBit) ? rdef_srv_count++ : UINT32_MAX;
-  uint32_t srv_index_depth =
-      (rs & kTransferUsedRootParameterDepthSRVBit) ? rdef_srv_count++ : UINT32_MAX;
-  uint32_t srv_index_stencil =
-      (rs & kTransferUsedRootParameterStencilSRVBit) ? rdef_srv_count++ : UINT32_MAX;
-  uint32_t srv_index_host_depth =
-      (rs & kTransferUsedRootParameterHostDepthSRVBit) ? rdef_srv_count++ : UINT32_MAX;
-  uint32_t rdef_binding_count = rdef_srv_count + rdef_cbuffer_count;
-  // Names.
-  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
-  uint32_t rdef_xe_transfer_color_name_ptr = name_ptr;
-  if (srv_index_color != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_color");
-  }
-  uint32_t rdef_xe_transfer_depth_name_ptr = name_ptr;
-  if (srv_index_depth != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_depth");
-  }
-  uint32_t rdef_xe_transfer_stencil_name_ptr = name_ptr;
-  if (srv_index_stencil != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_stencil");
-  }
-  uint32_t rdef_xe_transfer_host_depth_name_ptr = name_ptr;
-  if (srv_index_host_depth != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_host_depth");
-  }
-  // Bindings.
-  uint32_t rdef_binding_position_dwords = uint32_t(built_shader_.size());
-  built_shader_.resize(rdef_binding_position_dwords +
-                       sizeof(dxbc::RdefInputBind) / sizeof(uint32_t) * rdef_binding_count);
-  {
-    auto rdef_bindings =
-        reinterpret_cast<dxbc::RdefInputBind*>(built_shader_.data() + rdef_binding_position_dwords);
-    uint32_t rdef_binding_index = 0;
-    // xe_transfer_color
-    if (srv_index_color != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_color = rdef_bindings[rdef_binding_index++];
-      rdef_binding_color.name_ptr = rdef_xe_transfer_color_name_ptr;
-      rdef_binding_color.type = dxbc::RdefInputType::kTexture;
-      rdef_binding_color.return_type =
-          source_color_is_uint ? dxbc::ResourceReturnType::kUInt : dxbc::ResourceReturnType::kFloat;
-      if (key.source_msaa_samples != xenos::MsaaSamples::k1X) {
-        rdef_binding_color.dimension = dxbc::RdefDimension::kSRVTexture2DMS;
-      } else {
-        rdef_binding_color.dimension = dxbc::RdefDimension::kSRVTexture2D;
-        rdef_binding_color.sample_count = UINT32_MAX;
-      }
-      rdef_binding_color.bind_point = kTransferSRVRegisterColor;
-      rdef_binding_color.bind_count = 1;
-      assert_not_zero(source_color_srv_component_mask);
-      rdef_binding_color.flags = (32 - rex::lzcnt(source_color_srv_component_mask) - 1)
-                                 << dxbc::kRdefInputFlagsComponentsShift;
-      rdef_binding_color.id = srv_index_color;
-    }
-    // xe_transfer_depth
-    if (srv_index_depth != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_depth = rdef_bindings[rdef_binding_index++];
-      rdef_binding_depth.name_ptr = rdef_xe_transfer_depth_name_ptr;
-      rdef_binding_depth.type = dxbc::RdefInputType::kTexture;
-      rdef_binding_depth.return_type = dxbc::ResourceReturnType::kFloat;
-      if (key.source_msaa_samples != xenos::MsaaSamples::k1X) {
-        rdef_binding_depth.dimension = dxbc::RdefDimension::kSRVTexture2DMS;
-      } else {
-        rdef_binding_depth.dimension = dxbc::RdefDimension::kSRVTexture2D;
-        rdef_binding_depth.sample_count = UINT32_MAX;
-      }
-      rdef_binding_depth.bind_point = kTransferSRVRegisterDepth;
-      rdef_binding_depth.bind_count = 1;
-      rdef_binding_depth.id = srv_index_depth;
-    }
-    // xe_transfer_stencil
-    if (srv_index_stencil != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_stencil = rdef_bindings[rdef_binding_index++];
-      rdef_binding_stencil.name_ptr = rdef_xe_transfer_stencil_name_ptr;
-      rdef_binding_stencil.type = dxbc::RdefInputType::kTexture;
-      rdef_binding_stencil.return_type = dxbc::ResourceReturnType::kUInt;
-      if (key.source_msaa_samples != xenos::MsaaSamples::k1X) {
-        rdef_binding_stencil.dimension = dxbc::RdefDimension::kSRVTexture2DMS;
-      } else {
-        rdef_binding_stencil.dimension = dxbc::RdefDimension::kSRVTexture2D;
-        rdef_binding_stencil.sample_count = UINT32_MAX;
-      }
-      rdef_binding_stencil.bind_point = kTransferSRVRegisterStencil;
-      rdef_binding_stencil.bind_count = 1;
-      rdef_binding_stencil.flags = dxbc::kRdefInputFlags2Component;
-      rdef_binding_stencil.id = srv_index_stencil;
-    }
-    // xe_transfer_host_depth
-    if (srv_index_host_depth != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_host_depth = rdef_bindings[rdef_binding_index++];
-      rdef_binding_host_depth.name_ptr = rdef_xe_transfer_host_depth_name_ptr;
-      rdef_binding_host_depth.type = dxbc::RdefInputType::kTexture;
-      if (key.host_depth_source_is_copy) {
-        // Float as uint.
-        rdef_binding_host_depth.return_type = dxbc::ResourceReturnType::kUInt;
-        rdef_binding_host_depth.dimension = dxbc::RdefDimension::kSRVBuffer;
-        rdef_binding_host_depth.sample_count = UINT32_MAX;
-      } else {
-        rdef_binding_host_depth.return_type = dxbc::ResourceReturnType::kFloat;
-        if (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X) {
-          rdef_binding_host_depth.dimension = dxbc::RdefDimension::kSRVTexture2DMS;
-        } else {
-          rdef_binding_host_depth.dimension = dxbc::RdefDimension::kSRVTexture2D;
-          rdef_binding_host_depth.sample_count = UINT32_MAX;
-        }
-      }
-      rdef_binding_host_depth.bind_point = kTransferSRVRegisterHostDepth;
-      rdef_binding_host_depth.bind_count = 1;
-      rdef_binding_host_depth.id = srv_index_host_depth;
-    }
-    // xe_transfer_stencil_mask
-    if (cbuffer_index_stencil_mask != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_stencil_mask = rdef_bindings[rdef_binding_index++];
-      rdef_binding_stencil_mask.name_ptr = rdef_xe_transfer_stencil_mask_name_ptr;
-      rdef_binding_stencil_mask.type = dxbc::RdefInputType::kCbuffer;
-      rdef_binding_stencil_mask.bind_point = kTransferCBVRegisterStencilMask;
-      rdef_binding_stencil_mask.bind_count = 1;
-      rdef_binding_stencil_mask.flags = dxbc::kRdefInputFlagUserPacked;
-      rdef_binding_stencil_mask.id = cbuffer_index_stencil_mask;
-    }
-    // xe_transfer_address
-    if (cbuffer_index_address != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_address = rdef_bindings[rdef_binding_index++];
-      rdef_binding_address.name_ptr = rdef_xe_transfer_address_name_ptr;
-      rdef_binding_address.type = dxbc::RdefInputType::kCbuffer;
-      rdef_binding_address.bind_point = kTransferCBVRegisterAddress;
-      rdef_binding_address.bind_count = 1;
-      rdef_binding_address.flags = dxbc::kRdefInputFlagUserPacked;
-      rdef_binding_address.id = cbuffer_index_address;
-    }
-    // xe_transfer_host_depth_address
-    if (cbuffer_index_host_depth_address != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_host_depth_address = rdef_bindings[rdef_binding_index++];
-      rdef_binding_host_depth_address.name_ptr = rdef_xe_transfer_host_depth_address_name_ptr;
-      rdef_binding_host_depth_address.type = dxbc::RdefInputType::kCbuffer;
-      rdef_binding_host_depth_address.bind_point = kTransferCBVRegisterHostDepthAddress;
-      rdef_binding_host_depth_address.bind_count = 1;
-      rdef_binding_host_depth_address.flags = dxbc::kRdefInputFlagUserPacked;
-      rdef_binding_host_depth_address.id = cbuffer_index_host_depth_address;
-    }
-  }
-
-  // Header.
-  {
-    auto& rdef_header =
-        *reinterpret_cast<dxbc::RdefHeader*>(built_shader_.data() + rdef_position_dwords);
-    rdef_header.cbuffer_count = rdef_cbuffer_count;
-    rdef_header.cbuffers_ptr =
-        uint32_t((rdef_cbuffer_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
-    rdef_header.input_bind_count = rdef_binding_count;
-    rdef_header.input_binds_ptr =
-        uint32_t((rdef_binding_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
-    rdef_header.shader_model = dxbc::RdefShaderModel::kPixelShader5_1;
-    rdef_header.compile_flags =
-        dxbc::kCompileFlagNoPreshader | dxbc::kCompileFlagPreferFlowControl |
-        dxbc::kCompileFlagIeeeStrictness | dxbc::kCompileFlagAllResourcesBound;
-    // Generator name is right after the header.
-    rdef_header.generator_name_ptr = sizeof(dxbc::RdefHeader);
-    rdef_header.fourcc = dxbc::RdefHeader::FourCC::k5_1;
-    rdef_header.InitializeSizes();
-  }
-
-  {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
-    blob_header.fourcc = dxbc::BlobHeader::FourCC::kResourceDefinition;
-    blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
-  }
-
-  // ***************************************************************************
-  // Input signature
-  // ***************************************************************************
-
-  // Registers for accessing in the shader code - multiple inputs may be packed
-  // into the same register.
-  enum InputRegister : uint32_t {
-    kInputRegisterPosition,
-    kInputRegisterSampleIndex,
-    kInputRegisterCount,
-  };
-
-  // Position, and for multisampled, sample index.
-  uint32_t isgn_parameter_count = 1 + uint32_t(key.dest_msaa_samples != xenos::MsaaSamples::k1X);
-
-  // Reserve space for the header and the parameters.
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
-  uint32_t isgn_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-  built_shader_.resize(isgn_position_dwords + sizeof(dxbc::Signature) / sizeof(uint32_t) +
-                       sizeof(dxbc::SignatureParameter) / sizeof(uint32_t) * isgn_parameter_count);
-
-  // Names (after the parameters).
-  name_ptr = uint32_t((built_shader_.size() - isgn_position_dwords) * sizeof(uint32_t));
-  uint32_t isgn_sv_position_name_ptr = name_ptr;
-  name_ptr += dxbc::AppendAlignedString(built_shader_, "SV_Position");
-  uint32_t isgn_sv_sample_index_name_ptr = name_ptr;
-  if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "SV_SampleIndex");
-  }
-
-  // Header and parameters.
-  {
-    // Header.
-    auto& isgn_header =
-        *reinterpret_cast<dxbc::Signature*>(built_shader_.data() + isgn_position_dwords);
-    isgn_header.parameter_count = isgn_parameter_count;
-    isgn_header.parameter_info_ptr = sizeof(dxbc::Signature);
-    // Parameters.
-    auto isgn_parameters = reinterpret_cast<dxbc::SignatureParameter*>(
-        built_shader_.data() + isgn_position_dwords + sizeof(dxbc::Signature) / sizeof(uint32_t));
-    uint32_t isgn_parameter_index = 0;
-    // SV_Position.xy
-    dxbc::SignatureParameter& isgn_sv_position = isgn_parameters[isgn_parameter_index++];
-    isgn_sv_position.semantic_name_ptr = isgn_sv_position_name_ptr;
-    isgn_sv_position.system_value = dxbc::Name::kPosition;
-    isgn_sv_position.component_type = dxbc::SignatureRegisterComponentType::kFloat32;
-    isgn_sv_position.register_index = kInputRegisterPosition;
-    isgn_sv_position.mask = 0b1111;
-    isgn_sv_position.always_reads_mask = 0b0011;
-    // SV_SampleIndex
-    if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
-      dxbc::SignatureParameter& isgn_sv_sample_index = isgn_parameters[isgn_parameter_index++];
-      isgn_sv_sample_index.semantic_name_ptr = isgn_sv_sample_index_name_ptr;
-      isgn_sv_sample_index.system_value = dxbc::Name::kSampleIndex;
-      isgn_sv_sample_index.component_type = dxbc::SignatureRegisterComponentType::kUInt32;
-      isgn_sv_sample_index.register_index = kInputRegisterSampleIndex;
-      isgn_sv_sample_index.mask = 0b0001;
-      isgn_sv_sample_index.always_reads_mask = 0b0001;
-    }
-  }
-
-  {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
-    blob_header.fourcc = dxbc::BlobHeader::FourCC::kInputSignature;
-    blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
-  }
-
-  // ***************************************************************************
-  // Output signature
-  // ***************************************************************************
-
-  // Color or depth.
-  uint32_t osgn_parameter_count = 0;
-  uint32_t osgn_parameter_index_sv_target =
-      mode.output == TransferOutput::kColor ? osgn_parameter_count++ : UINT32_MAX;
-  uint32_t osgn_parameter_index_sv_depth =
-      mode.output == TransferOutput::kDepth ? osgn_parameter_count++ : UINT32_MAX;
-  uint32_t osgn_parameter_index_sv_stencil_ref =
-      shader_uses_stencil_reference_output ? osgn_parameter_count++ : UINT32_MAX;
-
-  // Reserve space for the header and the parameters.
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
-  uint32_t osgn_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-  built_shader_.resize(osgn_position_dwords + sizeof(dxbc::Signature) / sizeof(uint32_t) +
-                       sizeof(dxbc::SignatureParameter) / sizeof(uint32_t) * osgn_parameter_count);
-
-  // Names (after the parameters).
-  name_ptr = uint32_t((built_shader_.size() - osgn_position_dwords) * sizeof(uint32_t));
-  uint32_t osgn_sv_target_name_ptr = name_ptr;
-  if (osgn_parameter_index_sv_target != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "SV_Target");
-  }
-  uint32_t osgn_sv_depth_name_ptr = name_ptr;
-  if (osgn_parameter_index_sv_depth != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "SV_Depth");
-  }
-  uint32_t osgn_sv_stencil_ref_name_ptr = name_ptr;
-  if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "SV_StencilRef");
-  }
-
-  bool dest_color_is_uint;
-  if (mode.output == TransferOutput::kColor) {
-    GetColorOwnershipTransferDXGIFormat(dest_color_format, &dest_color_is_uint);
-  } else {
-    dest_color_is_uint = false;
-  }
-
-  // Header and parameters.
-  {
-    // Header.
-    auto& osgn_header =
-        *reinterpret_cast<dxbc::Signature*>(built_shader_.data() + osgn_position_dwords);
-    osgn_header.parameter_count = osgn_parameter_count;
-    osgn_header.parameter_info_ptr = sizeof(dxbc::Signature);
-    // Parameters.
-    auto osgn_parameters = reinterpret_cast<dxbc::SignatureParameter*>(
-        built_shader_.data() + osgn_position_dwords + sizeof(dxbc::Signature) / sizeof(uint32_t));
-    // SV_Target
-    if (osgn_parameter_index_sv_target != UINT32_MAX) {
-      dxbc::SignatureParameter& osgn_sv_target = osgn_parameters[osgn_parameter_index_sv_target];
-      osgn_sv_target.semantic_name_ptr = osgn_sv_target_name_ptr;
-      osgn_sv_target.component_type = dest_color_is_uint
-                                          ? dxbc::SignatureRegisterComponentType::kUInt32
-                                          : dxbc::SignatureRegisterComponentType::kFloat32;
-      osgn_sv_target.register_index = 0;
-      osgn_sv_target.mask = 0b1111;
-    }
-    // SV_Depth
-    if (osgn_parameter_index_sv_depth != UINT32_MAX) {
-      dxbc::SignatureParameter& osgn_sv_depth = osgn_parameters[osgn_parameter_index_sv_depth];
-      osgn_sv_depth.semantic_name_ptr = osgn_sv_depth_name_ptr;
-      osgn_sv_depth.component_type = dxbc::SignatureRegisterComponentType::kFloat32;
-      osgn_sv_depth.register_index = UINT32_MAX;
-      osgn_sv_depth.mask = 0b0001;
-      osgn_sv_depth.never_writes_mask = 0b1110;
-    }
-    // SV_StencilRef
-    if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX) {
-      dxbc::SignatureParameter& osgn_sv_stencil_ref =
-          osgn_parameters[osgn_parameter_index_sv_stencil_ref];
-      osgn_sv_stencil_ref.semantic_name_ptr = osgn_sv_stencil_ref_name_ptr;
-      // Older versions of FXC incorrectly expect SV_StencilRef to be float,
-      // it's always uint in DXC and also in the latest versions of FXC.
-      osgn_sv_stencil_ref.component_type = dxbc::SignatureRegisterComponentType::kUInt32;
-      osgn_sv_stencil_ref.register_index = UINT32_MAX;
-      osgn_sv_stencil_ref.mask = 0b0001;
-      osgn_sv_stencil_ref.never_writes_mask = 0b1110;
-    }
-  }
-
-  {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
-    blob_header.fourcc = dxbc::BlobHeader::FourCC::kOutputSignature;
-    blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
-  }
-
-  // ***************************************************************************
-  // Shader program
-  // ***************************************************************************
-
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
-  uint32_t shex_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-  built_shader_.resize(shex_position_dwords);
-
-  built_shader_.push_back(dxbc::VersionToken(dxbc::ProgramType::kPixelShader, 5, 1));
-  // Reserve space for the length token.
-  built_shader_.push_back(0);
-
-  dxbc::Statistics stat;
-  std::memset(&stat, 0, sizeof(dxbc::Statistics));
-  dxbc::Assembler a(built_shader_, stat);
-
-  a.OpDclGlobalFlags(dxbc::kGlobalFlagAllResourcesBound);
-  if (cbuffer_index_stencil_mask != UINT32_MAX) {
-    a.OpDclConstantBuffer(
-        dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_stencil_mask, kTransferCBVRegisterStencilMask,
-                      kTransferCBVRegisterStencilMask),
-        1);
-  }
-  if (cbuffer_index_address != UINT32_MAX) {
-    a.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_address,
-                                        kTransferCBVRegisterAddress, kTransferCBVRegisterAddress),
-                          1);
-  }
-  if (cbuffer_index_host_depth_address != UINT32_MAX) {
-    a.OpDclConstantBuffer(
-        dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_host_depth_address,
-                      kTransferCBVRegisterHostDepthAddress, kTransferCBVRegisterHostDepthAddress),
-        1);
-  }
-  if (srv_index_color != UINT32_MAX) {
-    a.OpDclResource(
-        key.source_msaa_samples != xenos::MsaaSamples::k1X ? dxbc::ResourceDimension::kTexture2DMS
-                                                           : dxbc::ResourceDimension::kTexture2D,
-        dxbc::ResourceReturnTypeX4Token(source_color_is_uint ? dxbc::ResourceReturnType::kUInt
-                                                             : dxbc::ResourceReturnType::kFloat),
-        dxbc::Src::T(dxbc::Src::Dcl, srv_index_color, kTransferSRVRegisterColor,
-                     kTransferSRVRegisterColor));
-  }
-  if (srv_index_depth != UINT32_MAX) {
-    a.OpDclResource(key.source_msaa_samples != xenos::MsaaSamples::k1X
-                        ? dxbc::ResourceDimension::kTexture2DMS
-                        : dxbc::ResourceDimension::kTexture2D,
-                    dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kFloat),
-                    dxbc::Src::T(dxbc::Src::Dcl, srv_index_depth, kTransferSRVRegisterDepth,
-                                 kTransferSRVRegisterDepth));
-  }
-  if (srv_index_stencil != UINT32_MAX) {
-    a.OpDclResource(key.source_msaa_samples != xenos::MsaaSamples::k1X
-                        ? dxbc::ResourceDimension::kTexture2DMS
-                        : dxbc::ResourceDimension::kTexture2D,
-                    dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
-                    dxbc::Src::T(dxbc::Src::Dcl, srv_index_stencil, kTransferSRVRegisterStencil,
-                                 kTransferSRVRegisterStencil));
-  }
-  if (srv_index_host_depth != UINT32_MAX) {
-    a.OpDclResource(key.host_depth_source_is_copy
-                        ? dxbc::ResourceDimension::kBuffer
-                        : (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X
-                               ? dxbc::ResourceDimension::kTexture2DMS
-                               : dxbc::ResourceDimension::kTexture2D),
-                    dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kFloat),
-                    dxbc::Src::T(dxbc::Src::Dcl, srv_index_host_depth,
-                                 kTransferSRVRegisterHostDepth, kTransferSRVRegisterHostDepth));
-  }
-  a.OpDclInputPSSIV(dxbc::InterpolationMode::kLinearNoPerspective,
-                    dxbc::Dest::V1D(kInputRegisterPosition, 0b0011), dxbc::Name::kPosition);
-  if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
-    a.OpDclInputPSSGV(dxbc::Dest::V1D(kInputRegisterSampleIndex, 0b0001), dxbc::Name::kSampleIndex);
-  }
-  if (osgn_parameter_index_sv_target != UINT32_MAX) {
-    a.OpDclOutput(dxbc::Dest::O(0));
-  }
-  if (osgn_parameter_index_sv_depth != UINT32_MAX) {
-    a.OpDclOutput(dxbc::Dest::ODepth());
-  }
-  if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX) {
-    a.OpDclOutput(dxbc::Dest::OStencilRef());
-  }
-  // r0:r2 are involved at least in common addressing code. Texture loads
-  // usually can overwrite some of the addressing temps as they are only needed
-  // for the coordinates for that load. Currently 3 temps are enough.
-  a.OpDclTemps(3);
-
-  uint32_t draw_resolution_scale_x = this->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = this->draw_resolution_scale_y();
-
-  uint32_t tile_width_samples = xenos::kEdramTileWidthSamples * draw_resolution_scale_x;
-  uint32_t tile_height_samples = xenos::kEdramTileHeightSamples * draw_resolution_scale_y;
-
-  // Split the destination pixel index into 32bpp tile in r0.zw and
-  // 32bpp-tile-relative pixel index in r0.xy.
-  // r0.xy = pixel XY as uint
-  a.OpFToU(dxbc::Dest::R(0, 0b0011), dxbc::Src::V1D(kInputRegisterPosition));
-  uint32_t dest_tile_width_pixels =
-      tile_width_samples >>
-      (uint32_t(dest_is_64bpp) + uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k4X));
-  uint32_t dest_tile_height_pixels =
-      tile_height_samples >> uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k2X);
-  // r0.xy = destination pixel XY index within the 32bpp tile
-  // r0.zw = 32bpp tile XY index
-  a.OpUDiv(dxbc::Dest::R(0, 0b1100), dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0, 0b01000100),
-           dxbc::Src::LU(dest_tile_width_pixels, dest_tile_height_pixels, dest_tile_width_pixels,
-                         dest_tile_height_pixels));
-
-  // r1.x = destination pitch in 32bpp tiles
-  a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits), dxbc::Src::LU(0),
-           dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0, dxbc::Src::kXXXX));
-  // r0.z = 32bpp tile index relative to the destination base
-  // r0.w = free
-  // r1.x = free
-  a.OpUMAd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(1, dxbc::Src::kXXXX),
-           dxbc::Src::R(0, dxbc::Src::kWWWW), dxbc::Src::R(0, dxbc::Src::kZZZZ));
-
-  // Now the tile index doesn't have any dependencies on the destination. The
-  // dword index within the source tile, however, is calculated from both the
-  // source and the destination pixel size, sample count and color vs. depth.
-
-  // Source can be 64bpp or 32bpp - depth if only depth is available, color in
-  // all other cases.
-
-  // Load the source to r1 (or low to r0, high to r1 if need 64bpp color as the
-  // result, as the address is loaded to r1).
-
-  // Source pixel and sample index within the 32bpp tile.
-  // X to r1.x (or keep r0.x if not modifying).
-  // Y to r1.y (or keep r0.y if not modifying).
-  // Sample index to r1.z (or use v# if not modifying); r1.z will also be set
-  // to 0 before sampling for the LOD of the single-sampled source (needs to
-  // be in the register).
-  // If 64bpp -> 32bpp, also the needed half in r0.w.
-
-  dxbc::Src dest_sample(dxbc::Src::V1D(kInputRegisterSampleIndex, dxbc::Src::kXXXX));
-  dxbc::Src source_sample(dest_sample);
-  uint32_t source_tile_pixel_x_reg = 0;
-  uint32_t source_tile_pixel_y_reg = 0;
-
-  // First sample bit at 4x in Direct3D 10.1+ - horizontal sample.
-  // Second sample bit at 4x in Direct3D 10.1+ - vertical sample.
-  // At 2x:
-  // - Native 2x: top is 1 in Direct3D 10.1+, bottom is 0.
-  // - 2x as 4x: top is 0, bottom is 3.
-
-  if (!source_is_64bpp && dest_is_64bpp) {
-    // 32bpp -> 64bpp, need two samples of the source.
-    if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 32bpp -> 64bpp, 4x ->.
-      // Source has 32bpp halves in two adjacent samples.
-      if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 32bpp -> 64bpp, 4x -> 4x.
-        // 1 destination horizontal sample = 2 source horizontal samples.
-        // D p0,0 s0,0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,0 s1,0 = S p1,0 s0,0 | S p1,0 s1,0
-        // D p0,0 s0,1 = S p0,0 s0,1 | S p0,0 s1,1
-        // D p0,0 s1,1 = S p1,0 s0,1 | S p1,0 s1,1
-        // Thus destination horizontal sample -> source horizontal pixel,
-        // vertical samples are 1:1.
-        a.OpAnd(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(0b10));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                dxbc::Src::R(0, dxbc::Src::kXXXX),
-                dxbc::Src::V1D(kInputRegisterSampleIndex, dxbc::Src::kXXXX));
-        source_tile_pixel_x_reg = 1;
-      } else if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 32bpp -> 64bpp, 4x -> 2x.
-        // 1 destination horizontal pixel = 2 source horizontal samples.
-        // D p0,0 s0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,0 s1 = S p0,0 s0,1 | S p0,0 s1,1
-        // D p1,0 s0 = S p1,0 s0,0 | S p1,0 s1,0
-        // D p1,0 s1 = S p1,0 s0,1 | S p1,0 s1,1
-        // Pixel index can be reused. Sample 1 (for native 2x) or 0 (for 2x as
-        // 4x) should become samples 01, sample 0 or 3 should become samples 23.
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (msaa_2x_supported_) {
-          a.OpXOr(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(1));
-          a.OpIShL(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-        } else {
-          a.OpAnd(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(0b10));
-        }
-      } else {
-        // 32bpp -> 64bpp, 4x -> 1x.
-        // 1 destination horizontal pixel = 2 source horizontal samples.
-        // D p0,0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,1 = S p0,0 s0,1 | S p0,0 s1,1
-        // Horizontal pixel index can be reused. Vertical pixel 1 should
-        // become sample 2.
-        a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(0));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        a.OpUShR(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        source_tile_pixel_y_reg = 1;
-      }
-    } else {
-      // 32bpp -> 64bpp, 1x/2x ->.
-      // Source has 32bpp halves in two adjacent pixels.
-      if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 32bpp -> 64bpp, 1x/2x -> 4x.
-        // The X part.
-        // 1 destination horizontal sample = 2 source horizontal pixels.
-        a.OpIShL(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(2));
-        a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                dxbc::Src::V1D(kInputRegisterSampleIndex, dxbc::Src::kXXXX),
-                dxbc::Src::R(1, dxbc::Src::kXXXX));
-        source_tile_pixel_x_reg = 1;
-        // Y is handled by common code.
-      } else {
-        // 32bpp -> 64bpp, 1x/2x -> 1x/2x.
-        // The X part.
-        // 1 destination horizontal pixel = 2 source horizontal pixels.
-        a.OpIShL(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        source_tile_pixel_x_reg = 1;
-        // Y is handled by common code.
-      }
-    }
-  } else if (source_is_64bpp && !dest_is_64bpp) {
-    // 64bpp -> 32bpp, also the half to r0.w.
-    if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 64bpp -> 32bpp, -> 4x.
-      // The needed half is in the destination horizontal sample index.
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 64bpp -> 32bpp, 4x -> 4x.
-        // D p0,0 s0,0 = S s0,0 low
-        // D p0,0 s1,0 = S s0,0 high
-        // D p1,0 s0,0 = S s1,0 low
-        // D p1,0 s1,0 = S s1,0 high
-        // Vertical pixel and sample (second bit) addressing is the same.
-        // However, 1 horizontal destination pixel = 1 horizontal source sample.
-        a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(0),
-                dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        // 2 destination horizontal samples = 1 source horizontal sample, thus
-        // 2 destination horizontal pixels = 1 source horizontal pixel.
-        a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        source_tile_pixel_x_reg = 1;
-      } else {
-        // 64bpp -> 32bpp, 1x/2x -> 4x.
-        // 2 destination horizontal samples = 1 source horizontal pixel, thus
-        // 1 destination horizontal pixel = 1 source horizontal pixel. Can reuse
-        // horizontal pixel index.
-        // Y is handled by common code.
-      }
-      // Half in r0.w from the destination horizontal sample index.
-      a.OpAnd(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-    } else {
-      // 64bpp -> 32bpp, -> 1x/2x.
-      // The needed half is in the destination horizontal pixel index.
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 64bpp -> 32bpp, 4x -> 1x/2x.
-        // (Destination horizontal pixel >> 1) & 1 = source horizontal sample
-        // (first bit).
-        a.OpUBFE(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                 dxbc::Src::R(0, dxbc::Src::kXXXX));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-          // 64bpp -> 32bpp, 4x -> 2x.
-          // Destination vertical samples (1/0 in the first bit for native 2x or
-          // 0/1 in the second bit for 2x as 4x) = source vertical samples
-          // (second bit).
-          if (msaa_2x_supported_) {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), dest_sample,
-                    source_sample);
-            a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1 << 1));
-          } else {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(0), source_sample,
-                    dest_sample);
-          }
-        } else {
-          // 64bpp -> 32bpp, 4x -> 1x.
-          // 1 destination vertical pixel = 1 source vertical sample.
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), source_sample);
-          a.OpUShR(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-          source_tile_pixel_y_reg = 1;
-        }
-        // 2 destination horizontal pixels = 1 source horizontal sample.
-        // 4 destination horizontal pixels = 1 source horizontal pixel.
-        a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(2));
-        source_tile_pixel_x_reg = 1;
-      } else {
-        // 64bpp -> 32bpp, 1x/2x -> 1x/2x.
-        // The X part.
-        // 2 destination horizontal pixels = 1 destination source pixel.
-        a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        source_tile_pixel_x_reg = 1;
-        // Y is handled by common code.
-      }
-      // Half in r0.w from the destination horizontal pixel index.
-      a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-    }
-  } else {
-    // Same bit count.
-    if (key.source_msaa_samples != key.dest_msaa_samples) {
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // Same BPP, 4x -> 1x/2x.
-        if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-          // Same BPP, 4x -> 2x.
-          // Horizontal pixels to samples. Vertical sample (1/0 in the first bit
-          // for native 2x or 0/1 in the second bit for 2x as 4x) to second
-          // sample bit.
-          source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-          if (msaa_2x_supported_) {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(31), dxbc::Src::LU(1), dest_sample,
-                    dxbc::Src::R(0, dxbc::Src::kXXXX));
-            a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1 << 1));
-          } else {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(0),
-                    dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-          }
-          a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-          source_tile_pixel_x_reg = 1;
-        } else {
-          // Same BPP, 4x -> 1x.
-          // Pixels to samples.
-          a.OpAnd(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-          source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), source_sample);
-          a.OpUShR(dxbc::Dest::R(1, 0b0011), dxbc::Src::R(0), dxbc::Src::LU(1));
-          source_tile_pixel_x_reg = 1;
-          source_tile_pixel_y_reg = 1;
-        }
-      } else {
-        // Same BPP, 1x/2x -> 1x/2x/4x (as long as they're different).
-        // Only the X part - Y is handled by common code.
-        if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-          // Horizontal samples to pixels.
-          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-          source_tile_pixel_x_reg = 1;
-        }
-      }
-    }
-  }
-  // Common source Y and sample index for 1x/2x AA sources, independent of bits
-  // per sample.
-  if (key.source_msaa_samples < xenos::MsaaSamples::k4X &&
-      key.source_msaa_samples != key.dest_msaa_samples) {
-    if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 1x/2x -> 4x.
-      if (key.source_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 2x -> 4x.
-        // Vertical samples (second bit) of 4x destination to vertical sample
-        // (1, 0 for native 2x, or 0, 3 for 2x as 4x) of 2x source.
-        a.OpUShR(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(1));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (msaa_2x_supported_) {
-          a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-        } else {
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), source_sample,
-                  source_sample);
-        }
-      } else {
-        // 1x -> 4x.
-        // Vertical samples (second bit) to Y pixels.
-        a.OpUShR(dxbc::Dest::R(1, 0b0010), dest_sample, dxbc::Src::LU(1));
-        a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(1, dxbc::Src::kYYYY));
-        source_tile_pixel_y_reg = 1;
-      }
-    } else {
-      // 1x/2x -> different 1x/2x.
-      if (key.source_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 2x -> 1x.
-        // Vertical pixels of 2x destination to vertical samples (1, 0 for
-        // native 2x, or 0, 3 for 2x as 4x) of 1x source.
-        a.OpAnd(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (msaa_2x_supported_) {
-          a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-        } else {
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), source_sample,
-                  source_sample);
-        }
-        a.OpUShR(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        source_tile_pixel_y_reg = 1;
-      } else {
-        // 1x -> 2x.
-        // Vertical samples (1/0 in the first bit for native 2x or 0/1 in the
-        // second bit for 2x as 4x) of 2x destination to vertical pixels of 1x
-        // source.
-        if (msaa_2x_supported_) {
-          a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), dest_sample);
-          a.OpXOr(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(1, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        } else {
-          a.OpUShR(dxbc::Dest::R(1, 0b0010), dest_sample, dxbc::Src::LU(1));
-          a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(1, dxbc::Src::kYYYY));
-        }
-        source_tile_pixel_y_reg = 1;
-      }
-    }
-  }
-
-  uint32_t source_pixel_width_dwords_log2 =
-      uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k4X) + uint32_t(source_is_64bpp);
-
-  if (source_is_color != dest_is_color) {
-    // Copying between color and depth / stencil - swap 40-32bpp-sample columns
-    // in the pixel index within the source 32bpp tile using r1.w as temporary.
-    uint32_t source_32bpp_tile_half_pixels =
-        tile_width_samples >> (1 + source_pixel_width_dwords_log2);
-    a.OpULT(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX),
-            dxbc::Src::LU(source_32bpp_tile_half_pixels));
-    a.OpMovC(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
-             dxbc::Src::LI(int32_t(source_32bpp_tile_half_pixels)),
-             dxbc::Src::LI(-int32_t(source_32bpp_tile_half_pixels)));
-    a.OpIAdd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX),
-             dxbc::Src::R(1, dxbc::Src::kWWWW));
-    source_tile_pixel_x_reg = 1;
-    // r1.w = free
-  }
-
-  // Current register allocation:
-  // r0.xy = pixel index within the destination 32bpp tile
-  // r0.z = 32bpp tile index relative to the destination base
-  // r0.w for 64bpp -> 32bpp - needed 32bpp half index of 64bpp data
-  // r1.xy = pixel index within the source 32bpp tile
-  // r1.z for 2x/4x -> = sample index within the source pixel
-
-  // Apply the source 32bpp tile index.
-  // r1.w = destination to source EDRAM tile adjustment
-  a.OpIBFE(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
-           dxbc::Src::LU(xenos::kEdramPitchTilesBits * 2),
-           dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0, dxbc::Src::kXXXX));
-  // r1.w = 32bpp tile index within the source, or the tile index within the
-  //        source minus the EDRAM tile count if transferring across addressing
-  //        wrapping (if negative)
-  a.OpIAdd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(0, dxbc::Src::kZZZZ),
-           dxbc::Src::R(1, dxbc::Src::kWWWW));
-  // r1.w = 32bpp tile index within the source
-  a.OpAnd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
-          dxbc::Src::LU(xenos::kEdramTileCount - 1));
-  // r2.x = source pitch in 32bpp tiles
-  a.OpUBFE(dxbc::Dest::R(2, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
-           dxbc::Src::LU(xenos::kEdramPitchTilesBits),
-           dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0, dxbc::Src::kXXXX));
-  // r1.w = source tile row
-  // r2.x = source 32bpp tile within the row
-  a.OpUDiv(dxbc::Dest::R(1, 0b1000), dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1, dxbc::Src::kWWWW),
-           dxbc::Src::R(2, dxbc::Src::kXXXX));
-  // r1.x = pixel X within the source texture
-  // r2.x = free
-  a.OpUMAd(
-      dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(tile_width_samples >> source_pixel_width_dwords_log2),
-      dxbc::Src::R(2, dxbc::Src::kXXXX), dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX));
-  // r1.y = pixel Y within the source texture
-  // r1.w = free
-  a.OpUMAd(dxbc::Dest::R(1, 0b0010),
-           dxbc::Src::LU(tile_height_samples >>
-                         uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k2X)),
-           dxbc::Src::R(1, dxbc::Src::kWWWW),
-           dxbc::Src::R(source_tile_pixel_y_reg, dxbc::Src::kYYYY));
-
-  // Load the source to r1, or, for 32bpp | 32bpp -> 64bpp, the first dword to
-  // r0 since addressing will not be needed anymore for color, and the second
-  // dword to r1.
-  // Depth will be loaded to w before loading stencil (so it doesn't overwrite
-  // the coordinates needed for stencil loading).
-  // Stencil will be loaded to x.
-  // Color will be loaded to x...w.
-  bool source_load_is_two_dwords = !source_is_64bpp && dest_is_64bpp;
-  if (key.source_msaa_samples != xenos::MsaaSamples::k1X) {
-    for (uint32_t i = 0; i <= uint32_t(source_load_is_two_dwords); ++i) {
-      uint32_t source_load_register = source_load_is_two_dwords ? i : 1;
-      if (srv_index_depth != UINT32_MAX) {
-        a.OpLdMS(dxbc::Dest::R(source_load_register, 0b1000), dxbc::Src::R(1), 0b0011,
-                 dxbc::Src::T(srv_index_depth, kTransferSRVRegisterDepth, dxbc::Src::kXXXX),
-                 source_sample);
-      }
-      if (srv_index_stencil != UINT32_MAX) {
-        a.OpLdMS(dxbc::Dest::R(source_load_register, 0b0001), dxbc::Src::R(1), 0b0011,
-                 dxbc::Src::T(srv_index_stencil, kTransferSRVRegisterStencil, dxbc::Src::kYYYY),
-                 source_sample);
-      } else if (srv_index_color != UINT32_MAX) {
-        a.OpLdMS(dxbc::Dest::R(source_load_register, source_color_srv_component_mask),
-                 dxbc::Src::R(1), 0b0011, dxbc::Src::T(srv_index_color, kTransferSRVRegisterColor),
-                 source_sample);
-      }
-      if (source_load_is_two_dwords && !i) {
-        // Go to the next sample or pixel along X if need to load two dwords.
-        if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-          a.OpOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-          source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        } else {
-          a.OpOr(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        }
-      }
-    }
-  } else {
-    // Write zero to the LOD index in r1.z.
-    a.OpMov(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(0));
-    dxbc::Src source_coordinates(dxbc::Src::R(1, 0b10000100));
-    for (uint32_t i = 0; i <= uint32_t(source_load_is_two_dwords); ++i) {
-      uint32_t source_load_register = source_load_is_two_dwords ? i : 1;
-      if (srv_index_depth != UINT32_MAX) {
-        a.OpLd(dxbc::Dest::R(source_load_register, 0b1000), source_coordinates, 0b1011,
-               dxbc::Src::T(srv_index_depth, kTransferSRVRegisterDepth, dxbc::Src::kXXXX));
-      }
-      if (srv_index_stencil != UINT32_MAX) {
-        a.OpLd(dxbc::Dest::R(source_load_register, 0b0001), source_coordinates, 0b1011,
-               dxbc::Src::T(srv_index_stencil, kTransferSRVRegisterStencil, dxbc::Src::kYYYY));
-      } else if (srv_index_color != UINT32_MAX) {
-        a.OpLd(dxbc::Dest::R(source_load_register, source_color_srv_component_mask),
-               source_coordinates, 0b1011,
-               dxbc::Src::T(srv_index_color, kTransferSRVRegisterColor));
-      }
-      if (source_load_is_two_dwords && !i) {
-        // Go to the next pixel along X if need to load two dwords.
-        a.OpOr(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-      }
-    }
-  }
-  // Pick the needed 32bpp half of the 64bpp color based on r0.w.
-  if (source_is_64bpp && !dest_is_64bpp) {
-    uint32_t source_color_half_component_count = source_color_format_component_count >> 1;
-    if (dest_is_stencil_bit) {
-      a.OpMovC(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kWWWW),
-               dxbc::Src::R(1).Select(source_color_half_component_count),
-               dxbc::Src::R(1, dxbc::Src::kXXXX));
-    } else {
-      uint32_t color_high_dword_swizzle =
-          (source_color_half_component_count * 0b01010101) &
-          ~((uint32_t(1) << (source_color_half_component_count * 2)) - 1);
-      for (uint32_t i = 0; i < source_color_half_component_count; ++i) {
-        color_high_dword_swizzle |= (source_color_half_component_count + i) << (i * 2);
-      }
-      a.OpMovC(dxbc::Dest::R(1, (1 << source_color_half_component_count) - 1),
-               dxbc::Src::R(0, dxbc::Src::kWWWW), dxbc::Src::R(1, color_high_dword_swizzle),
-               dxbc::Src::R(1));
-    }
-  }
-
-  if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX && srv_index_stencil != UINT32_MAX) {
-    // For the depth -> depth case, write the stencil loaded to r1.x directly to
-    // the output.
-    assert_true(mode.output == TransferOutput::kDepth);
-    a.OpMov(dxbc::Dest::OStencilRef(), dxbc::Src::R(1, dxbc::Src::kXXXX));
-  }
-
-  if (dest_is_64bpp) {
-    // Handle construction of 64bpp color, either from two 32-bit samples in r0
-    // and r1, or from one 64bpp sample in r1. Using r2.x as temporary when
-    // needed.
-    // If color_packed_in_r0x_and_r1x, use the generic path for combining two
-    // 32-bit samples - as raw in r0.x and r1.x - into the destination.
-    bool color_packed_in_r0x_and_r1x = false;
-    if (source_is_color) {
-      switch (source_color_format) {
-        case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
-          // 8_8_8_8_GAMMA is represented by linear stored in
-          // R16G16B16A16_UNORM.
-          for (uint32_t i = 0; i < 2; ++i) {
-            for (uint32_t j = 0; j < 3; ++j) {
-              DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, i, j, i, j, 2, 0, 2, 1);
-            }
-          }
-        }
-          [[fallthrough]];
-        case xenos::ColorRenderTargetFormat::k_8_8_8_8: {
-          color_packed_in_r0x_and_r1x = true;
-          for (uint32_t i = 0; i < 2; ++i) {
-            a.OpMAd(dxbc::Dest::R(i), dxbc::Src::R(i), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(i), dxbc::Src::R(i));
-            for (uint32_t j = 1; j < 4; ++j) {
-              a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(8), dxbc::Src::LU(j * 8),
-                      dxbc::Src::R(i).Select(j), dxbc::Src::R(i, dxbc::Src::kXXXX));
-            }
-          }
-        } break;
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10:
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10: {
-          color_packed_in_r0x_and_r1x = true;
-          for (uint32_t i = 0; i < 2; ++i) {
-            a.OpMAd(dxbc::Dest::R(i), dxbc::Src::R(i),
-                    dxbc::Src::LF(1023.0f, 1023.0f, 1023.0f, 3.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(i), dxbc::Src::R(i));
-            for (uint32_t j = 1; j < 4; ++j) {
-              a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(j == 3 ? 2 : 10),
-                      dxbc::Src::LU(j * 10), dxbc::Src::R(i).Select(j),
-                      dxbc::Src::R(i, dxbc::Src::kXXXX));
-            }
-          }
-        } break;
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
-          color_packed_in_r0x_and_r1x = true;
-          for (uint32_t i = 0; i < 2; ++i) {
-            // Float16 has a wider range for both color and alpha, also NaNs -
-            // clamp and convert.
-            for (uint32_t j = 0; j < 3; ++j) {
-              DxbcShaderTranslator::UnclampedFloat32To7e3(a, i, j, i, j, 2, 0);
-              if (j) {
-                a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(10), dxbc::Src::LU(j * 10),
-                        dxbc::Src::R(i).Select(j), dxbc::Src::R(i, dxbc::Src::kXXXX));
-              }
-            }
-            // Saturate and convert the alpha.
-            a.OpMov(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW), true);
-            a.OpMAd(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW),
-                    dxbc::Src::LF(3.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW));
-            a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(30),
-                    dxbc::Src::R(i, dxbc::Src::kWWWW), dxbc::Src::R(i, dxbc::Src::kXXXX));
-          }
-        } break;
-        // All 64bpp formats, and all 16 bits per component formats, are
-        // represented as integers in ownership transfer for safe handling of
-        // NaNs and -32768 / -32767.
-        case xenos::ColorRenderTargetFormat::k_16_16:
-        case xenos::ColorRenderTargetFormat::k_16_16_FLOAT: {
-          if (dest_color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
-            for (uint32_t i = 0; i < 2; ++i) {
-              a.OpBFI(dxbc::Dest::O(0, 1 << i), dxbc::Src::LU(16), dxbc::Src::LU(16),
-                      dxbc::Src::R(i, dxbc::Src::kYYYY), dxbc::Src::R(i, dxbc::Src::kXXXX));
-            }
-          } else {
-            a.OpMov(dxbc::Dest::O(0, 0b0011), dxbc::Src::R(0));
-            a.OpMov(dxbc::Dest::O(0, 0b1100), dxbc::Src::R(1, 0b0100 << 4));
-          }
-        } break;
-        case xenos::ColorRenderTargetFormat::k_16_16_16_16:
-        case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT: {
-          if (dest_color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
-            a.OpBFI(dxbc::Dest::O(0, 0b0011), dxbc::Src::LU(16), dxbc::Src::LU(16),
-                    dxbc::Src::R(1, 0b1101), dxbc::Src::R(1, 0b1000));
-          } else {
-            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
-          }
-        } break;
-        case xenos::ColorRenderTargetFormat::k_32_FLOAT: {
-          color_packed_in_r0x_and_r1x = true;
-        } break;
-        case xenos::ColorRenderTargetFormat::k_32_32_FLOAT: {
-          if (dest_color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
-            a.OpMov(dxbc::Dest::O(0, 0b0011), dxbc::Src::R(1));
-          } else {
-            a.OpUBFE(dxbc::Dest::O(0), dxbc::Src::LU(16), dxbc::Src::LU(0, 16, 0, 16),
-                     dxbc::Src::R(1, 0b01010000));
-          }
-        } break;
-      }
-    } else {
-      assert_not_zero(rs & kTransferUsedRootParameterDepthSRVBit);
-      color_packed_in_r0x_and_r1x = true;
-      for (uint32_t i = 0; i < 2; ++i) {
-        switch (source_depth_format) {
-          case xenos::DepthRenderTargetFormat::kD24S8: {
-            // Round to the nearest even integer. This seems to be the correct
-            // conversion, adding +0.5 and rounding towards zero results in red
-            // instead of black in the 4D5307E6 clear shader.
-            a.OpMul(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW),
-                    dxbc::Src::LF(float(0xFFFFFF)));
-            a.OpRoundNE(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW));
-            a.OpFToU(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW));
-          } break;
-          case xenos::DepthRenderTargetFormat::kD24FS8: {
-            // Convert using r1.y as temporary.
-            // When converting the depth in pixel shaders, it's always exact,
-            // truncating not to insert additional rounding instructions.
-            DxbcShaderTranslator::PreClampedDepthTo20e4(
-                a, i, 3, i, 3, 1, 1,
-                !depth_float24_convert_in_pixel_shader() && depth_float24_round(), true);
-          } break;
-        }
-        // Merge depth and stencil into r0/r1.x.
-        a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(24), dxbc::Src::LU(8),
-                dxbc::Src::R(i, dxbc::Src::kWWWW), dxbc::Src::R(i, dxbc::Src::kXXXX));
-      }
-    }
-    if (color_packed_in_r0x_and_r1x) {
-      if (dest_color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
-        a.OpMov(dxbc::Dest::O(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX));
-        a.OpMov(dxbc::Dest::O(0, 0b0010), dxbc::Src::R(1, dxbc::Src::kXXXX));
-      } else {
-        for (uint32_t i = 0; i < 2; ++i) {
-          a.OpUBFE(dxbc::Dest::O(0, 0b11 << (i * 2)), dxbc::Src::LU(16),
-                   dxbc::Src::LU(0, 16, 0, 16), dxbc::Src::R(i, dxbc::Src::kXXXX));
-        }
-      }
-    }
-  } else {
-    // Handle a 32bpp destination (32bpp color, or depth / stencil). If
-    // color_packed_in_r1x is true, a raw 32bpp color value was written, and
-    // common handling will be done.
-    bool color_packed_in_r1x = false;
-    bool depth_loaded_in_guest_format = false;
-    if (source_is_color) {
-      switch (source_color_format) {
-        case xenos::ColorRenderTargetFormat::k_8_8_8_8:
-        case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
-          if (dest_is_stencil_bit) {
-            if (source_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
-              DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, 0, 1, 0, 2, 0, 2, 1);
-            }
-            a.OpMAd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
-                    dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX));
-          } else if (dest_is_color &&
-                     (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
-                      dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
-            if (source_color_format != dest_color_format) {
-              // Color space conversion between k_8_8_8_8 and
-              // k_8_8_8_8_GAMMA.
-              if (dest_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
-                for (uint32_t i = 0; i < 3; ++i) {
-                  DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 2, 0, 2, 1);
-                }
-              } else {
-                for (uint32_t i = 0; i < 3; ++i) {
-                  DxbcShaderTranslator::PWLGammaToLinear(a, 1, i, 1, i, true, 2, 0, 2, 1);
-                }
-              }
-            }
-            // Same or converted format - passthrough.
-            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
-          } else if (mode.output == TransferOutput::kDepth) {
-            if (source_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
-              for (uint32_t i = osgn_parameter_index_sv_stencil_ref != UINT32_MAX ? 0 : 1; i < 3;
-                   ++i) {
-                DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 2, 0, 2, 1);
-              }
-            }
-            // When need only depth, not stencil, skip the red component.
-            a.OpMAd(dxbc::Dest::R(
-                        1, osgn_parameter_index_sv_stencil_ref != UINT32_MAX ? 0b1111 : 0b1110),
-                    dxbc::Src::R(1), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(1, 0b1110), dxbc::Src::R(1));
-            if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX) {
-              // Write the red component to the stencil reference.
-              a.OpFToU(dxbc::Dest::OStencilRef(), dxbc::Src::R(1, dxbc::Src::kXXXX));
-            }
-            // Put depth in 0:23 of r1.w.
-            // r1.y = 0xGGBB0000.
-            a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(8), dxbc::Src::LU(8),
-                    dxbc::Src::R(1, dxbc::Src::kZZZZ), dxbc::Src::R(1, dxbc::Src::kYYYY));
-            // r1.w = 0xGGBBAA00.
-            a.OpBFI(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(8), dxbc::Src::LU(16),
-                    dxbc::Src::R(1, dxbc::Src::kWWWW), dxbc::Src::R(1, dxbc::Src::kYYYY));
-          } else {
-            if (source_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
-              for (uint32_t i = 0; i < 3; ++i) {
-                DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 2, 0, 2, 1);
-              }
-            }
-            color_packed_in_r1x = true;
-            a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(1), dxbc::Src::R(1));
-            for (uint32_t i = 1; i < 4; ++i) {
-              a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(8), dxbc::Src::LU(i * 8),
-                      dxbc::Src::R(1).Select(i), dxbc::Src::R(1, dxbc::Src::kXXXX));
-            }
-          }
-        } break;
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10:
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10: {
-          if (dest_is_stencil_bit) {
-            a.OpMAd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
-                    dxbc::Src::LF(1023.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX));
-          } else if (dest_is_color &&
-                     (dest_color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 ||
-                      dest_color_format ==
-                          xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10)) {
-            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
-          } else {
-            color_packed_in_r1x = true;
-            a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1),
-                    dxbc::Src::LF(1023.0f, 1023.0f, 1023.0f, 3.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(1), dxbc::Src::R(1));
-            for (uint32_t i = 1; i < 4; ++i) {
-              a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(i == 3 ? 2 : 10),
-                      dxbc::Src::LU(i * 10), dxbc::Src::R(1).Select(i),
-                      dxbc::Src::R(1, dxbc::Src::kXXXX));
-            }
-          }
-        } break;
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
-          if (dest_is_stencil_bit) {
-            DxbcShaderTranslator::UnclampedFloat32To7e3(a, 1, 0, 1, 0, 2, 0);
-          } else if (dest_is_color &&
-                     (dest_color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
-                      dest_color_format ==
-                          xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
-            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
-          } else {
-            color_packed_in_r1x = true;
-            // Float16 has a wider range for both color and alpha, also NaNs -
-            // clamp and convert.
-            for (uint32_t i = 0; i < 3; ++i) {
-              DxbcShaderTranslator::UnclampedFloat32To7e3(a, 1, i, 1, i, 2, 0);
-              if (i) {
-                a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(10), dxbc::Src::LU(i * 10),
-                        dxbc::Src::R(1).Select(i), dxbc::Src::R(1, dxbc::Src::kXXXX));
-              }
-            }
-            // Saturate and convert the alpha.
-            a.OpMov(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW), true);
-            a.OpMAd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
-                    dxbc::Src::LF(3.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
-            a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(30),
-                    dxbc::Src::R(1, dxbc::Src::kWWWW), dxbc::Src::R(1, dxbc::Src::kXXXX));
-          }
-        } break;
-        case xenos::ColorRenderTargetFormat::k_16_16:
-        case xenos::ColorRenderTargetFormat::k_16_16_16_16:
-        case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
-        case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT: {
-          // All 16 bits per component formats are represented as integers in
-          // ownership transfer for safe handling of NaNs and -32768 / -32767.
-          if (dest_is_stencil_bit) {
-            // High bits are not important for discarding, as only one bit is
-            // checked - already loaded to red.
-          } else if (dest_is_color &&
-                     (dest_color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
-                      dest_color_format == xenos::ColorRenderTargetFormat::k_16_16_FLOAT)) {
-            a.OpMov(dxbc::Dest::O(0, 0b0011), dxbc::Src::R(1));
-          } else {
-            color_packed_in_r1x = true;
-            a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(16), dxbc::Src::LU(16),
-                    dxbc::Src::R(1, dxbc::Src::kYYYY), dxbc::Src::R(1, dxbc::Src::kXXXX));
-          }
-        } break;
-        case xenos::ColorRenderTargetFormat::k_32_FLOAT:
-        case xenos::ColorRenderTargetFormat::k_32_32_FLOAT: {
-          color_packed_in_r1x = true;
-        } break;
-      }
-    } else if (rs & kTransferUsedRootParameterDepthSRVBit) {
-      if (dest_is_color || dest_depth_format != source_depth_format) {
-        // Need to reinterpret the depth value as color or as a different depth
-        // format. Convert the depth within r1.w.
-        depth_loaded_in_guest_format = true;
-        switch (source_depth_format) {
-          case xenos::DepthRenderTargetFormat::kD24S8: {
-            // Round to the nearest even integer. This seems to be the correct
-            // conversion, adding +0.5 and rounding towards zero results in red
-            // instead of black in the 4D5307E6 clear shader.
-            a.OpMul(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
-                    dxbc::Src::LF(float(0xFFFFFF)));
-            a.OpRoundNE(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
-            a.OpFToU(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
-          } break;
-          case xenos::DepthRenderTargetFormat::kD24FS8: {
-            // Convert using r1.y as temporary.
-            // When converting the depth in pixel shaders, it's always exact,
-            // truncating not to insert additional rounding instructions.
-            DxbcShaderTranslator::PreClampedDepthTo20e4(
-                a, 1, 3, 1, 3, 1, 1,
-                !depth_float24_convert_in_pixel_shader() && depth_float24_round(), true);
-          } break;
-        }
-        if (dest_is_color) {
-          // Merge depth and stencil into r1.x for reinterpretation as color.
-          color_packed_in_r1x = true;
-          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(24), dxbc::Src::LU(8),
-                  dxbc::Src::R(1, dxbc::Src::kWWWW), dxbc::Src::R(1, dxbc::Src::kXXXX));
-        }
-      }
-    }
-    switch (mode.output) {
-      case TransferOutput::kColor:
-        // Unless a special path was taken, unpack the raw 32bpp value into the
-        // 32bpp color output. Any register can be used as temporary if needed -
-        // this is the end of the shader.
-        if (color_packed_in_r1x) {
-          switch (dest_color_format) {
-            case xenos::ColorRenderTargetFormat::k_8_8_8_8: {
-              a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8), dxbc::Src::LU(0, 8, 16, 24),
-                       dxbc::Src::R(1, dxbc::Src::kXXXX));
-              a.OpUToF(dxbc::Dest::R(1), dxbc::Src::R(1));
-              a.OpMul(dxbc::Dest::O(0), dxbc::Src::R(1), dxbc::Src::LF(1.0f / 255.0f));
-            } break;
-            case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
-              // 8_8_8_8_GAMMA is represented by linear stored in
-              // R16G16B16A16_UNORM.
-              a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8), dxbc::Src::LU(0, 8, 16, 24),
-                       dxbc::Src::R(1, dxbc::Src::kXXXX));
-              a.OpUToF(dxbc::Dest::R(1), dxbc::Src::R(1));
-              a.OpMul(dxbc::Dest::R(1, 0b0111), dxbc::Src::R(1), dxbc::Src::LF(1.0f / 255.0f));
-              a.OpMul(dxbc::Dest::O(0, 0b1000), dxbc::Src::R(1), dxbc::Src::LF(1.0f / 255.0f));
-              for (uint32_t i = 0; i < 3; ++i) {
-                DxbcShaderTranslator::PWLGammaToLinear(a, 1, i, 1, i, true, 0, 0, 0, 1);
-              }
-              a.OpMov(dxbc::Dest::O(0, 0b0111), dxbc::Src::R(1));
-            } break;
-            case xenos::ColorRenderTargetFormat::k_2_10_10_10:
-            case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10: {
-              a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(10, 10, 10, 2), dxbc::Src::LU(0, 10, 20, 30),
-                       dxbc::Src::R(1, dxbc::Src::kXXXX));
-              a.OpUToF(dxbc::Dest::R(1), dxbc::Src::R(1));
-              a.OpMul(dxbc::Dest::O(0), dxbc::Src::R(1),
-                      dxbc::Src::LF(1.0f / 1023.0f, 1.0f / 1023.0f, 1.0f / 1023.0f, 1.0f / 3.0f));
-            } break;
-            case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-            case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
-              // Color using r1.yz as temporary.
-              for (uint32_t i = 0; i < 3; ++i) {
-                DxbcShaderTranslator::Float7e3To32(a, dxbc::Dest::O(0, 1 << i), 1, 0, i * 10, 1, 1,
-                                                   1, 2);
-              }
-              // Alpha.
-              a.OpUBFE(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(2), dxbc::Src::LU(30),
-                       dxbc::Src::R(1, dxbc::Src::kXXXX));
-              a.OpUToF(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
-              a.OpMul(dxbc::Dest::O(0, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
-                      dxbc::Src::LF(1.0f / 3.0f));
-            } break;
-            case xenos::ColorRenderTargetFormat::k_16_16:
-            case xenos::ColorRenderTargetFormat::k_16_16_FLOAT: {
-              // All 16 bits per component formats are represented as integers
-              // in ownership transfer for safe handling of NaNs and
-              // -32768 / -32767.
-              a.OpUBFE(dxbc::Dest::O(0, 0b0011), dxbc::Src::LU(16), dxbc::Src::LU(0, 16, 0, 0),
-                       dxbc::Src::R(1, dxbc::Src::kXXXX));
-            } break;
-            case xenos::ColorRenderTargetFormat::k_32_FLOAT: {
-              // Already as a 32-bit value.
-              a.OpMov(dxbc::Dest::O(0, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX));
-            } break;
-            default:
-              // A 64bpp format (handled separately) or an invalid one.
-              assert_unhandled_case(dest_color_format);
-          }
-        }
-        break;
-      case TransferOutput::kDepth:
-        if (source_is_color || depth_loaded_in_guest_format) {
-          if (color_packed_in_r1x) {
-            // Extract the depth bits to r1.w.
-            a.OpUBFE(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(24), dxbc::Src::LU(8),
-                     dxbc::Src::R(1, dxbc::Src::kXXXX));
-            if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX) {
-              // Extract the stencil bits to the stencil reference.
-              // The depth -> depth case is handled earlier, not long after
-              // loading the stencil, for simplicity.
-              a.OpUBFE(dxbc::Dest::OStencilRef(), dxbc::Src::LU(8), dxbc::Src::LU(0),
-                       dxbc::Src::R(1, dxbc::Src::kXXXX));
-            }
-          }
-          // r1.w contains the depth in the guest format. If a host depth source
-          // is available, need to check if it's up to date - if it is, the host
-          // precision value needs to be written. Otherwise, the new guest value
-          // needs to be converted to the host format. Using `if` here because
-          // it's likely that the values will either be the same - if not
-          // modified - or different - if cleared or totally overwritten - in
-          // large amounts of samples, usually whole waves, at once.
-          if (rs & kTransferUsedRootParameterHostDepthSRVBit) {
-            // Load the host float32 depth to r0.x, check if, when converted to
-            // the guest format, it's the same as the guest source, thus up to
-            // date, and if it is, write host float32 depth to r1.w, otherwise
-            // do the guest -> host conversion on the `else` path.
-
-            // Current register allocation:
-            // r0.xy = pixel index within the destination 32bpp tile
-            // r0.z = 32bpp tile index relative to the destination base
-            // r1.w = depth in guest format
-
-            if (key.host_depth_source_is_copy) {
-              // Get the address in the EDRAM scratch buffer and load from
-              // there.
-              // The beginning of the buffer is (0, 0) of the destination.
-              // 40-sample columns are not swapped for addressing simplicity
-              // (because this is used for depth -> depth transfers, where
-              // swapping isn't needed).
-              // Convert samples to pixels.
-              assert_true(key.host_depth_source_msaa_samples == xenos::MsaaSamples::k1X);
-              if (key.dest_msaa_samples >= xenos::MsaaSamples::k2X) {
-                if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-                  // Horizontal sample index in bit 0.
-                  a.OpBFI(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                          dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-                }
-                // Vertical sample index as 1 or 0 in bit 0 for true 2x or as 0
-                // or 1 in bit 1 for 4x or for 2x emulated as 4x.
-                if (key.dest_msaa_samples == xenos::MsaaSamples::k2X && msaa_2x_supported_) {
-                  a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                          dxbc::Src::R(0, dxbc::Src::kYYYY), dest_sample);
-                  a.OpXOr(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                          dxbc::Src::LU(1));
-                } else {
-                  // Using r0.w as a temporary.
-                  a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                  a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                          dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kWWWW));
-                }
-              }
-              // Combine the tile sample index and the tile index into buffer
-              // address to r0.x.
-              // The tile index doesn't need to be wrapped, as the host depth is
-              // written to the beginning of the buffer, without the base
-              // offset.
-              a.OpUMAd(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(tile_width_samples),
-                       dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kXXXX));
-              a.OpUMAd(dxbc::Dest::R(0, 0b0001),
-                       dxbc::Src::LU(tile_width_samples * tile_height_samples),
-                       dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(0, dxbc::Src::kXXXX));
-              // Load from the buffer.
-              a.OpLd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), 0b0001,
-                     dxbc::Src::T(srv_index_host_depth, kTransferSRVRegisterHostDepth,
-                                  dxbc::Src::kXXXX));
-            } else {
-              // Adjust the tile index from the destination to the host depth
-              // source.
-              // r0.w = destination to host depth source EDRAM tile adjustment
-              a.OpIBFE(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
-                       dxbc::Src::LU(xenos::kEdramPitchTilesBits * 2),
-                       dxbc::Src::CB(cbuffer_index_host_depth_address,
-                                     kTransferCBVRegisterHostDepthAddress, 0, dxbc::Src::kXXXX));
-              // r0.z = tile index relative to the host depth source base, or
-              //        the tile index within the host depth source minus the
-              //        EDRAM tile count if transferring across addressing
-              //        wrapping (if negative)
-              // r0.w = free
-              a.OpIAdd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
-                       dxbc::Src::R(0, dxbc::Src::kWWWW));
-              // r0.z = tile index relative to the host depth source base
-              a.OpAnd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
-                      dxbc::Src::LU(xenos::kEdramTileCount - 1));
-              // Convert position and sample index from within the destination
-              // tile to within the host depth source tile, like for the guest
-              // render target, but for 32bpp -> 32bpp only.
-              dxbc::Src host_depth_source_sample(dest_sample);
-              if (key.host_depth_source_msaa_samples != key.dest_msaa_samples) {
-                if (key.host_depth_source_msaa_samples >= xenos::MsaaSamples::k4X) {
-                  // 4x -> 1x/2x.
-                  if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-                    // 4x -> 2x.
-                    // Horizontal pixels to samples. Vertical sample (1, 0 in
-                    // the first bit for native 2x or 0, 1 in the second bit for
-                    // 2x as 4x) to second sample bit.
-                    host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                    if (msaa_2x_supported_) {
-                      a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                              dest_sample, dxbc::Src::R(0, dxbc::Src::kXXXX));
-                      a.OpXOr(dxbc::Dest::R(0, 0b1000), host_depth_source_sample,
-                              dxbc::Src::LU(1 << 1));
-                    } else {
-                      a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(0),
-                              dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-                    }
-                    a.OpUShR(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX),
-                             dxbc::Src::LU(1));
-                  } else {
-                    // 4x -> 1x.
-                    // Pixels to samples.
-                    a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kXXXX),
-                            dxbc::Src::LU(1));
-                    host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                    a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                            dxbc::Src::R(0, dxbc::Src::kYYYY), host_depth_source_sample);
-                    a.OpUShR(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0), dxbc::Src::LU(1));
-                  }
-                } else {
-                  // 1x/2x -> 1x/2x/4x (as long as they're different).
-                  // Only the X part - Y is handled by common code.
-                  if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-                    // Horizontal samples to pixels.
-                    a.OpBFI(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                            dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-                  }
-                }
-                // Host depth source Y and sample index for 1x/2x AA sources.
-                if (key.host_depth_source_msaa_samples < xenos::MsaaSamples::k4X) {
-                  if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-                    // 1x/2x -> 4x.
-                    if (key.host_depth_source_msaa_samples == xenos::MsaaSamples::k2X) {
-                      // 2x -> 4x.
-                      // Vertical samples (second bit) of 4x destination to
-                      // vertical sample (1, 0 for native 2x, or 0, 3 for 2x as
-                      // 4x) of 2x source.
-                      a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                      host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                      if (msaa_2x_supported_) {
-                        a.OpXOr(dxbc::Dest::R(0, 0b1000), host_depth_source_sample,
-                                dxbc::Src::LU(1));
-                      } else {
-                        a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                                host_depth_source_sample, host_depth_source_sample);
-                      }
-                    } else {
-                      // 1x -> 4x.
-                      // Vertical samples (second bit) to Y pixels, using r0.w
-                      // (not needed without source MSAA) as a temporary.
-                      a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                      a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                              dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kWWWW));
-                    }
-                  } else {
-                    // 1x/2x -> different 1x/2x.
-                    if (key.host_depth_source_msaa_samples == xenos::MsaaSamples::k2X) {
-                      // 2x -> 1x.
-                      // Vertical pixels of 2x destination to vertical samples
-                      // (1, 0 for native 2x, or 0, 3 for 2x as 4x) of 1x
-                      // source.
-                      a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                              dxbc::Src::LU(1));
-                      host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                      if (msaa_2x_supported_) {
-                        a.OpXOr(dxbc::Dest::R(0, 0b1000), host_depth_source_sample,
-                                dxbc::Src::LU(1));
-                      } else {
-                        a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                                host_depth_source_sample, host_depth_source_sample);
-                      }
-                      a.OpUShR(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                               dxbc::Src::LU(1));
-                    } else {
-                      // 1x -> 2x.
-                      // Vertical samples (1, 0 in the first bit for native 2x
-                      // or 0, 1 in the second bit for 2x as 4x) of 2x
-                      // destination to vertical pixels of 1x source.
-                      // Using r0.w (not needed without source MSAA) as a
-                      // temporary.
-                      if (msaa_2x_supported_) {
-                        a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                                dxbc::Src::R(0, dxbc::Src::kYYYY), dest_sample);
-                        a.OpXOr(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                                dxbc::Src::LU(1));
-                      } else {
-                        a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                        a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                                dxbc::Src::R(0, dxbc::Src::kYYYY),
-                                dxbc::Src::R(0, dxbc::Src::kWWWW));
-                      }
-                    }
-                  }
-                }
-              }
-              // r1.x = host depth source pitch in tiles
-              a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
-                       dxbc::Src::LU(xenos::kEdramPitchTilesBits),
-                       dxbc::Src::CB(cbuffer_index_host_depth_address,
-                                     kTransferCBVRegisterHostDepthAddress, 0, dxbc::Src::kXXXX));
-              // r0.z = host depth source tile row
-              // r1.x = host depth source tile within the row
-              a.OpUDiv(dxbc::Dest::R(0, 0b0100), dxbc::Dest::R(1, 0b0001),
-                       dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(1, dxbc::Src::kXXXX));
-              // r0.x = pixel X within the host depth source texture
-              // r1.x = free
-              a.OpUMAd(
-                  dxbc::Dest::R(0, 0b0001),
-                  dxbc::Src::LU(tile_width_samples >> uint32_t(key.host_depth_source_msaa_samples >=
-                                                               xenos::MsaaSamples::k4X)),
-                  dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::R(0, dxbc::Src::kXXXX));
-              // r0.y = pixel Y within the host depth source texture
-              // r0.z = free
-              a.OpUMAd(dxbc::Dest::R(0, 0b0010),
-                       dxbc::Src::LU(
-                           tile_height_samples >>
-                           uint32_t(key.host_depth_source_msaa_samples >= xenos::MsaaSamples::k2X)),
-                       dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(0, dxbc::Src::kYYYY));
-              // Load from the host depth texture.
-              if (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X) {
-                a.OpLdMS(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0), 0b0011,
-                         dxbc::Src::T(srv_index_host_depth, kTransferSRVRegisterHostDepth,
-                                      dxbc::Src::kXXXX),
-                         host_depth_source_sample);
-              } else {
-                // Write zero to the LOD index in r0.z.
-                a.OpMov(dxbc::Dest::R(0, 0b0100), dxbc::Src::LU(0));
-                a.OpLd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, 0b10000100), 0b1011,
-                       dxbc::Src::T(srv_index_host_depth, kTransferSRVRegisterHostDepth,
-                                    dxbc::Src::kXXXX));
-              }
-            }
-            // Convert the host depth value in r0.x to the guest format in r0.y
-            // using r0.z as a temporary and check if it matches the value in
-            // the currently owning guest render target.
-            switch (dest_depth_format) {
-              case xenos::DepthRenderTargetFormat::kD24S8: {
-                // Round to the nearest even integer. This seems to be the
-                // correct, adding +0.5 and rounding towards zero results in red
-                // instead of black in the 4D5307E6 clear shader.
-                a.OpMul(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kXXXX),
-                        dxbc::Src::LF(float(0xFFFFFF)));
-                a.OpRoundNE(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY));
-                a.OpFToU(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY));
-              } break;
-              case xenos::DepthRenderTargetFormat::kD24FS8: {
-                // When converting the depth in pixel shaders, it's always
-                // exact, truncating not to insert additional rounding
-                // instructions.
-                DxbcShaderTranslator::PreClampedDepthTo20e4(
-                    a, 0, 1, 0, 0, 0, 2,
-                    !depth_float24_convert_in_pixel_shader() && depth_float24_round(), true);
-              } break;
-            }
-            a.OpIEq(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                    dxbc::Src::R(1, dxbc::Src::kWWWW));
-            a.OpIf(true, dxbc::Src::R(0, dxbc::Src::kYYYY));
-            // If the host depth is up to date, write it to oDepth at the host
-            // precision instead of converting the guest depth.
-            a.OpMov(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(0, dxbc::Src::kXXXX));
-            a.OpElse();
-          }
-          // Convert using r0.x as a temporary.
-          switch (dest_depth_format) {
-            case xenos::DepthRenderTargetFormat::kD24S8: {
-              // Multiplying by 1.0 / 0xFFFFFF produces an incorrect result (for
-              // 0xC00000, for instance - which is 2_10_10_10 clear to 0001) -
-              // rescale from 0...0xFFFFFF to 0...0x1000000 doing what true
-              // float division followed by multiplication does (on x86-64 MSVC
-              // with default SSE rounding) - values starting from 0x800000
-              // become bigger by 1; then accurately bias the result's exponent.
-              a.OpUShR(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(1, dxbc::Src::kWWWW),
-                       dxbc::Src::LU(23));
-              a.OpIAdd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
-                       dxbc::Src::R(0, dxbc::Src::kXXXX));
-              a.OpUToF(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
-              a.OpMul(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
-                      dxbc::Src::LF(1.0f / float(1 << 24)));
-            } break;
-            case xenos::DepthRenderTargetFormat::kD24FS8: {
-              DxbcShaderTranslator::Depth20e4To32(a, dxbc::Dest::R(1, 0b1000), 1, 3, 0, 1, 3, 0, 0,
-                                                  true);
-            } break;
-          }
-          // Host depth is different, or not available - convert the guest depth
-          // to the destination format.
-          if (rs & kTransferUsedRootParameterHostDepthSRVBit) {
-            // Close the conditional for the host / guest depth.
-            a.OpEndIf();
-          }
-        }
-        a.OpMov(dxbc::Dest::ODepth(), dxbc::Src::R(1, dxbc::Src::kWWWW));
-        break;
-      case TransferOutput::kStencilBit:
-        // Discard the sample if the needed stencil bit is not set.
-        assert_true(cbuffer_index_stencil_mask != UINT32_MAX);
-        a.OpAnd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
-                dxbc::Src::CB(cbuffer_index_stencil_mask, kTransferCBVRegisterStencilMask, 0,
-                              dxbc::Src::kXXXX));
-        a.OpDiscard(false, dxbc::Src::R(0, dxbc::Src::kXXXX));
-        break;
-    }
-  }
-
-  if (dest_is_color) {
-    // Fill the unused components of the color result.
-    uint32_t dest_color_component_count =
-        xenos::GetColorRenderTargetFormatComponentCount(dest_color_format);
-    uint32_t dest_color_unwritten_mask = 0b1111 & ~uint32_t((1 << dest_color_component_count) - 1);
-    if (dest_color_component_count < 4) {
-      a.OpMov(dxbc::Dest::O(0, dest_color_unwritten_mask), dxbc::Src::LU(0));
-    }
-  }
-
-  a.OpRet();
-
-  // Write the shader program length in dwords.
-  built_shader_[shex_position_dwords + 1] = uint32_t(built_shader_.size()) - shex_position_dwords;
-
-  {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
-    blob_header.fourcc = dxbc::BlobHeader::FourCC::kShaderEx;
-    blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
-  }
-
-  // ***************************************************************************
-  // Shader feature info
-  // ***************************************************************************
-
-  if (shader_uses_stencil_reference_output) {
-    built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
-    uint32_t sfi0_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-    built_shader_.resize(sfi0_position_dwords + sizeof(dxbc::ShaderFeatureInfo) / sizeof(uint32_t));
-    auto& shader_feature_info =
-        *reinterpret_cast<dxbc::ShaderFeatureInfo*>(built_shader_.data() + sfi0_position_dwords);
-    shader_feature_info.feature_flags[0] |= dxbc::kShaderFeature0_StencilRef;
-    {
-      auto& blob_header =
-          *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
-      blob_header.fourcc = dxbc::BlobHeader::FourCC::kShaderFeatureInfo;
-      blob_position_dwords = uint32_t(built_shader_.size());
-      blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                               built_shader_[blob_offset_position_dwords++];
-    }
-  }
-
-  // ***************************************************************************
-  // Statistics
-  // ***************************************************************************
-
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
-  uint32_t stat_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-  built_shader_.resize(stat_position_dwords + sizeof(dxbc::Statistics) / sizeof(uint32_t));
-  std::memcpy(built_shader_.data() + stat_position_dwords, &stat, sizeof(dxbc::Statistics));
-  {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
-    blob_header.fourcc = dxbc::BlobHeader::FourCC::kStatistics;
-    blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
-  }
-
-  // ***************************************************************************
-  // Container header
-  // ***************************************************************************
-
-  uint32_t built_shader_size_bytes = uint32_t(built_shader_.size() * sizeof(uint32_t));
-  {
-    auto& container_header = *reinterpret_cast<dxbc::ContainerHeader*>(built_shader_.data());
-    container_header.InitializeIdentification();
-    container_header.size_bytes = built_shader_size_bytes;
-    container_header.blob_count = blob_count;
-    CalculateDXBCChecksum(reinterpret_cast<unsigned char*>(built_shader_.data()),
-                          static_cast<unsigned int>(built_shader_size_bytes),
-                          reinterpret_cast<unsigned int*>(&container_header.hash));
-  }
+  const uint32_t built_shader_size_bytes = uint32_t(built_shader_.size() * sizeof(uint32_t));
 
   // ***************************************************************************
   // Pipeline
@@ -3926,7 +2261,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     const char* dest_format_name = mode.output == TransferOutput::kColor
                                        ? xenos::GetColorRenderTargetFormatName(dest_color_format)
                                        : xenos::GetDepthRenderTargetFormatName(dest_depth_format);
-    if (srv_index_host_depth != UINT32_MAX) {
+    if (rs & kTransferUsedRootParameterHostDepthSRVBit) {
       REXGPU_ERROR(
           "D3D12RenderTargetCache: Failed to create a render target ownership "
           "transfer pipeline for {}-sample {} + {}-sample host depth{} -> "
@@ -3946,6 +2281,30 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   return pipelines;
 }
 
+D3D12RenderTargetCache::D3D12RenderTarget* D3D12RenderTargetCache::SnapshotNativeHostDepth(
+    D3D12RenderTarget& source) {
+  auto snapshot = std::unique_ptr<D3D12RenderTarget>(
+      static_cast<D3D12RenderTarget*>(CreateRenderTarget(source.key())));
+  if (!snapshot)
+    return nullptr;
+  command_processor_.PushTransitionBarrier(
+      source.resource(), source.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.PushTransitionBarrier(
+      snapshot->resource(), snapshot->SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST),
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyResource(snapshot->resource(),
+                                                              source.resource());
+  auto* result = snapshot.get();
+  native_depth_snapshots_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                       std::move(snapshot));
+  if (++native_depth_snapshot_count_ <= 8 || !(native_depth_snapshot_count_ & 255))
+    REXGPU_INFO("[d3d12-native-depth-snapshot] {} in-place depth versions retained as images",
+                native_depth_snapshot_count_);
+  return result;
+}
+
 void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
@@ -3957,6 +2316,41 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   ID3D12Device* device = provider.GetDevice();
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+
+  // An aliased colour writer can leave this depth attachment as the retained
+  // high-precision depth owner. Freeze its image before writing it again, so
+  // the transfer samples a separate native attachment rather than EDRAM.
+  std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets> native_transfers;
+  bool needs_depth_snapshot = false;
+  if (render_target_transfers) {
+    for (uint32_t i = 0; i < render_target_count && !needs_depth_snapshot; ++i)
+      needs_depth_snapshot =
+          render_targets[i] &&
+          std::any_of(render_target_transfers[i].begin(), render_target_transfers[i].end(),
+                      [&](const Transfer& transfer) {
+                        return transfer.host_depth_source == render_targets[i];
+                      });
+  }
+  if (needs_depth_snapshot) {
+    assert_true(render_target_count <= native_transfers.size());
+    bool replaced = false;
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      native_transfers[i] = render_target_transfers[i];
+      RenderTarget* snapshot = nullptr;
+      for (auto& transfer : native_transfers[i]) {
+        if (!render_targets[i] || transfer.host_depth_source != render_targets[i])
+          continue;
+        if (!snapshot)
+          snapshot = SnapshotNativeHostDepth(*static_cast<D3D12RenderTarget*>(render_targets[i]));
+        if (snapshot) {
+          transfer.host_depth_source = snapshot;
+          replaced = true;
+        }
+      }
+    }
+    if (replaced)
+      render_target_transfers = native_transfers.data();
+  }
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
   D3D12_RECT clear_rect;
@@ -3992,6 +2386,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         continue;
       }
       if (!host_depth_store_set_up) {
+        if (!EnsureEdramBuffer()) {
+          return;
+        }
         // Bindings.
         // 0 - source.
         // 1 - EDRAM if bindful.
@@ -4226,8 +2623,6 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
   bool transfer_viewport_set = false;
   float pixels_to_ndc_unscaled = 2.0f / float(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION);
-  float pixels_to_ndc_x = pixels_to_ndc_unscaled * draw_resolution_scale_x();
-  float pixels_to_ndc_y = pixels_to_ndc_unscaled * draw_resolution_scale_y();
 
   TransferRootSignatureIndex last_transfer_root_signature_index =
       TransferRootSignatureIndex::kCount;
@@ -4253,6 +2648,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
     auto& dest_d3d12_rt = *static_cast<D3D12RenderTarget*>(dest_rt);
     RenderTargetKey dest_rt_key = dest_d3d12_rt.key();
+    float pixels_to_ndc_x = pixels_to_ndc_unscaled * GetRenderTargetScaleX(dest_rt_key);
+    float pixels_to_ndc_y = pixels_to_ndc_unscaled * GetRenderTargetScaleY(dest_rt_key);
 
     // Late barrier in case there was cross-copying that prevented merging of
     // barriers.
@@ -4290,6 +2687,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       TransferShaderKey new_transfer_shader_key;
       new_transfer_shader_key.dest_msaa_samples = dest_rt_key.msaa_samples;
       new_transfer_shader_key.dest_resource_format = dest_rt_key.resource_format;
+      new_transfer_shader_key.dest_original_resolution = dest_rt_key.original_resolution;
       uint32_t stencil_clear_rectangle_count = 0;
       for (uint32_t j = 0; j <= uint32_t(need_stencil_bit_draws); ++j) {
         // j == 0 - color or depth.
@@ -4322,8 +2720,13 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           RenderTargetKey source_rt_key = source_d3d12_rt.key();
           new_transfer_shader_key.source_msaa_samples = source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format = source_rt_key.resource_format;
+          new_transfer_shader_key.source_original_resolution = source_rt_key.original_resolution;
           bool host_depth_source_is_copy = host_depth_source_d3d12_rt == &dest_d3d12_rt;
           new_transfer_shader_key.host_depth_source_is_copy = host_depth_source_is_copy;
+          new_transfer_shader_key.host_depth_source_original_resolution =
+              host_depth_source_d3d12_rt && !host_depth_source_is_copy
+                  ? host_depth_source_d3d12_rt->key().original_resolution
+                  : 0;
           // The host depth copy buffer has only raw samples.
           new_transfer_shader_key.host_depth_source_msaa_samples =
               (host_depth_source_d3d12_rt && !host_depth_source_is_copy)
@@ -4378,15 +2781,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             const Transfer::Rectangle& stencil_clear_rectangle =
                 transfer_stencil_clear_rectangles[j];
             stencil_clear_rect_write_ptr->left =
-                LONG(stencil_clear_rectangle.x_pixels * draw_resolution_scale_x());
+                LONG(stencil_clear_rectangle.x_pixels * GetRenderTargetScaleX(dest_rt_key));
             stencil_clear_rect_write_ptr->top =
-                LONG(stencil_clear_rectangle.y_pixels * draw_resolution_scale_y());
+                LONG(stencil_clear_rectangle.y_pixels * GetRenderTargetScaleY(dest_rt_key));
             stencil_clear_rect_write_ptr->right =
                 LONG((stencil_clear_rectangle.x_pixels + stencil_clear_rectangle.width_pixels) *
-                     draw_resolution_scale_x());
+                     GetRenderTargetScaleX(dest_rt_key));
             stencil_clear_rect_write_ptr->bottom =
                 LONG((stencil_clear_rectangle.y_pixels + stencil_clear_rectangle.height_pixels) *
-                     draw_resolution_scale_y());
+                     GetRenderTargetScaleY(dest_rt_key));
             ++stencil_clear_rect_write_ptr;
           }
         }
@@ -4706,6 +3109,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
     // Perform the clear.
     if (resolve_clear_needed) {
+      clear_rect.left =
+          LONG(resolve_clear_rectangle->x_pixels * GetRenderTargetScaleX(dest_rt_key));
+      clear_rect.top = LONG(resolve_clear_rectangle->y_pixels * GetRenderTargetScaleY(dest_rt_key));
+      clear_rect.right =
+          LONG((resolve_clear_rectangle->x_pixels + resolve_clear_rectangle->width_pixels) *
+               GetRenderTargetScaleX(dest_rt_key));
+      clear_rect.bottom =
+          LONG((resolve_clear_rectangle->y_pixels + resolve_clear_rectangle->height_pixels) *
+               GetRenderTargetScaleY(dest_rt_key));
       uint64_t clear_value = render_target_resolve_clear_values[i];
       if (dest_rt_key.is_depth) {
         uint32_t depth_guest_clear_value = (uint32_t(clear_value) >> 8) & 0xFFFFFF;
@@ -5668,73 +4080,318 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   return pipeline;
 }
 
-ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDirectResolvePipeline(
-    DirectResolvePipelineKey key) {
-  auto pipeline_it = direct_resolve_pipelines_.find(key);
-  if (pipeline_it != direct_resolve_pipelines_.end()) {
-    return pipeline_it->second;
+bool D3D12RenderTargetCache::GetOrCreateNativeResolvePipeline(bool depth, bool integer_source,
+                                                              bool multisampled) {
+  uint32_t variant = uint32_t(integer_source) | (uint32_t(multisampled) << 1);
+  auto& attempted =
+      depth ? native_depth_copy_attempted_[multisampled] : native_color_copy_attempted_[variant];
+  auto& root_signature =
+      depth ? native_depth_copy_root_signature_ : native_color_copy_root_signature_;
+  auto& pipeline =
+      depth ? native_depth_copy_pipeline_[multisampled] : native_color_copy_pipeline_[variant];
+  if (attempted) {
+    return pipeline != nullptr;
   }
-  ID3D12PipelineState* pipeline = nullptr;
-  // Until dedicated direct host RT -> shared memory shaders are added, reuse
-  // the resolve copy pipelines to keep all resolve shader modes wired for the
-  // direct preflight path.
-  size_t copy_shader_index = size_t(key.copy_shader);
-  if (copy_shader_index < size_t(draw_util::ResolveCopyShaderIndex::kCount)) {
-    pipeline = resolve_copy_pipelines_[copy_shader_index];
+  attempted = true;
+
+  // The compiler is optional at runtime. Keep the existing precompiled resolve
+  // path available when this shader cannot be compiled or created.
+  HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+  auto compile =
+      compiler ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(compiler, "D3DCompile"))
+               : nullptr;
+  ID3DBlob* code = nullptr;
+  ID3DBlob* errors = nullptr;
+  std::string source = depth ? draw_util::kNativeDepthResolve : draw_util::kNativeColorResolve;
+  if (!depth && integer_source)
+    source.insert(0, "#define NATIVE_COLOR_UINT\n");
+  if (multisampled)
+    source.insert(0, "#define NATIVE_RESOLVE_MSAA\n");
+  HRESULT result = compile ? compile(source.data(), source.size(),
+                                     depth ? "native_depth_resolve" : "native_color_resolve",
+                                     nullptr, nullptr, "main", "cs_5_0",
+                                     D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                                     0, &code, &errors)
+                           : E_NOINTERFACE;
+  if (FAILED(result)) {
+    REXGPU_WARN("D3D12 native {} resolve shader unavailable: {:08X} {}", depth ? "depth" : "color",
+                uint32_t(result),
+                errors ? std::string(static_cast<const char*>(errors->GetBufferPointer()),
+                                     errors->GetBufferSize())
+                       : "D3DCompiler_47.dll is unavailable");
+  } else {
+    auto& provider = command_processor_.GetD3D12Provider();
+    D3D12_DESCRIPTOR_RANGE ranges[3] = {};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[0].NumDescriptors = 1;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[1].NumDescriptors = 1;
+    // One-use bindless descriptors are recycled independently, so the depth
+    // and stencil views are not necessarily adjacent. Give each its own table
+    // instead of overwriting the descriptor following the depth view.
+    ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[2].NumDescriptors = 1;
+    ranges[2].BaseShaderRegister = 1;
+    D3D12_ROOT_PARAMETER parameters[4] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.Num32BitValues = 20;
+    for (uint32_t i = 0; i < (depth ? 3u : 2u); ++i) {
+      parameters[i + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      parameters[i + 1].DescriptorTable.NumDescriptorRanges = 1;
+      parameters[i + 1].DescriptorTable.pDescriptorRanges = &ranges[i];
+    }
+    D3D12_ROOT_SIGNATURE_DESC description = {};
+    description.NumParameters = depth ? 4 : 3;
+    description.pParameters = parameters;
+    if (!root_signature)
+      root_signature = ui::d3d12::util::CreateRootSignature(provider, description);
+    if (root_signature) {
+      pipeline = ui::d3d12::util::CreateComputePipeline(
+          provider.GetDevice(), code->GetBufferPointer(), code->GetBufferSize(), root_signature);
+    }
+    if (!pipeline) {
+      REXGPU_WARN("D3D12 native {} resolve pipeline unavailable; using the general resolve",
+                  depth ? "depth" : "color");
+    }
   }
-  direct_resolve_pipelines_.emplace(key, pipeline);
-  return pipeline;
+  ui::d3d12::util::ReleaseAndNull(errors);
+  ui::d3d12::util::ReleaseAndNull(code);
+  if (compiler) {
+    FreeLibrary(compiler);
+  }
+  return pipeline != nullptr;
 }
 
-bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
-                                                    draw_util::ResolveCopyShaderIndex copy_shader,
-                                                    bool draw_resolution_scaled) {
-  ++direct_resolve_attempt_count_;
-  (void)copy_shader;
-  (void)draw_resolution_scaled;
-  if (!direct_resolve_root_signature_color_ || !direct_resolve_root_signature_depth_) {
-    return false;
-  }
-
-  uint32_t dump_base;
-  uint32_t dump_row_length_used;
-  uint32_t dump_rows;
-  uint32_t dump_pitch;
-  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-  GetResolveCopyDispatchesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
-                                 dump_rectangles_, direct_resolve_dispatches_);
-  if (direct_resolve_dispatches_.empty()) {
-    return false;
-  }
-
-  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
-    const auto* render_target = static_cast<const D3D12RenderTarget*>(rectangle.render_target);
-    if (render_target == nullptr) {
-      return false;
+RenderTargetCache::RenderTarget* D3D12RenderTargetCache::PrepareNativeResolveAlias(
+    const draw_util::ResolveInfo& resolve, uint32_t base, uint32_t row_length, uint32_t rows,
+    uint32_t pitch) {
+  NativeResolveOwnershipPlan plan;
+  if (!PlanNativeResolveOwnership(resolve, base, row_length, rows, pitch, plan, true))
+    return nullptr;
+  const auto dest_key = plan.destination;
+  const bool depth = dest_key.is_depth;
+  auto* dest = static_cast<D3D12RenderTarget*>(GetOrCreateRenderTarget(dest_key));
+  bool integer = !depth && draw_util::NativeColorResolveUsesIntegerSource(
+                               draw_util::GetNativeColorResolvePacking(dest_key.GetColorFormat()));
+  if (!dest || !GetOrCreateNativeResolvePipeline(depth, integer,
+                                                 dest_key.msaa_samples != xenos::MsaaSamples::k1X))
+    return nullptr;
+  // Preflight every source before decoding the temporary view. No source is decoded
+  // through the EDRAM buffer, including mixed format/base/pitch owners.
+  for (const auto& transfer : plan.transfers) {
+    const auto source_key = transfer.source->key();
+    TransferShaderKey shader_key;
+    shader_key.dest_msaa_samples = dest_key.msaa_samples;
+    shader_key.dest_resource_format = dest_key.resource_format;
+    shader_key.source_msaa_samples = source_key.msaa_samples;
+    shader_key.source_resource_format = source_key.resource_format;
+    shader_key.dest_original_resolution = dest_key.original_resolution;
+    shader_key.source_original_resolution = source_key.original_resolution;
+    shader_key.host_depth_source_original_resolution =
+        transfer.host_depth_source ? transfer.host_depth_source->key().original_resolution : 0;
+    shader_key.mode =
+        GetTransferMode(false, depth, source_key.is_depth, transfer.host_depth_source != nullptr);
+    if (transfer.host_depth_source)
+      shader_key.host_depth_source_msaa_samples = transfer.host_depth_source->key().msaa_samples;
+    if (!GetOrCreateTransferPipelines(shader_key))
+      return nullptr;
+    if (depth && !use_stencil_reference_output_) {
+      shader_key.mode = GetTransferMode(true, true, source_key.is_depth, false);
+      shader_key.host_depth_source_msaa_samples = xenos::MsaaSamples::k1X;
+      if (!GetOrCreateTransferPipelines(shader_key))
+        return nullptr;
     }
-    DumpPipelineKey dump_pipeline_key;
-    dump_pipeline_key.msaa_samples = render_target->key().msaa_samples;
-    dump_pipeline_key.resource_format = render_target->key().resource_format;
-    dump_pipeline_key.is_depth = render_target->key().is_depth;
-    if (!GetOrCreateDumpPipeline(dump_pipeline_key)) {
-      return false;
+  }
+  // Resolving is a read. Keep the original owners and host depth values;
+  // publishing this decoded view would accumulate format-rounding losses.
+  const auto& transfers = plan.transfers;
+  RenderTarget* targets[] = {dest};
+  PerformTransfersAndResolveClears(1, targets, &transfers);
+  GetResolveCopyRectanglesToDump(base, row_length, rows, pitch, dump_rectangles_);
+  command_processor_.native_gpu_diagnostics().RecordOperation(
+      NativeGpuDiagnostics::Operation::kAliasTransfer);
+  return dest;
+}
+
+void D3D12RenderTargetCache::PlanNativeResolveCopy(const draw_util::ResolveInfo& resolve,
+                                                   D3D12TextureCache& textures,
+                                                   NativeResolveCopy& copy) {
+  // Native packing preserves matching single-sampled attachment formats. A
+  // partial rectangle updates compact resolve storage; whole compatible
+  // textures can additionally receive an image copy.
+  bool depth = resolve.IsCopyingDepth();
+  const draw_util::ResolveEdramInfo& edram =
+      depth ? resolve.depth_edram_info : resolve.color_edram_info;
+  auto reject = [&](const char* reason) {
+    if (REXCVAR_GET(d3d12_native_resolve_debug)) {
+      static uint32_t logged = 0;
+      if (logged++ < 64) {
+        const auto& info = resolve.IsCopyingDepth() ? resolve.depth_edram_info : edram;
+        REXGPU_INFO(
+            "[d3d12-resolve-fallback] {}: depth {}, source format {}, destination format {}, "
+            "MSAA {}, origin {}x{}, size {}x{}, destination {:08X}",
+            reason, resolve.IsCopyingDepth(), uint32_t(info.format),
+            uint32_t(resolve.copy_dest_info.copy_dest_format), uint32_t(info.msaa_samples),
+            resolve.rect_x0, resolve.rect_y0, uint32_t(resolve.coordinate_info.width_div_8) << 3,
+            resolve.height_div_8 << 3, resolve.copy_dest_base);
+      }
     }
-    DirectResolvePipelineKey direct_pipeline_key;
-    direct_pipeline_key.dump_pipeline_key = dump_pipeline_key;
-    direct_pipeline_key.copy_shader = copy_shader;
-    direct_pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
-    if (!GetOrCreateDirectResolvePipeline(direct_pipeline_key)) {
-      return false;
+  };
+  if ((depth &&
+       (!REXCVAR_GET(d3d12_native_depth_resolves) || resolve.copy_dest_info.copy_dest_swap)) ||
+      edram.msaa_samples > xenos::MsaaSamples::k4X ||
+      uint32_t(resolve.copy_dest_info.copy_dest_endian) > uint32_t(xenos::Endian128::k8in128)) {
+    reject("copy parameters");
+    return;
+  }
+  auto guest_format = xenos::ColorRenderTargetFormat(edram.format);
+  auto depth_format = xenos::DepthRenderTargetFormat(edram.format);
+  if (depth ? (uint32_t(depth_format) > uint32_t(xenos::DepthRenderTargetFormat::kD24FS8) ||
+               uint32_t(resolve.copy_dest_info.copy_dest_format) !=
+                   (depth_format == xenos::DepthRenderTargetFormat::kD24FS8
+                        ? uint32_t(xenos::TextureFormat::k_24_8_FLOAT)
+                        : uint32_t(xenos::TextureFormat::k_24_8)))
+            : (draw_util::GetNativeColorResolvePacking(
+                   xenos::ColorFormat(resolve.copy_dest_info.copy_dest_format)) ==
+               draw_util::NativeColorResolveDestination::kUnsupported)) {
+    reject("format conversion");
+    return;
+  }
+  uint32_t base, row_length, rows, pitch;
+  resolve.GetCopyEdramTileSpan(base, row_length, rows, pitch);
+  GetResolveCopyRectanglesToDump(base, row_length, rows, pitch, dump_rectangles_);
+  auto* native_source = PrepareNativeResolveAlias(resolve, base, row_length, rows, pitch);
+  if (!native_source)
+    native_source = FindNativeResolveSource(base, row_length, rows, pitch);
+  if (!native_source) {
+    reject("source tiles missing or have different owners");
+    return;
+  }
+  auto& source = *static_cast<D3D12RenderTarget*>(native_source);
+  RenderTargetKey key = source.key();
+  xenos::ColorRenderTargetFormat source_format =
+      key.is_depth ? xenos::ColorRenderTargetFormat::k_8_8_8_8 : key.GetColorFormat();
+  if (bool(key.is_depth) != depth ||
+      key.base_tiles != (depth ? resolve.depth_original_base : resolve.color_original_base) ||
+      key.msaa_samples != edram.msaa_samples || key.GetPitchTiles() != edram.pitch_tiles ||
+      (depth ? key.GetDepthFormat() != depth_format
+             : draw_util::GetNativeColorResolvePacking(source_format) ==
+                   draw_util::NativeColorResolvePacking::kUnsupported)) {
+    reject("source format or layout");
+    if (REXCVAR_GET(d3d12_native_resolve_debug)) {
+      REXGPU_INFO(
+          "[d3d12-resolve-source] depth {}, format {}, base {}, pitch {}, MSAA {}; requested "
+          "depth {}, format {}, base {}, pitch {}, MSAA {}",
+          bool(key.is_depth),
+          key.is_depth ? uint32_t(key.GetDepthFormat()) : uint32_t(key.GetColorFormat()),
+          uint32_t(key.base_tiles), key.GetPitchTiles(), uint32_t(key.msaa_samples), depth,
+          uint32_t(edram.format), depth ? resolve.depth_original_base : resolve.color_original_base,
+          uint32_t(edram.pitch_tiles), uint32_t(edram.msaa_samples));
+    }
+    return;
+  }
+  D3D12_RESOURCE_DESC source_desc = source.resource()->GetDesc();
+  auto packing = draw_util::GetNativeColorResolvePacking(source_format);
+  uint32_t scale_x = GetRenderTargetScaleX(key), scale_y = GetRenderTargetScaleY(key);
+  uint32_t x1 = resolve.rect_x0 + (uint32_t(resolve.coordinate_info.width_div_8)
+                                   << xenos::kResolveAlignmentPixelsLog2);
+  uint32_t y1 = resolve.rect_y0 + (resolve.height_div_8 << xenos::kResolveAlignmentPixelsLog2);
+  uint32_t dest_pitch = uint32_t(resolve.copy_dest_coordinate_info.pitch_aligned_div_32)
+                        << xenos::kTextureTileWidthHeightLog2;
+  auto source_layout = draw_util::GetNativeResolveSourceLayout(
+      resolve.rect_x0, resolve.rect_y0, x1 - resolve.rect_x0, y1 - resolve.rect_y0, scale_x,
+      scale_y, uint32_t(source_desc.Width), source_desc.Height, edram.msaa_samples,
+      key.msaa_samples, !depth && key.Is64bpp(), edram.pitch_tiles);
+  if (!x1 || !y1 || x1 > dest_pitch || !source_layout ||
+      (depth ? (source_desc.Format != DXGI_FORMAT_R32G8X24_TYPELESS &&
+                source_desc.Format != DXGI_FORMAT_R24G8_TYPELESS)
+             : source_desc.Format != GetColorResourceDXGIFormat(source_format))) {
+    reject("host extent or format");
+    return;
+  }
+  copy.source = &source;
+  copy.scale_x = scale_x;
+  copy.scale_y = scale_y;
+  copy.color_packing = uint32_t(packing);
+  copy.source_layout = source_layout.packed;
+  copy.integer_source = !depth && draw_util::NativeColorResolveUsesIntegerSource(packing);
+  copy.red_blue_swapped = resolve.copy_dest_info.copy_dest_swap != 0;
+  if (depth || (source_layout.packed & 0x80000000u) ||
+      key.msaa_samples != xenos::MsaaSamples::k1X ||
+      !xenos::IsColorResolveFormatBitwiseEquivalent(
+          source_format, xenos::ColorFormat(resolve.copy_dest_info.copy_dest_format)) ||
+      resolve.rect_x0 || resolve.rect_y0 || resolve.copy_dest_info.copy_dest_array ||
+      resolve.copy_dest_info.copy_dest_exp_bias || copy.integer_source ||
+      packing >= draw_util::NativeColorResolvePacking::kSint16x2 ||
+      uint32_t(resolve.copy_dest_info.copy_dest_endian) > uint32_t(xenos::Endian128::k16in32))
+    return;
+  D3D12TextureCache::NativeResolveTarget found[D3D12TextureCache::kMaxNativeResolveTargets];
+  uint32_t count = textures.FindNativeResolveTargets(
+      resolve.copy_dest_base_raw, dest_pitch,
+      xenos::TextureFormat(resolve.copy_dest_info.copy_dest_format),
+      xenos::Endian(resolve.copy_dest_info.copy_dest_endian),
+      IsDrawResolutionScaled() && !key.original_resolution, found);
+  for (uint32_t i = 0; i < count; ++i) {
+    const auto& target = found[i];
+    const D3D12_RESOURCE_DESC target_desc = target.resource->GetDesc();
+    bool copy_compatible = (source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                            target_desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) ||
+                           (source_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM &&
+                            target_desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS);
+    if (target.width > x1 || target.height > y1 ||
+        uint64_t(target.width) * scale_x > source_desc.Width ||
+        target.height * scale_y > source_desc.Height || !copy_compatible ||
+        source_desc.SampleDesc.Count != 1 ||
+        target_desc.Width != uint64_t(target.width) * scale_x ||
+        target_desc.Height != target.height * scale_y) {
+      continue;
+    }
+    copy.targets[copy.target_count++] = target;
+  }
+  copy.source = &source;
+  copy.scale_x = scale_x;
+  copy.scale_y = scale_y;
+  copy.red_blue_swapped = resolve.copy_dest_info.copy_dest_swap != 0;
+}
+
+void D3D12RenderTargetCache::PerformNativeResolveCopy(const NativeResolveCopy& copy,
+                                                      D3D12TextureCache& textures) {
+  if (!copy.target_count) {
+    return;
+  }
+  command_processor_.PushTransitionBarrier(
+      copy.source->resource(), copy.source->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  for (uint32_t i = 0; i < copy.target_count; ++i) {
+    textures.BeginNativeResolveWrite(copy.targets[i]);
+  }
+  command_processor_.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION source = {};
+  source.pResource = copy.source->resource();
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  for (uint32_t i = 0; i < copy.target_count; ++i) {
+    const auto& target = copy.targets[i];
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = target.resource;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_BOX box = {0, 0, 0, target.width * copy.scale_x, target.height * copy.scale_y, 1};
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&destination, 0, 0, 0, &source,
+                                                                     &box);
+    textures.EndNativeResolveWrite(target, copy.red_blue_swapped);
+    command_processor_.native_gpu_diagnostics().RecordOperation(
+        NativeGpuDiagnostics::Operation::kResolve);
+    if (++direct_resolve_success_count_ <= 8 || !(direct_resolve_success_count_ & 4095)) {
+      REXGPU_INFO("[d3d12-native-resolve] {} resolves copied into the textures sampling them",
+                  direct_resolve_success_count_);
     }
   }
-
-  // Dedicated direct resolve dispatches are staged behind the same preflight;
-  // keep using the existing dump path until source-image direct shaders land.
-  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
 }
 
 bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                                                uint32_t dump_rows, uint32_t dump_pitch) {
+  if (!EnsureEdramBuffer()) {
+    return false;
+  }
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,

@@ -1017,10 +1017,17 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
   TextureKey key;
   BindingInfoFromFetchConstant(fetch, key, nullptr);
   if (!key.is_valid || key.base_page == 0 || key.dimension != xenos::DataDimension::k2DOrStacked) {
+    REXGPU_ERROR(
+        "Swap texture has an invalid fetch descriptor: {:08X} {:08X} {:08X} "
+        "{:08X} {:08X} {:08X}",
+        fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
     return nullptr;
   }
   VulkanTexture* texture = static_cast<VulkanTexture*>(FindOrCreateTexture(key));
   if (!texture) {
+    REXGPU_ERROR("Could not create swap texture at {:08X}, format {}, {}x{}",
+                 uint32_t(key.base_page) << 12, uint32_t(key.format), key.GetWidth(),
+                 key.GetHeight());
     return VK_NULL_HANDLE;
   }
   uint32_t host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key));
@@ -1037,6 +1044,7 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
   // Reloading can change the image's channel order. Select the view after
   // the reload so presentation cannot retain the old red/blue swizzle.
   if (!LoadTextureData(*texture)) {
+    REXGPU_ERROR("Could not load swap texture at {:08X}", uint32_t(key.base_page) << 12);
     return VK_NULL_HANDLE;
   }
   VkImageView texture_view = texture->GetView(false, host_swizzle, false);
@@ -1568,6 +1576,12 @@ bool VulkanTextureCache::CanLoadTextureDataFromNativeGpu(const Texture& texture,
                                                          bool load_mips) const {
   const TextureKey& key = texture.key();
   auto has_native_range = [&](uint32_t page, uint32_t size) {
+    if (key.scaled_resolve && scaled_resolve_memory_flusher_) {
+      // Materialize image-owned resolves into compact buffers before deciding
+      // the source. Waiting until LoadTextureDataImpl would already have
+      // classified this load as a mirror dependency.
+      scaled_resolve_memory_flusher_(page << 12, rex::align(size, uint32_t(16)));
+    }
     return command_processor_.CanUseNativeResolveBufferRange(
                page << 12, rex::align(size, uint32_t(16)), key.scaled_resolve) ||
            command_processor_.CanComposeNativeResolveRange(
@@ -1589,12 +1603,15 @@ bool VulkanTextureCache::LoadTextureDataFromNativeGpuImpl(Texture& texture, bool
 
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kTextureFallback,
-      (load_base ? texture.GetGuestBaseSize() : 0) + (load_mips ? texture.GetGuestMipsSize() : 0),
-      fmt::format("base {:08X}, {}x{}, format {}, scaled {}", texture.key().base_page << 12,
-                  texture.key().GetWidth(), texture.key().GetHeight(),
-                  uint32_t(texture.key().format), bool(texture.key().scaled_resolve)));
+  if (command_processor_.native_gpu_diagnostics().enabled()) {
+    command_processor_.native_gpu_diagnostics().RecordDependency(
+        NativeGpuDiagnostics::Dependency::kTextureFallback,
+        (load_base ? texture.GetGuestBaseSize() : 0) +
+            (load_mips ? texture.GetGuestMipsSize() : 0),
+        fmt::format("base {:08X}, {}x{}, format {}, scaled {}", texture.key().base_page << 12,
+                    texture.key().GetWidth(), texture.key().GetHeight(),
+                    uint32_t(texture.key().format), bool(texture.key().scaled_resolve)));
+  }
   if (SharedMemory::CensusEnabled()) {
     // Diagnostics: what native data there is where a texture uses the mirror.
     static uint32_t logged = 0;
@@ -2919,10 +2936,13 @@ void VulkanTextureCache::GetScaledResolveUsageMasks(VkPipelineStageFlags& stage_
 }
 
 void VulkanTextureCache::UseScaledResolveBufferForRead(std::pair<uint32_t, uint32_t> read_range) {
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kScaledMirrorRead, read_range.second,
-      fmt::format("{:08X}+{} at {}", read_range.first, read_range.second,
-                  SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
+  // The detail looks up a symbol name: only when anything records it.
+  if (command_processor_.native_gpu_diagnostics().enabled()) {
+    command_processor_.native_gpu_diagnostics().RecordDependency(
+        NativeGpuDiagnostics::Dependency::kScaledMirrorRead, read_range.second,
+        fmt::format("{:08X}+{} at {}", read_range.first, read_range.second,
+                    SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
+  }
   const void* census_trigger_previous = SharedMemory::CensusTrigger();
   if (SharedMemory::CensusEnabled()) {
     SharedMemory::CensusRecord(__builtin_return_address(0), SharedMemory::kCensusKindScaledRead,
@@ -2965,10 +2985,12 @@ void VulkanTextureCache::UseScaledResolveBufferForRead(std::pair<uint32_t, uint3
 
 void VulkanTextureCache::UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                                         uint64_t written_length_scaled) {
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kScaledMirrorWrite, written_length_scaled,
-      fmt::format("{:X}+{} at {}", written_start_scaled, written_length_scaled,
-                  SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
+  if (command_processor_.native_gpu_diagnostics().enabled()) {
+    command_processor_.native_gpu_diagnostics().RecordDependency(
+        NativeGpuDiagnostics::Dependency::kScaledMirrorWrite, written_length_scaled,
+        fmt::format("{:X}+{} at {}", written_start_scaled, written_length_scaled,
+                    SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
+  }
   uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
   const void* census_trigger_previous = SharedMemory::CensusTrigger();
   if (SharedMemory::CensusEnabled()) {

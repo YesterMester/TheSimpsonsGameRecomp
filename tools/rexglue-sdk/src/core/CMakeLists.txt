@@ -75,7 +75,13 @@ target_include_directories(rexcore PRIVATE
     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
 )
 
-if(UNIX)
+if(ANDROID)
+    target_sources(rexcore PRIVATE filesystem_android.cpp fiber_android.cpp fiber_android_arm64.S
+                   performance_hint_android.cpp)
+    enable_language(ASM)
+    set_source_files_properties(fiber_posix.cpp PROPERTIES HEADER_FILE_ONLY TRUE)
+    target_link_libraries(rexcore PRIVATE SDL3::SDL3 android log dl)
+elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()
 

@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <cstring>
 
 #include <fmt/format.h>
@@ -953,6 +955,61 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
 #endif
 }
 
+namespace {
+std::mutex g_freeze_mutex;
+std::condition_variable g_freeze_cv;
+std::atomic<bool> g_freeze_requested{false};
+}  // namespace
+
+XThread::WaitScope::WaitScope() {
+  auto* thread = XThread::GetCurrentThread();
+  if (thread && thread->is_guest_thread()) {
+    thread_ = thread;
+    thread_->freeze_state_.store(1, std::memory_order_release);
+  }
+}
+
+XThread::WaitScope::~WaitScope() {
+  if (!thread_) {
+    return;
+  }
+  if (g_freeze_requested.load(std::memory_order_acquire)) {
+    std::unique_lock<std::mutex> lock(g_freeze_mutex);
+    thread_->freeze_state_.store(2, std::memory_order_release);
+    g_freeze_cv.wait(lock, [] { return !g_freeze_requested.load(std::memory_order_acquire); });
+  }
+  thread_->freeze_state_.store(0, std::memory_order_release);
+}
+
+void XThread::RequestFreeze() {
+  g_freeze_requested.store(true, std::memory_order_release);
+}
+
+void XThread::ReleaseFreeze() {
+  {
+    std::lock_guard<std::mutex> lock(g_freeze_mutex);
+    g_freeze_requested.store(false, std::memory_order_release);
+  }
+  g_freeze_cv.notify_all();
+}
+
+bool XThread::AllFrozen(std::vector<uint32_t>* busy) {
+  const uint32_t current = GetCurrentThreadId();
+  bool frozen = true;
+  for (auto& thread : ::rex::system::kernel_state()->object_table()->GetObjectsByType<XThread>()) {
+    if (!thread->is_guest_thread() || thread->thread_id() == current || !thread->is_running()) {
+      continue;
+    }
+    if (thread->freeze_state_.load(std::memory_order_acquire) == 0) {
+      frozen = false;
+      if (busy) {
+        busy->push_back(thread->thread_id());
+      }
+    }
+  }
+  return frozen;
+}
+
 X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
   auto guest_thread = guest_object<X_KTHREAD>();
   uint8_t previous_suspend_count =
@@ -1000,6 +1057,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
     ~DelayDoneTrace() { rex::perf::TraceSwapThreadEvent("kdelay_done"); }
   } delay_done_trace;
   if (alertable) {
+    WaitScope scope;
     auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
     switch (result) {
       default:
@@ -1016,6 +1074,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
         rex::thread::MaybeYield();
       }
     } else {
+      WaitScope scope;
       rex::thread::Sleep(std::chrono::milliseconds(timeout_ms));
     }
   }

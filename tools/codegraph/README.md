@@ -41,26 +41,37 @@ generated functions is exactly the wrong shape for clangd; use tool #2.
 
 ## 2. `recomp_index.py` — the generated recompiled game code
 
-`simpsons/generated/default/*.cpp`: ~82k `DEFINE_REX_FUNC(sub_XXXXXXXX)`
-blocks, mechanically translated PPC. No types/overloads/templates worth
-understanding semantically — what's actually needed is address/name lookup
-and an exact call graph (exact because this code has no virtual dispatch:
-every call is a literal `sub_XXXXXXXX(ctx, base)`, so a regex-built graph
-is not a heuristic, it's ground truth).
+The generated game has address-based functions and explicit register operations.
+The structural index finds their definitions and literal direct calls. Indirect
+dispatch through function pointers, vtables and runtime helpers remains a separate
+analysis task; an empty caller list does not prove a function is unused.
+
+The modkit shares this implementation through `code` commands. It adds reviewed
+descriptive names from `modkit/symbols.json`, source evidence, public API links,
+adapter/research references and a registration-table audit. Names describe known
+behavior; they do not recover original source types or create a public ABI.
 
 ```
 cd tools/codegraph
-python3 recomp_index.py build              # ~19s one-time (SQLite output alongside this file)
-python3 recomp_index.py name sub_8297AEB0   # -> address + file:line, or "not found"
-python3 recomp_index.py addr 0x8297AEB0     # -> reverse lookup, same info
-python3 recomp_index.py gap 0x8297AEB0      # -> nearest registered functions above/below
-                                             #    + gap size; THIS is the missed-function-
-                                             #    hunting workflow from the crash sessions,
-                                             #    now one command instead of manual grep+python
-python3 recomp_index.py callers sub_8297AEB0   # every sub_XXXXXXXX that calls this
-python3 recomp_index.py callees sub_8297AEB0   # every sub_XXXXXXXX this one calls
+python3 recomp_index.py build
+python3 recomp_index.py status
+python3 recomp_index.py search health
+python3 recomp_index.py show ScoreKeeper.GetScore
+python3 recomp_index.py name sub_8297AEB0
+python3 recomp_index.py addr 0x8297AEB0
+python3 recomp_index.py gap 0x8297AEB0
+python3 recomp_index.py callers ScoreKeeper.GetScore
+python3 recomp_index.py callees sub_8297AEB0
 ```
 
-Rebuild (`build --force`) after any mega-pass / hand-patch session that adds
-functions to `simpsons/generated/default` — the DB is otherwise stale and
-`gap`/`callers`/`callees` will lie about what's actually registered.
+The legacy address/name commands remain available. Results now use JSON, including
+bounded pages and call-site lines. `--db PATH` selects a private index. No compiler,
+game data, game window or mod profile is required.
+
+Content hashes detect changed, added and deleted inputs. Queries refuse stale data;
+rebuild after changing sources, notes, names or API definitions. Rebuilding an unchanged
+tree reuses the database. Builds replace it atomically after rechecking source hashes.
+The `gap` command reports neighboring starts, not proven function extents.
+
+See [the modkit guide](../../modkit/CODE_NAVIGATION.md) for reviewed names and the path
+from an internal function to a supported mod API.

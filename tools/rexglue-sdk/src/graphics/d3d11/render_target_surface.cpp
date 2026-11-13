@@ -16,13 +16,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstring>
 
 #include <rex/assert.h>
 
 namespace rex::graphics::d3d11 {
 namespace {
 using Microsoft::WRL::ComPtr;
+using ShaderStage = ui::d3d11::D3D11Device::ShaderStage;
 DXGI_FORMAT GetColorResourceDXGIFormat(xenos::ColorRenderTargetFormat format,
                                        bool gamma_as_unorm16) {
   // Typed should be preferred over typeless so there are more opportunities for
@@ -277,35 +277,19 @@ std::unique_ptr<RenderTargetSurface> RenderTargetSurface::Snapshot(ui::d3d11::D3
   return copy;
 }
 
-const ShaderProgram* RenderTargetTransfer::Helper(const char* source, const char* profile,
-                                                  std::string& error) {
-  Microsoft::WRL::ComPtr<ID3DBlob> code, diagnostics;
-  if (Failed(D3DCompile(source, std::strlen(source), "native_target_transfer", nullptr, nullptr,
-                        "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code.GetAddressOf(),
-                        diagnostics.GetAddressOf()),
-             "Native render target helper compilation", error)) {
-    if (diagnostics)
-      error.assign(static_cast<const char*>(diagnostics->GetBufferPointer()),
-                   diagnostics->GetBufferSize());
-    return nullptr;
-  }
-  return shaders_.GetOrCreate(
-      {static_cast<const uint8_t*>(code->GetBufferPointer()), code->GetBufferSize()}, false, error);
-}
-
 bool RenderTargetTransfer::Prepare(DrawCommand& command, const RenderTargetSurface& destination,
                                    std::string& error) {
   if (!vertex_) {
-    vertex_ = Helper(
-        "float4 main(uint id:SV_VertexID):SV_Position {"
-        "float2 p=float2((id<<1)&2,id&2);"
-        "return float4(p*float2(2,-2)+float2(-1,1),0,1); }",
-        "vs_5_1", error);
+    vertex_ = ShaderProgram::CompileNative(device_,
+                                           "float4 main(uint id:SV_VertexID):SV_Position {"
+                                           "float2 p=float2((id<<1)&2,id&2);"
+                                           "return float4(p*float2(2,-2)+float2(-1,1),0,1); }",
+                                           ShaderStage::kVertex, error);
     if (!vertex_)
       return false;
   }
   command = {};
-  command.programs[size_t(DrawStage::kVertex)] = vertex_;
+  command.programs[size_t(DrawStage::kVertex)] = vertex_.get();
   command.topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
   command.count = 3;
   command.state =
@@ -412,16 +396,16 @@ bool RenderTargetTransfer::ClearColor(RenderTargetSurface& destination,
     return false;
   }
   if (!color_float_)
-    color_float_ = Helper(
-        "cbuffer Clear:b0 { float4 value; };"
-        "float4 main():SV_Target { return value; }",
-        "ps_5_1", error);
+    color_float_ = ShaderProgram::CompileNative(device_,
+                                                "cbuffer Clear:register(b0) { float4 value; };"
+                                                "float4 main():SV_Target { return value; }",
+                                                ShaderStage::kPixel, error);
   if (!color_float_)
     return false;
   DrawCommand command;
   if (!Prepare(command, destination, error))
     return false;
-  command.programs[size_t(DrawStage::kPixel)] = color_float_;
+  command.programs[size_t(DrawStage::kPixel)] = color_float_.get();
   auto cb = Constant(value.data(), sizeof(value), error);
   if (!cb)
     return false;
@@ -442,16 +426,16 @@ bool RenderTargetTransfer::ClearColorInteger(RenderTargetSurface& destination,
     return false;
   }
   if (!color_integer_)
-    color_integer_ = Helper(
-        "cbuffer Clear:b0 { uint4 value; };"
-        "uint4 main():SV_Target { return value; }",
-        "ps_5_1", error);
+    color_integer_ = ShaderProgram::CompileNative(device_,
+                                                  "cbuffer Clear:register(b0) { uint4 value; };"
+                                                  "uint4 main():SV_Target { return value; }",
+                                                  ShaderStage::kPixel, error);
   if (!color_integer_)
     return false;
   DrawCommand command;
   if (!Prepare(command, destination, error))
     return false;
-  command.programs[size_t(DrawStage::kPixel)] = color_integer_;
+  command.programs[size_t(DrawStage::kPixel)] = color_integer_.get();
   auto stored_value = value;
   D3D11_RENDER_TARGET_VIEW_DESC view_description;
   destination.transfer_view()->GetDesc(&view_description);
@@ -482,18 +466,20 @@ bool RenderTargetTransfer::ClearDepthStencil(RenderTargetSurface& destination, b
     error = "Invalid native partial depth or stencil clear";
     return false;
   }
-  auto*& pixel = clear_depth ? depth_ : stencil_;
+  auto& pixel = clear_depth ? depth_ : stencil_;
   if (!pixel)
-    pixel = Helper(clear_depth ? "cbuffer Clear:b0 { float4 value; };"
-                                 "float main():SV_Depth { return value.x; }"
-                               : "void main() {}",
-                   "ps_5_1", error);
+    pixel =
+        ShaderProgram::CompileNative(device_,
+                                     clear_depth ? "cbuffer Clear:register(b0) { float4 value; };"
+                                                   "float main():SV_Depth { return value.x; }"
+                                                 : "void main() {}",
+                                     ShaderStage::kPixel, error);
   if (!pixel)
     return false;
   DrawCommand command;
   if (!Prepare(command, destination, error))
     return false;
-  command.programs[size_t(DrawStage::kPixel)] = pixel;
+  command.programs[size_t(DrawStage::kPixel)] = pixel.get();
   command.depth_stencil = destination.depth_view();
   std::array<float, 4> value = {depth, 0, 0, 0};
   auto cb = Constant(value.data(), sizeof(value), error);
@@ -518,9 +504,12 @@ bool RenderTargetTransfer::ClearDepthStencil(RenderTargetSurface& destination, b
 
 void RenderTargetTransfer::Clear() {
   draws_.Invalidate();
-  shaders_.Clear();
   buffers_.Clear();
-  vertex_ = color_float_ = color_integer_ = depth_ = stencil_ = nullptr;
+  vertex_.reset();
+  color_float_.reset();
+  color_integer_.reset();
+  depth_.reset();
+  stencil_.reset();
 }
 
 }  // namespace rex::graphics::d3d11

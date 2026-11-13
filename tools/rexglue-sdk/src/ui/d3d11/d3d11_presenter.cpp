@@ -48,17 +48,22 @@ D3D11Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& surface
     return SurfacePaintConnectResult::kFailureSurfaceUnusable;
   HWND window = static_cast<Win32HwndSurface&>(surface).hwnd();
   std::lock_guard lock(device_.context_mutex());
-  if (was_paintable && swap_chain_ && window_ == window && width_ == width && height_ == height)
+  if (was_paintable && swap_chain_ && window_ == window && width_ == width && height_ == height) {
+    implicit_vsync = swap_chain_->implicit_vsync();
     return SurfacePaintConnectResult::kSuccessUnchanged;
+  }
   if (swap_chain_ && window_ == window) {
-    if (FAILED(swap_chain_->Resize(width, height))) {
+    HRESULT result = swap_chain_->Resize(width, height);
+    if (FAILED(result)) {
+      REXGPU_WARN("DX11 surface resize to {}x{} failed (0x{:08X}); recreating the swap chain",
+                  width, height, uint32_t(result));
       swap_chain_.reset();
-      window_ = nullptr;
-      return SurfacePaintConnectResult::kFailure;
     }
   } else {
     device_.context()->ClearState();
     swap_chain_.reset();
+  }
+  if (!swap_chain_) {
     std::string error;
     swap_chain_ = D3D11SwapChain::Create(device_, window, width, height, error);
     if (!swap_chain_) {
@@ -66,10 +71,16 @@ D3D11Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& surface
       window_ = nullptr;
       return SurfacePaintConnectResult::kFailure;
     }
+    if (!swap_chain_->creation_diagnostics().empty())
+      REXGPU_WARN("DX11 presentation compatibility: {}", swap_chain_->creation_diagnostics());
+    REXGPU_INFO("DX11 presentation: {}x{}, swap effect {}, flags 0x{:X}, latency {}", width, height,
+                uint32_t(swap_chain_->swap_effect()), swap_chain_->flags(),
+                swap_chain_->implicit_vsync() ? "synchronized Present" : "waitable handle");
   }
   window_ = window;
   width_ = width;
   height_ = height;
+  implicit_vsync = swap_chain_->implicit_vsync();
   return SurfacePaintConnectResult::kSuccess;
 }
 void D3D11Presenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {

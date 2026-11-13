@@ -13,6 +13,28 @@ namespace rex::graphics {
 // separate from rendering dependencies and never count as native work.
 class NativeGpuDiagnostics {
  public:
+  ~NativeGpuDiagnostics();
+
+  // Units are defined by the instrumented boundary, not by dependency events.
+  // Command routes and resource-local operations are separate measurements.
+  enum class RouteSystem {
+    kDrawDispatch,
+    kGeometry,
+    kTextures,
+    kResolves,
+    kShaderCommands,
+    kSynchronization,
+    kSubmission,
+    kPresentation,
+    kStateCommands,
+    kQueries,
+    kOtherCommands,
+    kHostPresentation,
+    kCount,
+  };
+  enum class RouteOutcome { kNative, kRetained, kMixed, kFailed, kSkipped, kUnclassified, kCount };
+  class RouteScope;
+
   enum class Dependency {
     kEdram,
     kMemoryMirror,
@@ -29,6 +51,8 @@ class NativeGpuDiagnostics {
     kGpuTextureUpload,
     kResolve,
     kAliasTransfer,
+    kNativeDrawCall,
+    kLegacyDrawPacket,
     kCount,
   };
   enum class Allocation {
@@ -39,6 +63,8 @@ class NativeGpuDiagnostics {
   };
 
   void Initialize(std::string_view backend);
+  void BindRegisterFile(const void* register_file);
+  static NativeGpuDiagnostics* ForRegisterFile(const void* register_file);
   void RecordDependency(Dependency kind, uint64_t bytes, std::string_view detail);
   void RecordOperation(Operation kind);
   void RecordAllocation(Allocation kind, uint64_t virtual_bytes, uint64_t resident_bytes);
@@ -82,6 +108,57 @@ class NativeGpuDiagnostics {
   std::array<Counter, size_t(Allocation::kCount)> allocations_;
   std::mutex report_mutex_;
   static thread_local NativeGpuDiagnostics* readback_owner_;
+};
+
+// One scope is one attempted operation. Early errors record failure, predicated
+// commands record skipped, and compatibility dependencies make a native resource
+// operation mixed. Diagnostic readback is excluded. Storage lives outside the
+// processor so these diagnostics do not change the renderer object layouts.
+class NativeGpuDiagnostics::RouteScope {
+ public:
+  RouteScope(NativeGpuDiagnostics* diagnostics, RouteSystem system,
+             bool observe_dependencies = true)
+      : diagnostics_(diagnostics), system_(system), observe_dependencies_(observe_dependencies) {
+    if (!diagnostics_ || !diagnostics_->enabled_ || system_ == RouteSystem::kCount) {
+      diagnostics_ = nullptr;
+      return;
+    }
+    Start();
+  }
+  ~RouteScope() {
+    if (diagnostics_) {
+      Finish(false);
+      Stop();
+    }
+  }
+  RouteScope(const RouteScope&) = delete;
+  RouteScope& operator=(const RouteScope&) = delete;
+  void Native() { native_ = true; }
+  void Retained() { retained_ = true; }
+  void Finish(bool success) {
+    if (diagnostics_ && !finished_)
+      FinishSlow(success);
+  }
+  void Skip() {
+    if (diagnostics_ && !finished_)
+      SkipSlow();
+  }
+
+ private:
+  friend class NativeGpuDiagnostics;
+  void Start();
+  void Stop();
+  void FinishSlow(bool success);
+  void SkipSlow();
+  static void ObserveCompatibility(NativeGpuDiagnostics* diagnostics);
+  static thread_local RouteScope* active_;
+  NativeGpuDiagnostics* diagnostics_;
+  RouteSystem system_;
+  RouteScope* previous_ = nullptr;
+  bool observe_dependencies_;
+  bool native_ = false;
+  bool retained_ = false;
+  bool finished_ = false;
 };
 
 }  // namespace rex::graphics

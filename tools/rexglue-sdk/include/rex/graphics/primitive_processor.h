@@ -149,9 +149,15 @@ class PrimitiveProcessor {
     // only valid for index_buffer_type kHostConverted, kHostBuiltinForAuto and
     // kHostBuiltinForDMA.
     size_t host_index_buffer_handle;
-    // Exact CPU copy of a native DMA index stream, valid until the next
-    // Process call. Bounds scans must not read a write-combined GPU mapping.
+    // Exact CPU copy of the host index stream, or the original guest stream
+    // for shader expansion, valid until the next Process call. Bounds scans
+    // must not read a write-combined GPU mapping.
     const void* native_index_snapshot;
+    // Shader-loaded indices may use a compact native snapshot. If the backend
+    // cannot bind it for this draw, it must request the original guest range.
+    bool shader_index_buffer_deferred;
+    // The index shadow was frozen from retained GPU data, rather than stale CPU bytes.
+    bool native_index_from_gpu;
     // A triangle list (strips converted) that can be drawn as three-point
     // patches, as requested for smooth tessellation.
     bool triangle_patches;
@@ -175,12 +181,14 @@ class PrimitiveProcessor {
 
   // Submission must be open to call (may request the index buffer in the shared
   // memory).
-  // native_dma_indices snapshots supported CPU index streams into a host
+  // native_dma_indices snapshots CPU or retained GPU index streams into a host
   // buffer for this draw, without uploading them to the guest memory mirror.
   // triangle_patches asks for a triangle list that can be drawn as patches:
   // indexed triangle lists stay as they are, indexed strips are converted.
+  // native_shader_indices defers expanded DMA streams to the backend, which
+  // must bind the frozen snapshot or request the original shared-memory range.
   bool Process(ProcessingResult& result_out, bool native_dma_indices = false,
-               bool triangle_patches = false);
+               bool triangle_patches = false, bool native_shader_indices = false);
 
   // Invalidates the cache within the range.
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
@@ -326,6 +334,8 @@ class PrimitiveProcessor {
  private:
   // Refilled for every native DMA draw, never reused by guest address.
   std::vector<uint8_t> native_index_snapshot_;
+  std::vector<uint8_t> native_gpu_index_snapshot_;
+  std::shared_ptr<std::vector<uint8_t>> native_converted_index_snapshot_;
 
 #if XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE
 #if REX_ARCH_AMD64
@@ -774,6 +784,8 @@ class PrimitiveProcessor {
     xenos::Endian host_shader_index_endian;
     bool host_primitive_reset_enabled;
     size_t host_index_buffer_handle;
+    std::shared_ptr<std::vector<uint8_t>> native_index_shadow;
+    uint32_t native_index_shadow_offset = 0;
   };
 
   struct CacheEntry {

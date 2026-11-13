@@ -30,6 +30,7 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
+#include <rex/graphics/pipeline/shader/cache_key.h>
 #include <rex/graphics/primitive_processor.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
@@ -290,7 +291,7 @@ class PipelineCache {
   IDxcCompiler* dxc_compiler_ = nullptr;
 
   // Ucode hash -> shader.
-  std::unordered_map<uint64_t, D3D12Shader*, rex::IdentityHasher<uint64_t>> shaders_;
+  std::unordered_map<ShaderCacheKey, D3D12Shader*, ShaderCacheKeyHasher> shaders_;
 
   struct LayoutUID {
     size_t uid;

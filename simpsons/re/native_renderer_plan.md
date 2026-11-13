@@ -1,8 +1,336 @@
 # Native renderer: plan and state
 
-Goal: render the whole game natively on Vulkan (Linux / Steam Deck, Windows, later
-Android) with none of the Xenia-derived GPU emulation (EDRAM emulation, render target
-cache, texture cache, shared-memory mirror machinery) in the shipped build.
+Goal: render the whole game natively on Vulkan (Linux / Steam Deck, Windows and
+Android), Direct3D 12 and Direct3D 11. Each backend must preserve game-visible
+rendering and synchronization while removing its EDRAM emulation and full
+physical-address memory mirror. Native caches still own and reuse host resources;
+their remaining compatibility dependencies must be measured explicitly.
+
+## 0.0.7.0 development state (2026-10-16)
+
+Full native rendering is not complete. The backend-specific work shares address
+proofs and colour/depth packing where the APIs have the same semantics. It does not
+silently substitute an unsupported operation or count a compatibility path as
+native coverage.
+
+The [native GPU call conversion](native_gpu_calls.md) separately tracks replacing
+the game's graphics API writers. Its bounded draw/constant pilot is disabled by
+default; passing resource-local backend checks does not prove that this API
+conversion is complete.
+
+| Backend | Current native work | Remaining dependencies |
+|---|---|---|
+| Vulkan | Resource-local CPU/GPU inputs, retained indices and proven exports; sparse and wrapped aliases, colour/depth/MSAA packing, transfers between original and scaled targets | Unproved addresses or missing owners still use compatibility paths; unseen campaign states and device limits need qualification |
+| Direct3D 12 | The shared input proofs and native ownership work, compact scaled resolve buffers, native packing and mixed-resolution transfers in both binding modes | Unproved addresses or missing owners; native Windows drivers and campaign coverage |
+| Direct3D 11 | The shared input proofs and native ownership work, independent base/mip owners, native packing and mixed-resolution transfers | Unproved addresses or missing owners; native Windows drivers and campaign coverage |
+| Android Vulkan | The Vulkan implementation builds for ARM64, with compute exports where vertex storage writes are unavailable; launcher and touch controls share the app | Pixel hardware qualification; overlapping/tessellated exports and unsupported clipping/fill features remain explicitly guarded |
+
+The latest native checks close the known fractional/reversed input, retained-owner,
+resolve-format, wrapped-address and mixed-resolution cases. They retain the
+compatibility diagnostics rather than treating an unsupported operation as native.
+This is coverage of the generated and recorded cases, not proof of every possible
+game state or a promise that every driver is bug-free.
+
+The [renderer performance notes](renderer_performance.md) cover batched native
+page ownership, reduced DX11 upload work and Windows initialization fixes. These
+changes preserve the coverage checks and do not change shader encodings.
+
+- The input proof includes outward bounds for finite binary32 rounding and
+  flush-to-zero, with physical address checks for negative offsets. Its CPU
+  check covers 4,080 exact cases, 1,470 rounding cases, and 1,922 larger-index
+  cases with 69,144 executed rounding/flush results. The artificial 22-bit
+  cutoff is gone; finite arithmetic, signed conversion and physical memory
+  bounds determine whether the input is safe. The GPU geometry suite
+  passes 600 cases across Vulkan vertex/compute exports, DX11 and DX12
+  bindless/bindful modes, with 1,258,291,200 exact output bytes. A further 30
+  cases cover inputs larger than 1 MiB, with 251,658,240 exact bytes.
+- Native GPU owners survive cache clearing and the soft resolve-buffer budget.
+  Sparse live pages are compacted with GPU copies. Publication checks preserve
+  the winning CPU/GPU version during overlapping writes; the 39-transition
+  memory check compares 8,740,032 bytes, including 2 MiB immutable index snapshots.
+  The cache budget limits retained snapshots, not the size of a valid stream.
+- Native packing covers ten canonical render-target source families and 21
+  destination packing families, from 8 to 128 bits per texel. The independent
+  GPU check passes 4,060 dispatches and 3,580,887,040 exact bytes, including
+  MSAA, endian modes, conversions, padding and array slices. Forty-three
+  consecutive resolves also match the general path at 1x/2x on all three APIs.
+- Resolving an aliased view no longer changes its source ownership. Gamma aliases
+  preserve raw source bits, and wrapped tile addressing handles partial final
+  rows and repeated periods. Thirty-two wrapped-frame checks match an independent
+  address/pixel reference without compatibility dependencies or allocations.
+- Original-resolution depth and scaled colour targets transfer in both directions.
+  Viewports, clears, packers and texture metadata use the actual target scale.
+  DX11 and DX12 share the transfer shader generator. The patterned GPU fixture
+  passes 594 cases, including MSAA, stencil, retained snapshots and individual
+  host-pixel markers. Production replays also exercise retained host-depth
+  restoration and original-resolution D24S8/D24FS8 resolves with exact pixels.
+- Vulkan's private vertex-fetch constants now carry a signed 31-bit word offset
+  and a separate valid flag. Large or negative original indices need no unused
+  prefix in the compact input buffer. The offset encoding passes 160 CPU cases.
+  Production replays at 22-bit, 23-bit and near-maximum 24-bit indices pass 24
+  exact frame comparisons at 1x/2x across Vulkan, DX11 and both DX12 binding modes.
+  Vulkan uses an 84-byte input snapshot for each of those draws, with zero
+  compatibility dependencies or allocations.
+- CPU draw-extent estimation now matches the GPU's physical vertex-fetch bounds:
+  a nonzero stream size does not truncate valid reads beyond its declaration.
+  GPU-owned vertex and DMA-index pages are not read from stale CPU memory to
+  shrink attachment ownership or replace a draw with a clear. Those draws keep
+  conservative bounds and run on the GPU. Five ownership/extent regression
+  checks pass, including recovery after CPU rewrites, without creating a mirror.
+  The refreshed 600-case geometry suite and 32 recorded-frame comparisons also
+  pass with exact output and zero compatibility dependencies or allocations.
+
+All 6,660 bundled translated variants have been rebuilt for the private fetch
+encoding and pass SPIR-V validation. The shared encoding helper participates in
+the translator source hash, so older device caches and shader sets cannot be
+loaded with the new ABI. No previously shipped variant was dropped.
+Eight additional comparisons disable geometry shaders and vertex storage writes
+and restrict storage-buffer ranges to 128 MiB. The rebuilt packaged set matches
+fresh translations exactly, records zero compatibility dependencies or allocations,
+and serves every used shader without runtime translation. These are capability
+checks on the Deck driver, rather than a Pixel hardware qualification.
+
+The refreshed executable/cache inventory contains 383 programs: 217 vertex
+programs with static addresses and 166 pixel programs. It finds no unproved
+vertex-address programs, pixel-stage vertex fetches, memory exports or dynamic
+register addressing in this set. That establishes shader prerequisites; it does
+not establish every draw's resource ownership. Later CPU writes, aliases and
+hardware allocation limits still require runtime checks.
+
+`native_gpu_strict` and `tools/bench/native_coverage.py` reject compatibility
+dependencies and allocations. Captured-frame replay and generated GPU fixtures
+check output independently. These tools allow qualification without manually
+replaying each level. The local Windows API checks run through Proton on the Deck;
+native Windows drivers and the Pixel GPU still need focused runs.
+
+### Earlier 0.0.7.0 qualification (2026-10-15)
+
+The shared vertex-input bounds proof also accepts exact non-power-of-two,
+negative and zero address scales. It tracks the binary grid through each add,
+multiply and optional rounding operation; products that would lose precision
+still keep their compatibility path. Negative scales reverse the proven endpoints
+before deriving the native input range. Vulkan, DX11 and DX12 use this same proof.
+Its CPU check passes 4,080 expressions and 1,404,880 individual fetches. The expanded
+GPU geometry/index suite passes 72 cases on each of the five configurations,
+360 cases and 754,974,720 exact bytes in total, with zero compatibility dependencies
+or allocations. It includes scaled and reversed fetches, point/rectangle expansion,
+GPU index rewrites and later CPU ownership. The earlier proof fails the new strict
+GPU check. Eight attack, overlapping-resolve, Eighty Bites and menu comparisons at
+1x/2x retain identical pixels and zero compatibility dependencies or allocations.
+These checks use the Deck GPU, with Windows APIs through Proton; Pixel and native
+Windows drivers and unseen campaign states remain unqualified.
+
+Retained GPU-written DMA indices now have immutable native snapshots on all
+three backends, including Vulkan's compute export path. Topology conversion,
+restart handling, vertex bounds and memory-export proofs consume the same GPU
+version rather than stale CPU memory. Exact ranges are cached until a CPU or GPU
+write invalidates them; new versions download only their compact index range.
+The cache retains at most 64 entries and 8 MiB. Larger valid streams now live as
+uncached immutable snapshots for their consumers; the earlier 1 MiB stream limit
+has been removed. Unretained writers and unproved streams keep their compatibility path.
+
+The GPU index check passes 42 cases per configuration on Vulkan vertex/compute
+exports, DX11 and both DX12 binding modes: 210 cases and 440,401,920 exact bytes.
+It leaves the CPU index memory stale during GPU production and a second GPU
+rewrite, then switches ownership back to the CPU. All five runs report zero
+compatibility dependencies and allocations. The earlier runtime fails this
+strict check. Eight saved attack, Eighty Bites, Donut and menu comparisons also
+retain identical pixels at 1x/2x. These checks qualify their generated and
+recorded states on the Deck GPU, with Windows APIs through Proton; they do not
+prove unseen campaign states or native Windows and Pixel driver behavior.
+Twelve further comparisons add title, saves, loading, walking, pause and
+super-burp frames at both scales, also with identical pixels and zero
+compatibility dependencies or allocations: 20 saved-frame comparisons in total.
+
+Linux audio qualification exposed a separate real-time CPU-budget crash during
+load testing. The mixer keeps its scheduling priority and yields at safe buffer,
+voice-poll and decoder boundaries before exhausting the host limit. The CPU clock
+check is gated to avoid adding a syscall to every busy poll. A 300 ms CPU check
+passes with priority 20 and the original 100/200 ms limits; its unguarded control
+terminates with SIGXCPU. The combined runtime's 2x, 16-frame audio queue check
+passes gameplay, four CPU workers and recovery: 7,680 played/submitted frames,
+zero underruns, zero silent submissions and a clean exit. Its 5,599 rendered
+frames also record zero compatibility dependencies or allocations. This is one
+Linux workload, not a qualification of every audio scene or platform.
+
+The native memory-export paths now keep resource-local GPU buffers and retain
+their written pages as inputs to later draws. The five configurations (DX11,
+DX12 bindless and bindful, Vulkan vertex exports and Vulkan compute exports)
+passed 90 export cases and five GPU producer/vertex consumer chains, including
+CPU rewrites of neighboring pages. This work removes the previous blanket
+fallback for GPU-written vertex streams and proven memory exports. Dynamic or
+modified export addresses still require an independent proof.
+
+Point and rectangle expansion on Vulkan now uses the original guest vertex
+range and freezes shader-loaded DMA indices beside the native streams. The
+16-bit half-word offset is preserved. Native export buffers receive the same
+frozen indices used for their bounds proof. All three backends also accept
+built-in auto-index adapters and use the converted stream's actual format and
+byte order. Converted CPU indices have an immutable shadow retained with cached
+GPU buffers; the default uncached path reuses its CPU storage. These paths are
+covered by [native_geometry_check.cpp](../../tools/native-renderer/native_geometry_check.cpp).
+
+The expanded geometry check passes 42 cases on each of the five configurations:
+210 cases and 440,401,920 exact output bytes. Each case includes two draws with
+different output constants, covering cached conversions and consecutive writes.
+Vulkan's vertex and compute export paths also pass 160 consecutive GPU-data
+consumer frames each within a 16 MiB native buffer budget. Previously, publishing
+a second export could flush its preceding version into the physical mirror;
+publication now retains untouched pages and retires wholly preserved versions.
+All these checks report zero compatibility dependencies or allocations. Eight
+captured-frame comparisons with geometry shaders disabled also have identical
+pixels: attack effects, Eighty Bites, Colossal Donut and menus, each at 1x/2x.
+
+The Vulkan effect fix now carries the whole written extent across native
+render-target aliases. Texture inputs can combine several immutable GPU resolve
+versions and CPU-owned gaps. Pending padding preserves the earlier memory image;
+CPU writes invalidate it, and resource generations survive their GPU submissions.
+Unknown mixed pages retain the compatibility path. The special-attack frame and
+a trace with a 4 KB overlap match their reference at both scales. The two 2x
+strict captures report zero legacy dependencies and no EDRAM, physical mirror or
+scaled mirror allocation. That is captured-scene coverage, not full-game proof.
+
+The earlier campaign census sampled all 18 episodes, with 16 reaching gameplay
+after the longer runs. Its last observed EDRAM and memory-mirror dependency was
+the D24S8-to-2:10:10:10 colour alias in Eighty Bites and The Day the Earth Stood
+Stupid. The native depth-to-colour transfer added for 0.0.6.5 covers that case.
+The current runtime also passes six strict alias comparisons at 1x and 2x:
+two uniform patterns and a quadrant pattern, with 30 alias transfers in total.
+Every comparison has identical pixels, zero legacy dependencies and zero EDRAM,
+physical-mirror or scaled-mirror allocations. This closes the known census case;
+it does not establish that every format, alias or draw in a complete playthrough
+has native coverage.
+
+The Android portability work makes vertex storage writes optional. A compute
+prepass runs the original guest index stream before rasterization and preserves
+base offsets, clamps, primitive restart and byte order. It rejects overlapping
+input/output ranges and tessellated exports until those cases have an independent
+input snapshot and matching domain implementation. Unsupported user clip planes
+and non-solid fill are rejected explicitly on devices without those features.
+These restrictions still need actual game coverage on the Pixel 9 Pro.
+
+Translated system constants now obey std140 vector alignment. Vector selects
+also satisfy the SPIR-V 1.3 rules used by Vulkan 1.1 devices. Both translated
+stages pass the Vulkan 1.1 validator without relaxed layout options. The shipped
+set has been rebuilt with module version 2 and configuration format 3. It now
+contains 6,640 variants, retaining all 6,604 previously shipped variants and
+adding observed native point/rectangle and setup-draw modifications. The export helper retranslates the previous
+set's modifications and fails if any are missing; it never relabels stale modules.
+Native GLSL replacements use the same constant layout and module version.
+Their cache records its SPIR-V version too: a driver that cannot consume the
+native module version uses a compatible translation instead of loading an
+unsupported replacement.
+
+Read-only translated modules can also serve compatible devices with fewer
+vertex-stage features or smaller storage-buffer ranges. The loader checks each
+program: compact native vertex snapshots stay within the device's storage-buffer
+range, so their reads stay in descriptor zero even with a 128 MiB storage limit. A smaller shader
+descriptor array is valid with the larger runtime layout ([Vulkan layout rule
+07991](https://docs.vulkan.org/refpages/latest/refpages/source/VkGraphicsPipelineCreateInfo.html)).
+Memory exports and physical-address vertex inputs retain their configuration
+requirements. Source hashes, math controls and every other field still must
+match; malformed, duplicate and unknown fields are rejected.
+
+With geometry shaders and vertex storage writes disabled and storage ranges
+limited to 128 MiB, all eight sampled 1x/2x frames match fresh translations
+exactly, with zero runtime shader translations or compatibility allocations.
+The six negative configuration/address checks and 42 memory-export cases also
+pass without serving incompatible modules. This qualifies the capability
+combinations on the Deck driver, not the Pixel driver. The source cache used for
+the bake contains 380 programs: all 214 vertex programs have static addresses,
+and none of its vertex or pixel programs use memory exports or pixel-stage
+vertex fetches. This inventory describes the cache, not a complete playthrough.
+
+The executable inventory can now run the same shader analysis offline. Merging
+its 283 validated containers with 34 existing captured caches produces 380 unique
+programs: 214 vertex programs with static addresses and 166 pixel programs. This
+set has no memory exports, pixel-stage vertex fetches or dynamic register
+addressing. Synthetic programs independently check that the inventory flags all
+three address/export exceptions. `native-analysis.json` retains per-program fetch
+formats and constant dependencies; it does not prove draw-level resource ownership.
+
+`tools/bench/native_coverage.py` checks strict reports from Vulkan, Direct3D 11
+and Direct3D 12 without launching the game. It rejects missing counters,
+incomplete runs, nonzero compatibility bytes or allocations, and malformed
+numeric counters. The normal frame check still requires native vertex streams
+and resolves. Geometry-only checks explicitly require vertex streams instead.
+For example:
+
+```sh
+python3 tools/bench/native_coverage.py --backend vulkan frame.coverage.json
+python3 tools/bench/native_coverage.py --backend d3d11 \
+    --require-operation vertex_streams native-coverage.json
+```
+
+The refreshed five-configuration geometry suite again passes 210 cases and
+440,401,920 exact output bytes with zero compatibility dependencies or allocations.
+Four further restricted-capability attack/alias replays match their general-path
+reference exactly at 1x/2x; a deliberately enabled memory-mirror consumer fails
+the strict guard. These automated checks cover their recorded states and generated
+cases. They do not establish unseen campaign behavior or qualify Pixel and native
+Windows drivers.
+
+Rendering evidence for this work includes 132 compute GPU cases with
+276,824,064 exact output bytes, 18 command-processor cases with 37,748,736 exact
+bytes and 18 captured presented frames, and eight exact frame comparisons: the attack and
+overlap frames at 1x/2x, with vertex storage writes enabled and disabled. These
+checks exercise the Steam Deck's Vulkan driver; they do not qualify a phone or
+native Windows drivers. The Direct3D checks and remaining work are in
+[d3d11_renderer.md](d3d11_renderer.md) and [d3d12_renderer.md](d3d12_renderer.md).
+The integrated cases also cover presentation after accurate memory-export
+readback. Readback ends its submission, so swap now opens a new submission before
+recording texture loads and presentation; otherwise the exported bytes could be
+correct while the frame failed to present.
+Android build and device restrictions are in [../../android/README.md](../../android/README.md).
+The camera and raster work is tracked in [widescreen.md](widescreen.md).
+
+The shared vertex address proof now covers exact constant offsets and
+power-of-two scales on all three backends. Its independent scalar check passes
+1,440 cases and 495,840 float operations on Linux and Windows through Proton,
+with 17 deliberately unproved inputs rejected. The depth packing GPU check
+passes 136 dispatches and 35,651,584 exact bytes, including padding, stencil,
+float24 rounding, endian variants and symmetric/asymmetric scales.
+
+Direct3D 12 now passes eight strict menu/Springfield frame comparisons at 1x/2x
+in both binding modes: 55,296,000 RGB bytes match, with zero compatibility
+dependencies or allocations. A private live run through startup, saves,
+Springfield, movement, attacks and pause/resume at 1x also records zero; a 2x
+title run does too. Direct3D 11 records zero dependencies and allocations through
+the same live 1x flow and a 2x title run. The refreshed Linux dev runtime records
+zero through 3,240 frames covering startup, Springfield, attack inputs and
+pause/resume at 2x. Both Windows backends pass eight additional native alias
+comparisons against their general paths, covering uniform and quadrant data
+at both scales. These are bounded checks through Proton, not full campaign or
+native Windows driver qualification.
+
+Eight further Windows comparisons cover the original attack-flash and Eighty
+Bites captures at 1x/2x on both backends. Every native frame has identical pixels
+to its general resolve path and zero compatibility dependencies or allocations.
+Direct3D 11 also keeps the unresolved tail of a sampled layout in native scaled
+storage, rather than allocating a 512 MiB physical-address buffer for a 64x64
+texture. All native GPU texture inputs now arm CPU write callbacks for their
+whole sampled range, including CPU-owned levels and padding, without declaring
+the compatibility mirror current.
+
+Next work, in order:
+
+1. Expand strict saved-frame coverage across the available campaign captures,
+   including effects, loading, co-op, cache clearing and original-resolution
+   targets. Record any new fallback reason and reproduce its exact inputs.
+   [Checkpoint testing](checkpoint_testing.md) now prepares isolated map starts,
+   discovers loaded checkpoint IDs and verifies the active target before taking
+   a frame. A copied Medal of Homer test save also resumes its third section
+   with the original gameflow; no binary save edits are needed.
+2. Qualify remaining guarded cases and hardware limits before extending them.
+   The current inventory has no unproved address/export programs, but that does
+   not prove every resource sequence or an arbitrary modified shader safe.
+3. Run the ARM64 app on the Pixel 9 Pro and qualify its Vulkan limits, input,
+   audio and surface lifecycle. The APK's ARM64 libraries and package alignment
+   pass 16 KB checks; actual device behavior still needs qualification.
+4. Connect widescreen raster allocation, post effects and HUD framing to the
+   proven projection hook, preserving video aspect and split-screen behavior.
+5. Remove compatibility implementations only after diagnostics and rendering
+   checks prove they have no consumers. Check native Windows drivers separately.
 
 ## Design
 
@@ -43,13 +371,14 @@ constants, MSAA sample counts, resolve tiling when the guest reads resolved memo
 | D3DDevice_DrawVertices | 0x8244CF78 |
 | D3DDevice_DrawIndexedVertices | 0x8244D360 |
 | D3DDevice_DrawVerticesUP | 0x8244C910 |
-| D3DDevice_BeginVertices / EndVertices | 0x8244C450 / 0x8244CEA0 |
+| D3DDevice_BeginVertices / EndVertices | 0x8244C450 / 0x8244C8F0 |
+| D3DDevice_BeginIndexedVertices / EndIndexedVertices | 0x8244C970 / 0x8244CEA0 |
 | D3DDevice_Clear / D3D_InternalClearDraw | 0x82453C30 / 0x82453B08 |
 | D3DDevice_Resolve | 0x82455570 |
 | D3DDevice_Swap | 0x824544F0 |
 | D3DDevice_BeginTiling / EndTiling / SetPredication | 0x824675C8 / 0x82467B50 / 0x82467450 |
 | D3DDevice_CreateShaderA / B (container) | 0x82448178 / 0x82448308 |
-| D3DDevice_SetVertexShader / SetPixelShader | 0x82445278 / 0x82445578 |
+| D3DDevice_SetVertexShader / SetPixelShader | 0x82445578 / 0x82445278 |
 | D3DDevice_SetTexture / CreateTexture | 0x824408E0 / 0x82440578 |
 | D3DVertexBuffer_Lock / Unlock | 0x824418A0 / 0x824419A0 |
 | D3D_KickOff / RingMakeSpace / RingAlloc | 0x824572F8 / 0x82457CC8 / 0x82457F50 |

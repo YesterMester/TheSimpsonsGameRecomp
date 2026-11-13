@@ -3,6 +3,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -11,9 +12,16 @@
 
 namespace rex::graphics::d3d11 {
 
-// Immutable native shader objects. The device must outlive its shader cache.
+// Immutable native shader objects. The device must outlive its shaders.
 class ShaderProgram {
  public:
+  // Native helpers already use fixed D3D11 bindings. Compile them directly as
+  // SM 5.0; only translated guest/shared shaders need SM 5.1 conversion.
+  static std::unique_ptr<ShaderProgram> CompileNative(ui::d3d11::D3D11Device& device,
+                                                      std::string_view source,
+                                                      ui::d3d11::D3D11Device::ShaderStage stage,
+                                                      std::string& error);
+
   const ShaderBytecode& bytecode() const { return bytecode_; }
   ID3D11VertexShader* vertex() const { return vertex_.Get(); }
   ID3D11PixelShader* pixel() const { return pixel_.Get(); }
@@ -24,6 +32,7 @@ class ShaderProgram {
 
  private:
   friend class ShaderCache;
+  bool CreateNative(ID3D11Device* device, std::string& error);
   bool shared_memory_read_only_ = false;
   std::vector<TextureSwizzle> texture_swizzles_;
   std::vector<uint8_t> source_;
@@ -64,7 +73,6 @@ class ShaderCache {
 
  private:
   ShaderBytecodeOptions GetOptions(bool shared_memory_read_only) const;
-  HRESULT CreateNative(ShaderProgram& program);
 
   ui::d3d11::D3D11Device& device_;
   // Hashes narrow the lookup; exact source bytes and the pipeline promise are

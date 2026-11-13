@@ -17,6 +17,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -46,6 +47,7 @@ namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor : public CommandProcessor {
  public:
+  bool DownloadNativeIndexRange(uint32_t start, std::span<uint8_t> bytes);
   explicit D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                  system::KernelState* kernel_state);
   ~D3D12CommandProcessor();
@@ -154,6 +156,18 @@ class D3D12CommandProcessor : public CommandProcessor {
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
 
+    // Written once, only when the compatibility buffer is first needed.
+    // Earlier submissions bind the original null slots, never these slots.
+    // UAVs stay outside the unbounded SRV region for older D3D12 drivers.
+    kDeferredSharedMemoryRawSRV,
+    kDeferredSharedMemoryR32UintSRV,
+    kDeferredSharedMemoryR32G32UintSRV,
+    kDeferredSharedMemoryR32G32B32A32UintSRV,
+    kDeferredSharedMemoryRawUAV,
+    kDeferredSharedMemoryR32UintUAV,
+    kDeferredSharedMemoryR32G32UintUAV,
+    kDeferredSharedMemoryR32G32B32A32UintUAV,
+
     // Beyond this point, SRVs are accessible to shaders through an unbounded
     // range - no descriptors of other types bound to shaders alongside
     // unbounded ranges - must be located beyond this point.
@@ -165,15 +179,16 @@ class D3D12CommandProcessor : public CommandProcessor {
     kCount,
   };
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSystemBindlessViewHandlePair(
-      SystemBindlessView view) const;
+      SystemBindlessView view);
+  void InvalidateSharedMemoryBindings();
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSharedMemoryUintPow2BindlessSRVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
+      uint32_t element_size_bytes_pow2);
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSharedMemoryUintPow2BindlessUAVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
+      uint32_t element_size_bytes_pow2);
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetEdramUintPow2BindlessSRVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
+      uint32_t element_size_bytes_pow2);
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetEdramUintPow2BindlessUAVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
+      uint32_t element_size_bytes_pow2);
 
   // Returns a single temporary GPU-side buffer within a submission for tasks
   // like texture untiling and resolving.
@@ -231,8 +246,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   static constexpr uint32_t kQueueFrames = 3;
 
   enum RootParameter : UINT {
-    // Keep the size of the root signature at each stage 13 dwords or less
-    // (better 12 or less) so it fits in user data on AMD. Descriptor tables are
+    // Prefer 13 dwords or less at each stage so the root signature fits in
+    // user data on AMD. Native SRVs require a separate UAV table, adding one
+    // dword to the bindless layout. Descriptor tables are
     // 1 dword, root descriptors are 2 dwords (however, root descriptors require
     // less setup on the CPU - balance needs to be maintained).
 
@@ -286,10 +302,13 @@ class D3D12CommandProcessor : public CommandProcessor {
     // memory byte address buffer (as SRV and as UAV, either may be null if not
     // used).
     kRootParameter_Bindless_SharedMemory,  // +1 = 11 in all.
+    // The UAV table stays in the static descriptor region when a native SRV
+    // is selected from the unbounded SRV region.
+    kRootParameter_Bindless_SharedMemoryUAV,  // +1 = 12 in all.
     // Unbounded sampler descriptor table - changed in case of overflow.
-    kRootParameter_Bindless_SamplerHeap,  // +1 = 12 in all.
+    kRootParameter_Bindless_SamplerHeap,  // +1 = 13 in all.
     // Unbounded SRV/UAV descriptor table - never changed.
-    kRootParameter_Bindless_ViewHeap,  // +1 = 13 in all.
+    kRootParameter_Bindless_ViewHeap,  // +1 = 14 in all.
 
     kRootParameter_Bindless_Count,
   };
@@ -422,6 +441,20 @@ class D3D12CommandProcessor : public CommandProcessor {
                                  uint64_t samples);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+
+  bool PrepareNativeVertexStreams(const D3D12Shader& vertex, const D3D12Shader* pixel,
+                                  const PrimitiveProcessor::ProcessingResult& primitive,
+                                  bool memexport, uint32_t used_texture_mask);
+  void WriteNativeVertexSRV(D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+  std::unordered_map<size_t, std::unique_ptr<ui::d3d12::D3D12UploadBufferPool>>
+      native_vertex_upload_pools_;
+  std::array<uint32_t, 32 * 6> native_vertex_fetch_constants_ = {};
+  ID3D12Resource* native_vertex_buffer_ = nullptr;
+  size_t native_vertex_offset_ = 0;
+  uint32_t native_vertex_size_ = 0;
+  bool native_vertex_streams_active_ = false;
+  uint64_t native_vertex_draws_ = 0;
+  uint64_t native_vertex_bytes_ = 0;
 
   bool device_removed_ = false;
 
@@ -762,6 +795,11 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  std::array<ui::d3d12::util::DescriptorCpuGpuHandlePair, uint32_t(SystemBindlessView::kCount)>
+      edram_bindless_views_ = {};
+  uint32_t deferred_memory_views_written_ = 0;
+  D3D12SharedMemory::NativeResolveHandle native_memexport_buffer_;
 };
 
 }  // namespace rex::graphics::d3d12

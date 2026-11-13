@@ -306,6 +306,7 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
+      {"native_memexport_base", offsetof(SystemConstants, native_memexport_base), type_uint_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
@@ -531,8 +532,18 @@ void SpirvShaderTranslator::StartTranslation() {
       var_main_rectangle_guest_vertex_index_ =
           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
                                    "xe_var_rectangle_guest_vertex_index", const_uint_0_);
+      // BuiltIn decorations belong to interface variables, including their
+      // struct members. The rectangle loop keeps a private copy of each
+      // vertex, so its local struct must not reuse the decorated output type.
+      std::vector<spv::Id> rectangle_members;
+      for (int member = 0; member < builder_->getNumTypeConstituents(type_output_per_vertex_);
+           ++member) {
+        rectangle_members.push_back(builder_->getContainedTypeId(type_output_per_vertex_, member));
+      }
+      const spv::Id type_rectangle_vertex =
+          builder_->makeStructType(rectangle_members, "XeRectangleVertex");
       spv::Id type_rectangle_per_vertex_array =
-          builder_->makeArrayType(type_output_per_vertex_, builder_->makeUintConstant(3), 0);
+          builder_->makeArrayType(type_rectangle_vertex, builder_->makeUintConstant(3), 0);
       var_main_rectangle_per_vertex_ =
           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
                                    type_rectangle_per_vertex_array, "xe_var_rectangle_per_vertex");
@@ -736,12 +747,18 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
           builder_->createUnaryOp(spv::OpBitcast, type_int_, rectangle_guest_vertex_index);
 
       // Store current iteration outputs.
-      id_vector_temp_.clear();
-      id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
-      builder_->createStore(
-          builder_->createLoad(output_per_vertex_, spv::NoPrecision),
-          builder_->createAccessChain(spv::StorageClassFunction, var_main_rectangle_per_vertex_,
-                                      id_vector_temp_));
+      for (int member = 0; member < builder_->getNumTypeConstituents(type_output_per_vertex_);
+           ++member) {
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(builder_->makeIntConstant(member));
+        const spv::Id value = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_, id_vector_temp_),
+            spv::NoPrecision);
+        id_vector_temp_.insert(id_vector_temp_.begin(), rectangle_guest_vertex_index_int);
+        builder_->createStore(
+            value, builder_->createAccessChain(spv::StorageClassFunction,
+                                               var_main_rectangle_per_vertex_, id_vector_temp_));
+      }
       uint32_t interpolators_remaining = GetModificationInterpolatorMask();
       uint32_t interpolator_index;
       while (rex::bit_scan_forward(interpolators_remaining, &interpolator_index)) {

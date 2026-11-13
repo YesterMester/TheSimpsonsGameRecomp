@@ -60,9 +60,11 @@ endif()
 
 # Codegen target - run 'cmake --build . --target {{ names.snake_case }}_codegen'
 # Uses the manifest to drive codegen for all modules (entrypoint + DLLs).
+if(NOT ANDROID)
 add_custom_target({{ names.snake_case }}_codegen
     COMMAND $<TARGET_FILE:rex::rexglue> codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
     WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
     COMMENT "Generating recompiled code for {{ names.snake_case }}"
     VERBATIM
 )
+endif()

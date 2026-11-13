@@ -513,6 +513,8 @@ void VulkanImmediateDrawer::OnLeavePresenter() {
     dfn.vkDestroyBuffer(device, submitted_texture_upload_buffer.buffer, nullptr);
     dfn.vkFreeMemory(device, submitted_texture_upload_buffer.buffer_memory, nullptr);
   }
+  // Freed: the destructor would free them again.
+  texture_upload_buffers_submitted_.clear();
 
   vertex_buffer_pool_->ChangeSubmissionTimeline();
 

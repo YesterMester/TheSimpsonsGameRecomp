@@ -14,8 +14,10 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -28,6 +30,7 @@
 #include <rex/dbg.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/string.h>
 #include <rex/math.h>
 #include <rex/thread.h>
 #include <rex/memory.h>
@@ -44,6 +47,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
+#include <rex/graphics/shader_warmup.h>
 #include <rex/graphics/translator_hash.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/xenos.h>
@@ -110,6 +114,16 @@ REXCVAR_DEFINE_STRING(aot_export_path, "", "GPU",
 REXCVAR_DEFINE_BOOL(aot_export_storage, false, "GPU/Vulkan",
                     "With aot_export_path, bake common modifications of stored shaders even "
                     "when no recorded pipeline references them (offline tool)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(shader_precompile, REX_PLATFORM_ANDROID, "GPU/Vulkan",
+                    "Prepare known shader variants and pipeline states for this device before "
+                    "the game starts, retaining compatible translations for later launches")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(aot_export_modifications, "", "GPU/Vulkan",
+                      "With aot_export_storage, also translate the hash, stage and hexadecimal "
+                      "modification triples in this file (offline tool)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_STRING(pipeline_inventory_json, "", "GPU",
@@ -717,6 +731,10 @@ bool VulkanPipelineCache::Initialize() {
     size_t creation_thread_count;
     if (REXCVAR_GET(vulkan_pipeline_creation_threads) < 0) {
       creation_thread_count = std::max(logical_processor_count * 3 / 4, uint32_t(1));
+#if REX_PLATFORM_ANDROID
+      // Leave mobile CPU time for simulation, streaming and the audio workers.
+      creation_thread_count = std::min(creation_thread_count, size_t(2));
+#endif
     } else {
       creation_thread_count = std::min(uint32_t(REXCVAR_GET(vulkan_pipeline_creation_threads)),
                                        logical_processor_count);
@@ -733,9 +751,28 @@ bool VulkanPipelineCache::Initialize() {
   return true;
 }
 
+namespace {
+// Progress of the shader and pipeline preparation before the game starts,
+// for a platform's loading screen.
+std::atomic<uint32_t> g_shader_warmup_done{0};
+std::atomic<uint32_t> g_shader_warmup_total{0};
+std::atomic<bool> g_shader_warmup_active{false};
+std::atomic<uint32_t> g_shader_warmup_phase{0};
+}  // namespace
+
 void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                   uint32_t title_id, bool blocking) {
   ShutdownShaderStorage();
+  g_shader_warmup_done = 0;
+  g_shader_warmup_total = 0;
+  g_shader_warmup_phase = 1;
+  g_shader_warmup_active = true;
+  struct FinishWarmup {
+    ~FinishWarmup() {
+      g_shader_warmup_active = false;
+      g_shader_warmup_phase = 4;
+    }
+  } finish_warmup;
   {
     std::lock_guard<std::mutex> lock(creation_request_lock_);
     startup_loading_ = false;
@@ -755,12 +792,21 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
 
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  const bool precompile = REXCVAR_GET(shader_precompile);
+  device_aot_root_.clear();
+  device_aot_set_dir_.clear();
+  if (precompile) {
+    const std::string configuration = GetTranslatorConfiguration();
+    device_aot_root_ = shader_storage_root / "device" /
+                       fmt::format("{:08X}-{:016X}", title_id,
+                                   XXH3_64bits(configuration.data(), configuration.size()));
+  }
 
   // Initialize the pipeline storage stream - read pipeline descriptions and
   // collect used shader modifications to translate.
   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
   // <Shader hash, modification bits>.
-  std::set<std::pair<uint64_t, uint64_t>> shader_translations_needed;
+  std::set<std::pair<ShaderCacheKey, uint64_t>> shader_translations_needed;
   auto pipeline_storage_file_path =
       shader_storage_shareable_root /
       fmt::format("{:08X}.{}.vk.xpso", title_id, edram_fragment_shader_interlock ? "fsi" : "fbo");
@@ -865,11 +911,13 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
         pipeline_stored_descriptions[pipeline_storage_kept_count++] = pipeline_stored_description;
         // Mark the shader modifications as needed for translation.
         shader_translations_needed.emplace(
-            pipeline_stored_description.description.vertex_shader_hash,
+            ShaderCacheKey{pipeline_stored_description.description.vertex_shader_hash,
+                           xenos::ShaderType::kVertex},
             pipeline_stored_description.description.vertex_shader_modification);
         if (pipeline_stored_description.description.pixel_shader_hash) {
           shader_translations_needed.emplace(
-              pipeline_stored_description.description.pixel_shader_hash,
+              ShaderCacheKey{pipeline_stored_description.description.pixel_shader_hash,
+                             xenos::ShaderType::kPixel},
               pipeline_stored_description.description.pixel_shader_modification);
         }
       }
@@ -949,20 +997,94 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
            shader_storage_file_);
   }
 
+  if (precompile && !edram_fragment_shader_interlock) {
+    // Recipes contain pipeline state and shader identities, never another
+    // device's compiled binaries. Rebuild only records this version understands
+    // and this device supports, using programs from the owner's executable.
+    std::ifstream recipes(GetAotShaderRoot() / "warmup-pipelines.txt");
+    std::string magic;
+    uint32_t version = 0;
+    size_t description_size = 0;
+    if (recipes >> magic >> std::hex >> version >> std::dec >> description_size;
+        magic == "REX_VULKAN_PIPELINES" && version == PipelineDescription::kVersion &&
+        description_size == sizeof(PipelineDescription)) {
+      std::set<uint64_t> known;
+      for (const auto& stored : pipeline_stored_descriptions) {
+        known.insert(stored.description_hash);
+      }
+      uint64_t hash;
+      std::string bytes;
+      size_t added = 0;
+      while (recipes >> std::hex >> hash >> bytes) {
+        if (bytes.size() != sizeof(PipelineDescription) * 2 || known.contains(hash)) {
+          continue;
+        }
+        PipelineStoredDescription stored{};
+        auto* output = reinterpret_cast<uint8_t*>(&stored.description);
+        bool valid = true;
+        auto digit = [](char c) -> int {
+          if (c >= '0' && c <= '9')
+            return c - '0';
+          if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+          if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+          return -1;
+        };
+        for (size_t i = 0; i < sizeof(PipelineDescription); ++i) {
+          int high = digit(bytes[i * 2]), low = digit(bytes[i * 2 + 1]);
+          if (high < 0 || low < 0) {
+            valid = false;
+            break;
+          }
+          output[i] = uint8_t((high << 4) | low);
+        }
+        const auto& description = stored.description;
+        if (!valid || description.GetHash() != hash ||
+            !shaders_.contains({description.vertex_shader_hash, xenos::ShaderType::kVertex}) ||
+            (description.pixel_shader_hash &&
+             !shaders_.contains({description.pixel_shader_hash, xenos::ShaderType::kPixel})) ||
+            !ArePipelineRequirementsMet(description)) {
+          continue;
+        }
+        stored.description_hash = hash;
+        known.insert(hash);
+        pipeline_stored_descriptions.push_back(stored);
+        shader_translations_needed.emplace(
+            ShaderCacheKey{description.vertex_shader_hash, xenos::ShaderType::kVertex},
+            description.vertex_shader_modification);
+        if (description.pixel_shader_hash) {
+          shader_translations_needed.emplace(
+              ShaderCacheKey{description.pixel_shader_hash, xenos::ShaderType::kPixel},
+              description.pixel_shader_modification);
+        }
+        ++added;
+      }
+      REXGPU_INFO("[shader-precompile] added {} compatible pipeline recipes", added);
+    }
+  }
+
   // A storage made from the executable has programs but no recorded pipeline
   // state. Bake ordinary vertex and pixel modifications using their actual
   // interpolator masks. Other draw state and dynamically indexed register
   // counts still come from recorded pipelines, or translate at first use.
-  if (REXCVAR_GET(aot_export_storage) && !REXCVAR_GET(aot_export_path).empty() &&
+  if ((precompile || (REXCVAR_GET(aot_export_storage) && !REXCVAR_GET(aot_export_path).empty())) &&
       render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     std::unordered_set<uint32_t> interpolator_masks = {0};
     reg::SQ_PROGRAM_CNTL program_cntl = {};
     program_cntl.ps_num_reg = 63;
     reg::SQ_CONTEXT_MISC context_misc = {};
+    uint32_t vertex_programs = 0, static_vertex_programs = 0;
+    uint32_t memory_export_programs = 0, pixel_vertex_fetch_programs = 0;
     for (const auto& [hash, shader] : shaders_) {
       if (!shader->is_ucode_analyzed()) {
         shader->AnalyzeUcode(ucode_disasm_buffer_);
       }
+      bool vertex = shader->type() == xenos::ShaderType::kVertex;
+      vertex_programs += vertex;
+      static_vertex_programs += vertex && shader->has_static_vertex_addresses();
+      memory_export_programs += shader->memexport_eM_written() != 0;
+      pixel_vertex_fetch_programs += !vertex && !shader->vertex_bindings().empty();
       if (shader->type() != xenos::ShaderType::kPixel ||
           shader->uses_register_dynamic_addressing()) {
         continue;
@@ -1000,10 +1122,58 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
         "[aot-storage] {} stored programs, {} common modifications, {} dynamic "
         "programs need recorded register counts",
         shaders_.size(), shader_translations_needed.size(), dynamic_shaders);
+    REXGPU_INFO(
+        "[aot-storage] {} vertex programs ({} static addresses), {} pixel programs, "
+        "{} memory export programs, {} pixel vertex fetch programs",
+        vertex_programs, static_vertex_programs, shaders_.size() - vertex_programs,
+        memory_export_programs, pixel_vertex_fetch_programs);
+  }
+
+  // Preserve previously shipped variants even if this cache has no recorded
+  // pipeline using them. Recompile from microcode with the current translator;
+  // an old module must never acquire the new version or configuration label.
+  const auto modifications_path = precompile ? GetAotShaderRoot() / "warmup-modifications.txt"
+                                             : rex::to_path(REXCVAR_GET(aot_export_modifications));
+  if ((precompile || (REXCVAR_GET(aot_export_storage) && !REXCVAR_GET(aot_export_path).empty())) &&
+      !modifications_path.empty()) {
+    std::ifstream requests(modifications_path);
+    if (!requests) {
+      REXGPU_ERROR("Could not read requested AOT shader modifications");
+    }
+    std::string line;
+    while (std::getline(requests, line)) {
+      if (line.empty() || line.front() == '#')
+        continue;
+      uint64_t hash, modification;
+      std::string stage, extra;
+      std::istringstream fields(line);
+      if (!(fields >> std::hex >> hash >> stage >> modification) || (fields >> extra) ||
+          (stage != "vs" && stage != "ps")) {
+        REXGPU_ERROR("Invalid requested AOT shader modification: {}", line);
+        continue;
+      }
+      const ShaderCacheKey key{
+          hash, stage == "vs" ? xenos::ShaderType::kVertex : xenos::ShaderType::kPixel};
+      const auto shader = shaders_.find(key);
+      if (shader == shaders_.end()) {
+        if (!precompile) {
+          REXGPU_ERROR("Requested AOT shader {:016X} ({}) is missing from the source cache", hash,
+                       stage);
+        }
+        continue;
+      }
+      shader_translations_needed.emplace(key, modification);
+    }
   }
 
   // Translate shader modifications needed for stored pipelines or the bake.
-  for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {
+  g_shader_warmup_phase = 2;
+  g_shader_warmup_total =
+      uint32_t(shader_translations_needed.size() + pipeline_stored_descriptions.size());
+  for (const auto& translation_needed : shader_translations_needed) {
+    struct CompletedStep {
+      ~CompletedStep() { g_shader_warmup_done.fetch_add(1, std::memory_order_relaxed); }
+    } completed_step;
     auto shader_it = shaders_.find(translation_needed.first);
     if (shader_it == shaders_.end()) {
       continue;
@@ -1030,7 +1200,10 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     // draw. Prewarm the other version too, and include it in exported sets.
     if (shader->type() == xenos::ShaderType::kVertex) {
       SpirvShaderTranslator::Modification native(translation_needed.second);
-      if (native.vertex.host_vertex_shader_type == Shader::HostVertexShaderType::kVertex &&
+      auto host_type = native.vertex.host_vertex_shader_type;
+      if ((host_type == Shader::HostVertexShaderType::kVertex ||
+           host_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
+           host_type == Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) &&
           (native.vertex.native_vertex_streams ||
            (shader->has_static_vertex_addresses() &&
             (REXCVAR_GET(native_vertex_buffers) || !REXCVAR_GET(aot_export_path).empty())))) {
@@ -1053,7 +1226,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   // by the state of their textures - so a set made from a storage recorded
   // without them still serves every draw its fastest exact module.
   if (!REXCVAR_GET(aot_export_path).empty()) {
-    for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {
+    for (const auto& translation_needed : shader_translations_needed) {
       auto shader_it = shaders_.find(translation_needed.first);
       if (shader_it == shaders_.end() ||
           shader_it->second->type() != xenos::ShaderType::kPixel ||
@@ -1088,7 +1261,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     if (edram_fragment_shader_interlock) {
       continue;
     }
-    auto shader_it = shaders_.find(stored.description.vertex_shader_hash);
+    auto shader_it =
+        shaders_.find({stored.description.vertex_shader_hash, xenos::ShaderType::kVertex});
     if (shader_it == shaders_.end()) {
       continue;
     }
@@ -1106,6 +1280,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   }
 
   // Create the pipelines.
+  g_shader_warmup_phase = 3;
   std::vector<PipelineCreationArguments> pipeline_creations;
   pipeline_creations.reserve(pipeline_descriptions.size());
   for (const PipelineDescription& pipeline_description : pipeline_descriptions) {
@@ -1138,6 +1313,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     pipeline_creations.push_back(creation_arguments);
   }
 
+  g_shader_warmup_total =
+      g_shader_warmup_done.load(std::memory_order_relaxed) + uint32_t(pipeline_creations.size());
   if (!pipeline_creations.empty()) {
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -1153,6 +1330,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       creation_thread_count = 1;
     } else if (REXCVAR_GET(vulkan_pipeline_creation_threads) < 0) {
       creation_thread_count = std::max(logical_processor_count * 3 / 4, uint32_t(1));
+#if REX_PLATFORM_ANDROID
+      creation_thread_count = std::min(creation_thread_count, size_t(2));
+#endif
     } else {
       creation_thread_count = std::min(uint32_t(REXCVAR_GET(vulkan_pipeline_creation_threads)),
                                        logical_processor_count);
@@ -1176,6 +1356,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
         if (EnsurePipelineCreated(pipeline_creations[creation_index])) {
           created_pipeline_count.fetch_add(1);
         }
+        g_shader_warmup_done.fetch_add(1, std::memory_order_relaxed);
       }
     };
 
@@ -1198,6 +1379,12 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
 
     REXGPU_INFO("Created {} graphics pipelines from Vulkan storage ({} requested)",
                 created_pipeline_count.load(), pipeline_creations.size());
+    // Keep what was just compiled, in case the process is killed early.
+    if (created_pipeline_count.load()) {
+      SaveDriverPipelineCache();
+    }
+    driver_cache_saved_pipelines_ = pipelines_created_.load(std::memory_order_relaxed);
+    driver_cache_saved_at_ = std::chrono::steady_clock::now();
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       startup_loading_ = false;
@@ -1206,25 +1393,46 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
 
   // If any pipeline descriptions were corrupted (or the whole file has excess
   // bytes in the end), truncate to the last valid pipeline description.
-  rex::filesystem::TruncateStdioFile(
-      pipeline_storage_file_,
-      uint64_t(sizeof(pipeline_storage_file_header) +
-               sizeof(PipelineStoredDescription) * pipeline_stored_descriptions.size()));
-  if (pipeline_stored_descriptions.empty()) {
-    rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
-    pipeline_storage_file_header.magic = pipeline_storage_magic;
-    pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;
-    pipeline_storage_file_header.version_swapped = pipeline_storage_version_swapped;
-    fwrite(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
-           pipeline_storage_file_);
+  // Compact filtered records and add the recipes atomically. Simply truncating
+  // to the kept count would leave holes or extend the file with zero records.
+  pipeline_storage_file_header.magic = pipeline_storage_magic;
+  pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;
+  pipeline_storage_file_header.version_swapped = pipeline_storage_version_swapped;
+  auto temporary = pipeline_storage_file_path;
+  temporary += ".tmp";
+  if (FILE* compacted = rex::filesystem::OpenFile(temporary, "wb")) {
+    bool written = fwrite(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
+                          compacted) == 1;
+    if (!pipeline_stored_descriptions.empty()) {
+      written = fwrite(pipeline_stored_descriptions.data(), sizeof(PipelineStoredDescription),
+                       pipeline_stored_descriptions.size(),
+                       compacted) == pipeline_stored_descriptions.size() &&
+                written;
+    }
+    written = fclose(compacted) == 0 && written;
+    if (written) {
+      fclose(pipeline_storage_file_);
+      std::error_code error;
+      std::filesystem::rename(temporary, pipeline_storage_file_path, error);
+      pipeline_storage_file_ = rex::filesystem::OpenFile(pipeline_storage_file_path, "a+b");
+      if (!pipeline_storage_file_) {
+        REXGPU_WARN("Could not reopen pipeline storage after preparation");
+        fclose(shader_storage_file_);
+        shader_storage_file_ = nullptr;
+        return;
+      }
+    }
   }
 
   shader_storage_cache_root_ = cache_root;
   shader_storage_title_id_ = title_id;
 
+  g_shader_warmup_active = false;
+
   // Start the storage writing thread.
   storage_write_flush_shaders_ = false;
   storage_write_flush_pipelines_ = false;
+  storage_write_save_driver_cache_ = false;
   storage_write_thread_shutdown_ = false;
   storage_write_thread_ = rex::thread::Thread::Create({}, [this]() { StorageWriteThread(); });
   assert_not_null(storage_write_thread_);
@@ -1260,7 +1468,67 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
   shader_storage_title_id_ = 0;
 }
 
+void VulkanPipelineCache::SaveDriverPipelineCache() {
+  std::lock_guard<std::mutex> lock(driver_cache_save_mutex_);
+  if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty()) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  size_t pc_size = 0;
+  if (dfn.vkGetPipelineCacheData(vulkan_device->device(), vk_pipeline_cache_, &pc_size,
+                                 nullptr) != VK_SUCCESS ||
+      !pc_size) {
+    return;
+  }
+  std::vector<uint8_t> pc_data(pc_size);
+  VkResult result = dfn.vkGetPipelineCacheData(vulkan_device->device(), vk_pipeline_cache_,
+                                               &pc_size, pc_data.data());
+  if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+    return;
+  }
+  // Compilers can grow the cache between the size query and the read. Vulkan
+  // guarantees the partial data returned with VK_INCOMPLETE is also valid.
+  pc_data.resize(pc_size);
+  // Through a temporary file, so a process killed while writing keeps the
+  // previous cache instead of a truncated one.
+  std::filesystem::path temporary = vk_pipeline_cache_path_;
+  temporary += ".tmp";
+  FILE* pc_file = rex::filesystem::OpenFile(temporary, "wb");
+  if (!pc_file) {
+    return;
+  }
+  bool written = fwrite(pc_data.data(), 1, pc_size, pc_file) == pc_size;
+  written = fclose(pc_file) == 0 && written;
+  std::error_code error;
+  if (written) {
+    std::filesystem::rename(temporary, vk_pipeline_cache_path_, error);
+  }
+  if (!written || error) {
+    std::filesystem::remove(temporary, error);
+    return;
+  }
+  REXGPU_INFO("VulkanPipelineCache: saved {} bytes of driver pipeline cache", pc_size);
+}
+
 void VulkanPipelineCache::EndSubmission() {
+  // Keep the driver's compiled pipelines on disk while playing: at most every
+  // 30 seconds, and only after new ones were created.
+  if (storage_write_thread_) {
+    size_t created = pipelines_created_.load(std::memory_order_relaxed);
+    auto now = std::chrono::steady_clock::now();
+    if (created != driver_cache_saved_pipelines_ &&
+        now - driver_cache_saved_at_ >= std::chrono::seconds(30)) {
+      driver_cache_saved_pipelines_ = created;
+      driver_cache_saved_at_ = now;
+      {
+        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+        storage_write_save_driver_cache_ = true;
+      }
+      storage_write_request_cond_.notify_one();
+    }
+  }
+
   if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
@@ -1407,23 +1675,7 @@ void VulkanPipelineCache::Shutdown() {
   if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
     const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-    if (!vk_pipeline_cache_path_.empty()) {
-      size_t pc_size = 0;
-      if (dfn.vkGetPipelineCacheData(vulkan_device->device(), vk_pipeline_cache_, &pc_size,
-                                     nullptr) == VK_SUCCESS &&
-          pc_size) {
-        std::vector<uint8_t> pc_data(pc_size);
-        if (dfn.vkGetPipelineCacheData(vulkan_device->device(), vk_pipeline_cache_, &pc_size,
-                                       pc_data.data()) == VK_SUCCESS) {
-          FILE* pc_file = rex::filesystem::OpenFile(vk_pipeline_cache_path_, "wb");
-          if (pc_file) {
-            fwrite(pc_data.data(), 1, pc_size, pc_file);
-            fclose(pc_file);
-            REXGPU_INFO("VulkanPipelineCache: saved {} bytes of driver pipeline cache", pc_size);
-          }
-        }
-      }
-    }
+    SaveDriverPipelineCache();
     dfn.vkDestroyPipelineCache(vulkan_device->device(), vk_pipeline_cache_, nullptr);
     vk_pipeline_cache_ = VK_NULL_HANDLE;
   }
@@ -1462,6 +1714,12 @@ void VulkanPipelineCache::Shutdown() {
 
   // Destroy all pipelines.
   last_pipeline_ = nullptr;
+  for (const auto& [key, pipeline] : vertex_memexport_compute_pipelines_) {
+    if (pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, pipeline, nullptr);
+    }
+  }
+  vertex_memexport_compute_pipelines_.clear();
   for (const auto& pipeline_pair : pipelines_) {
     VkPipeline pipeline = pipeline_pair.second.pipeline.load(std::memory_order_acquire);
     if (pipeline != VK_NULL_HANDLE) {
@@ -1532,7 +1790,8 @@ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
 VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
                                               const uint32_t* host_address, uint32_t dword_count,
                                               uint64_t data_hash) {
-  auto it = shaders_.find(data_hash);
+  const ShaderCacheKey key{data_hash, shader_type};
+  auto it = shaders_.find(key);
   if (it != shaders_.end()) {
     // Shader has been previously loaded.
     return it->second;
@@ -1542,7 +1801,7 @@ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
   // again.
   VulkanShader* shader = new VulkanShader(command_processor_.GetVulkanDevice(), shader_type,
                                           data_hash, host_address, dword_count);
-  shaders_.emplace(data_hash, shader);
+  shaders_.emplace(key, shader);
   return shader;
 }
 
@@ -1716,8 +1975,9 @@ std::string VulkanPipelineCache::GetTranslatorConfiguration() const {
   bool fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
   std::string configuration = fmt::format(
-      "set_format=2 translator_source={} spirv_version={:X} shared_memory_bindings_log2={} "
+      "set_format=3 translator_source={} spirv_version={:X} shared_memory_bindings_log2={} "
       "full_draw_index_uint32={} image_view_format_swizzle={} "
+      "vertex_pipeline_stores_and_atomics={} fragment_stores_and_atomics={} "
       "signed_zero_inf_nan_preserve_float32={} denorm_flush_to_zero_float32={} "
       "rounding_mode_rte_float32={} demote_to_helper_invocation={} sample_rate_shading={} "
       "msaa_2x_attachments={} msaa_2x_no_attachments={} render_target_path={}",
@@ -1725,6 +1985,7 @@ std::string VulkanPipelineCache::GetTranslatorConfiguration() const {
       SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
           features.max_storage_buffer_range),
       int(features.full_draw_index_uint32), int(features.image_view_format_swizzle),
+      int(features.vertex_pipeline_stores_and_atomics), int(features.fragment_stores_and_atomics),
       int(features.signed_zero_inf_nan_preserve_float32),
       int(features.denorm_flush_to_zero_float32), int(features.rounding_mode_rte_float32),
       int(features.demote_to_helper_invocation), int(features.sample_rate_shading),
@@ -1738,7 +1999,7 @@ std::string VulkanPipelineCache::GetTranslatorConfiguration() const {
   return configuration;
 }
 
-std::filesystem::path VulkanPipelineCache::FindTranslatedShaderSet() const {
+std::filesystem::path VulkanPipelineCache::FindTranslatedShaderSet() {
   std::filesystem::path root = GetAotShaderRoot();
   if (root.empty()) {
     return {};
@@ -1775,8 +2036,53 @@ std::filesystem::path VulkanPipelineCache::FindTranslatedShaderSet() const {
     }
     fclose(configuration_file);
   }
-  if (version != SpirvShaderTranslator::kTranslatedModuleVersion ||
-      set_configuration != GetTranslatorConfiguration()) {
+  const std::string current_configuration = GetTranslatorConfiguration();
+  bool compatible = set_configuration == current_configuration;
+  if (!compatible && version == SpirvShaderTranslator::kTranslatedModuleVersion) {
+    // Keep the source, math controls, SPIR-V version and all other fields exact.
+    // Two device differences can be harmless for a read-only shader: unused
+    // vertex exports, and a smaller descriptor array for compact native inputs.
+    // Eligibility is checked per translation below; never apply this to a
+    // physical-address shader just because the directory is usable.
+    using Fields = std::map<std::string, std::string>;
+    auto parse = [](const std::string& text, Fields& fields) {
+      std::istringstream input(text);
+      std::string field;
+      while (input >> field) {
+        size_t equals = field.find('=');
+        if (!equals || equals == std::string::npos || equals + 1 == field.size() ||
+            !fields.emplace(field.substr(0, equals), field.substr(equals + 1)).second) {
+          return false;
+        }
+      }
+      return !fields.empty();
+    };
+    Fields stored, current;
+    if (parse(set_configuration, stored) && parse(current_configuration, current)) {
+      const char* writes = "vertex_pipeline_stores_and_atomics";
+      const char* bindings = "shared_memory_bindings_log2";
+      auto flag = [](const std::string& value) { return value == "0" || value == "1"; };
+      auto binding_count = [](const std::string& value) {
+        return value == "0" || value == "1" || value == "2";
+      };
+      if (flag(stored[writes]) && flag(current[writes]) && binding_count(stored[bindings]) &&
+          binding_count(current[bindings]) && stored[bindings] <= current[bindings]) {
+        bool writes_differ = stored[writes] != current[writes];
+        bool bindings_differ = stored[bindings] != current[bindings];
+        stored.erase(writes);
+        current.erase(writes);
+        stored.erase(bindings);
+        current.erase(bindings);
+        compatible =
+            stored == current && (!bindings_differ || current["render_target_path"] == "host");
+        if (compatible) {
+          translated_set_vertex_writes_differ_ = writes_differ;
+          translated_set_memory_bindings_differ_ = bindings_differ;
+        }
+      }
+    }
+  }
+  if (version != SpirvShaderTranslator::kTranslatedModuleVersion || !compatible) {
     REXGPU_INFO(
         "VulkanPipelineCache: not using the translated shader set in {}: made by another "
         "translator version or configuration; shaders it has are translated at runtime",
@@ -1784,11 +2090,18 @@ std::filesystem::path VulkanPipelineCache::FindTranslatedShaderSet() const {
     return {};
   }
   REXGPU_INFO("VulkanPipelineCache: serving translated shaders from {}", set_dir.string());
+  if (translated_set_vertex_writes_differ_ || translated_set_memory_bindings_differ_) {
+    REXGPU_INFO(
+        "VulkanPipelineCache: translated shaders require per-shader device checks "
+        "(vertex writes differ: {}, memory bindings differ: {})",
+        translated_set_vertex_writes_differ_, translated_set_memory_bindings_differ_);
+  }
   return set_dir;
 }
 
-std::filesystem::path VulkanPipelineCache::FindAotShaderSet() const {
-  std::filesystem::path aot_dir = GetAotShaderRoot();
+std::filesystem::path VulkanPipelineCache::FindAotShaderSet(
+    const std::filesystem::path& root) const {
+  std::filesystem::path aot_dir = root.empty() ? GetAotShaderRoot() : root;
   if (aot_dir.empty()) {
     return {};
   }
@@ -1849,6 +2162,24 @@ std::filesystem::path VulkanPipelineCache::FindAotShaderSet() const {
     return {};
   }
   SpirvShaderTranslator::Features features(command_processor_.GetVulkanDevice());
+  // Native replacements are compiled for Vulkan 1.2 / SPIR-V 1.5. Vulkan
+  // 1.1 devices can expose the required float controls without accepting
+  // that module version. Older sets used the same compilation target.
+  uint32_t native_spirv_version = spv::Spv_1_5;
+  FILE* spirv_version_file = rex::filesystem::OpenFile(set_dir / "spirv_version.txt", "rb");
+  if (spirv_version_file) {
+    if (fscanf(spirv_version_file, "%x", &native_spirv_version) != 1) {
+      native_spirv_version = UINT32_MAX;
+    }
+    fclose(spirv_version_file);
+  }
+  if (native_spirv_version > uint32_t(features.spirv_version)) {
+    REXGPU_WARN(
+        "VulkanPipelineCache: ignoring the ahead-of-time shader set in {}: its SPIR-V "
+        "version {:X} exceeds the device's {:X}; shaders are translated at runtime",
+        set_dir.string(), native_spirv_version, uint32_t(features.spirv_version));
+    return {};
+  }
   if (!features.image_view_format_swizzle || !features.signed_zero_inf_nan_preserve_float32 ||
       !features.denorm_flush_to_zero_float32 || !features.rounding_mode_rte_float32) {
     REXGPU_WARN(
@@ -1867,9 +2198,12 @@ bool VulkanPipelineCache::TryLoadAotTranslation(VulkanShader::VulkanTranslation&
   if (!aot_set_checked_) {
     aot_set_checked_ = true;
     aot_set_dir_ = FindAotShaderSet();
+    if (!device_aot_root_.empty()) {
+      device_aot_set_dir_ = FindAotShaderSet(device_aot_root_);
+    }
     translated_set_dir_ = FindTranslatedShaderSet();
   }
-  if (aot_set_dir_.empty() && translated_set_dir_.empty()) {
+  if (aot_set_dir_.empty() && device_aot_set_dir_.empty() && translated_set_dir_.empty()) {
     return false;
   }
   // The directory the module comes from, which also has its binding sidecar.
@@ -1885,7 +2219,35 @@ bool VulkanPipelineCache::TryLoadAotTranslation(VulkanShader::VulkanTranslation&
         "rb");
   };
   FILE* aot_file = open_aot_module(translation.modification());
-  if (!aot_file && !translated_set_dir_.empty()) {
+  if (!aot_file && !device_aot_set_dir_.empty()) {
+    aot_file = rex::filesystem::OpenFile(
+        device_aot_set_dir_ / fmt::format("{:016X}_{}_{:016X}.spv",
+                                          translation.shader().ucode_data_hash(), stage,
+                                          translation.modification()),
+        "rb");
+    if (aot_file) {
+      module_set_dir = device_aot_set_dir_;
+    }
+  }
+  bool translated_compatible = true;
+  if (translated_set_vertex_writes_differ_ || translated_set_memory_bindings_differ_) {
+    const auto& shader = translation.shader();
+    translated_compatible = shader.memexport_eM_written() == 0;
+    if (translated_compatible && translated_set_memory_bindings_differ_) {
+      // PrepareNativeVertexStreams limits read-only snapshots, including the
+      // expanded primitive index stream, to the device's storage-buffer range.
+      // All addresses therefore select descriptor zero, even at the minimum
+      // 128 MiB range.
+      // A shader's array may be smaller than the pipeline layout (VUID 07991).
+      // Pixel shaders without vertex fetches never read this buffer at all.
+      SpirvShaderTranslator::Modification modification(translation.modification());
+      translated_compatible =
+          shader.type() == xenos::ShaderType::kVertex
+              ? modification.vertex.native_vertex_streams && shader.has_static_vertex_addresses()
+              : shader.vertex_bindings().empty();
+    }
+  }
+  if (!aot_file && !translated_set_dir_.empty() && translated_compatible) {
     // Modules of runtime translations, for exactly this modification.
     aot_file = rex::filesystem::OpenFile(
         translated_set_dir_ / fmt::format("{:016X}_{}_{:016X}.spv",
@@ -2113,7 +2475,9 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
-                   pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE;
+                   pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE &&
+                   !vertex_shader->shader().memexport_eM_written() &&
+                   !pixel_shader->shader().memexport_eM_written();
   uint8_t async_priority = pipeline_util::kPriorityLowest;
   if (use_async) {
     uint32_t bound_rts =
@@ -2235,6 +2599,45 @@ void VulkanPipelineCache::GetPipelineAndLayoutByHandle(
   }
 }
 
+VkPipeline VulkanPipelineCache::GetVertexMemExportComputePipeline(VulkanShader& shader,
+                                                                  VkPipelineLayout layout,
+                                                                  bool native_vertex_streams) {
+  auto modification = GetCurrentVertexShaderModification(
+      shader, Shader::HostVertexShaderType::kMemExportCompute, 0, false);
+  modification.vertex.user_clip_plane_count = 0;
+  modification.vertex.user_clip_plane_cull = 0;
+  modification.vertex.vertex_kill_and = 0;
+  modification.vertex.output_point_parameters = 0;
+  modification.vertex.native_vertex_streams = native_vertex_streams;
+  auto translation = static_cast<VulkanShader::VulkanTranslation*>(
+      shader.GetOrCreateTranslation(modification.value));
+  if (!EnsureShadersTranslated(translation, nullptr)) {
+    return VK_NULL_HANDLE;
+  }
+  auto key = std::make_pair(translation, layout);
+  auto found = vertex_memexport_compute_pipelines_.find(key);
+  if (found != vertex_memexport_compute_pipelines_.end()) {
+    return found->second;
+  }
+  const auto device = command_processor_.GetVulkanDevice();
+  VkComputePipelineCreateInfo info = {};
+  info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  info.stage.module = translation->shader_module();
+  info.stage.pName = "main";
+  info.layout = layout;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  if (device->functions().vkCreateComputePipelines(device->device(), vk_pipeline_cache_, 1, &info,
+                                                   nullptr, &pipeline) != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to create vertex memory export compute pipeline for {:016X}",
+                 shader.ucode_data_hash());
+    return VK_NULL_HANDLE;
+  }
+  vertex_memexport_compute_pipelines_.emplace(key, pipeline);
+  return pipeline;
+}
+
 bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                                   VulkanShader::VulkanTranslation& translation) {
   VulkanShader& shader = static_cast<VulkanShader&>(translation.shader());
@@ -2254,7 +2657,10 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
 
 void VulkanPipelineCache::ExportAotTranslation(
     const VulkanShader::VulkanTranslation& translation) {
-  const std::string& export_root = REXCVAR_GET(aot_export_path);
+  std::filesystem::path export_root = rex::to_path(REXCVAR_GET(aot_export_path));
+  if (export_root.empty()) {
+    export_root = device_aot_root_;
+  }
   if (export_root.empty() || !translation.is_valid()) {
     return;
   }
@@ -2296,31 +2702,50 @@ void VulkanPipelineCache::ExportAotTranslation(
   const char* stage = shader.type() == xenos::ShaderType::kVertex ? "vs" : "ps";
   uint64_t hash = shader.ucode_data_hash();
   const std::vector<uint8_t>& binary = translation.translated_binary();
-  FILE* module_file = rex::filesystem::OpenFile(
-      set_dir / fmt::format("{:016X}_{}_{:016X}.spv", hash, stage, translation.modification()),
-      "wb");
+  const auto module_path =
+      set_dir / fmt::format("{:016X}_{}_{:016X}.spv", hash, stage, translation.modification());
+  auto module_temporary = module_path;
+  module_temporary += ".tmp";
+  FILE* module_file = rex::filesystem::OpenFile(module_temporary, "wb");
   if (!module_file) {
     return;
   }
-  fwrite(binary.data(), 1, binary.size(), module_file);
-  fclose(module_file);
+  bool written = fwrite(binary.data(), 1, binary.size(), module_file) == binary.size();
+  written = fclose(module_file) == 0 && written;
+  std::error_code module_error;
+  if (written) {
+    std::filesystem::rename(module_temporary, module_path, module_error);
+  }
+  if (!written || module_error) {
+    std::filesystem::remove(module_temporary, module_error);
+    return;
+  }
   // The binding sidecar TryLoadAotTranslation needs (the same for every
   // modification of the shader).
   const auto& spirv_shader = static_cast<const SpirvShader&>(shader);
   const auto& textures = spirv_shader.GetTextureBindingsAfterTranslation();
   const auto& samplers = spirv_shader.GetSamplerBindingsAfterTranslation();
-  FILE* bind_file =
-      rex::filesystem::OpenFile(set_dir / fmt::format("{:016X}_{}.bind", hash, stage), "wb");
+  const auto bind_path = set_dir / fmt::format("{:016X}_{}.bind", hash, stage);
+  auto bind_temporary = bind_path;
+  bind_temporary += ".tmp";
+  FILE* bind_file = rex::filesystem::OpenFile(bind_temporary, "wb");
   if (bind_file) {
     uint32_t magic = 0x444E4258;
     uint32_t texture_count = uint32_t(textures.size());
     uint32_t sampler_count = uint32_t(samplers.size());
-    fwrite(&magic, 4, 1, bind_file);
-    fwrite(&texture_count, 4, 1, bind_file);
-    fwrite(textures.data(), sizeof(textures[0]), texture_count, bind_file);
-    fwrite(&sampler_count, 4, 1, bind_file);
-    fwrite(samplers.data(), sizeof(samplers[0]), sampler_count, bind_file);
-    fclose(bind_file);
+    bool bind_written =
+        fwrite(&magic, 4, 1, bind_file) == 1 && fwrite(&texture_count, 4, 1, bind_file) == 1 &&
+        fwrite(textures.data(), sizeof(textures[0]), texture_count, bind_file) == texture_count &&
+        fwrite(&sampler_count, 4, 1, bind_file) == 1 &&
+        fwrite(samplers.data(), sizeof(samplers[0]), sampler_count, bind_file) == sampler_count;
+    bind_written = fclose(bind_file) == 0 && bind_written;
+    std::error_code error;
+    if (bind_written) {
+      std::filesystem::rename(bind_temporary, bind_path, error);
+    }
+    if (!bind_written || error) {
+      std::filesystem::remove(bind_temporary, error);
+    }
   }
   ++aot_exported_;
 }
@@ -2614,6 +3039,14 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
           return false;
       }
     } else {
+      if (pa_su_sc_mode_cntl.poly_mode == xenos::PolygonModeEnable::kDualMode &&
+          ((!cull_front &&
+            pa_su_sc_mode_cntl.polymode_front_ptype != xenos::PolygonType::kTriangles) ||
+           (!cull_back &&
+            pa_su_sc_mode_cntl.polymode_back_ptype != xenos::PolygonType::kTriangles))) {
+        REXGPU_ERROR("Guest line/point polygon mode requires fillModeNonSolid");
+        return false;
+      }
       description_out.polygon_mode = PipelinePolygonMode::kFill;
     }
     description_out.front_face_clockwise = pa_su_sc_mode_cntl.face != 0;
@@ -4097,7 +4530,8 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
     return fail("pipeline_requirements_not_met");
   }
 
-  auto vertex_shader_it = shaders_.find(description.vertex_shader_hash);
+  auto vertex_shader_it =
+      shaders_.find({description.vertex_shader_hash, xenos::ShaderType::kVertex});
   if (vertex_shader_it == shaders_.end()) {
     return fail("vertex_shader_not_found");
   }
@@ -4114,7 +4548,8 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
 
   VulkanShader::VulkanTranslation* pixel_shader = nullptr;
   if (description.pixel_shader_hash && !for_placeholder) {
-    auto pixel_shader_it = shaders_.find(description.pixel_shader_hash);
+    auto pixel_shader_it =
+        shaders_.find({description.pixel_shader_hash, xenos::ShaderType::kPixel});
     if (pixel_shader_it == shaders_.end()) {
       return fail("pixel_shader_not_found");
     }
@@ -4902,11 +5337,14 @@ void VulkanPipelineCache::StorageWriteThread() {
     const Shader* shader = nullptr;
     PipelineStoredDescription pipeline_description;
     bool write_pipeline = false;
+    bool save_driver_cache = false;
     {
       std::unique_lock<std::mutex> lock(storage_write_request_lock_);
       if (storage_write_thread_shutdown_) {
         return;
       }
+      save_driver_cache = storage_write_save_driver_cache_;
+      storage_write_save_driver_cache_ = false;
       if (!storage_write_shader_queue_.empty()) {
         shader = storage_write_shader_queue_.front();
         storage_write_shader_queue_.pop_front();
@@ -4924,7 +5362,19 @@ void VulkanPipelineCache::StorageWriteThread() {
         flush_pipelines = true;
       }
       if (!shader && !write_pipeline) {
-        storage_write_request_cond_.wait(lock);
+        // A requested flush happens before sleeping: an Android process is
+        // often killed rather than shut down, losing anything still buffered.
+        if (!flush_shaders && !flush_pipelines && !save_driver_cache) {
+          storage_write_request_cond_.wait(lock);
+        }
+        if (!save_driver_cache) {
+          continue;
+        }
+      }
+    }
+    if (save_driver_cache) {
+      SaveDriverPipelineCache();
+      if (!shader && !write_pipeline) {
         continue;
       }
     }
@@ -4954,3 +5404,23 @@ void VulkanPipelineCache::StorageWriteThread() {
 }
 
 }  // namespace rex::graphics::vulkan
+
+// How far the shader and pipeline preparation before the game starts has got,
+// for a loading screen: steps done and in all, and whether it is running.
+extern "C" void rex_graphics_shader_warmup_progress(uint32_t* done, uint32_t* total,
+                                                    uint32_t* phase) {
+  using namespace rex::graphics::vulkan;
+  if (done) {
+    *done = g_shader_warmup_done.load(std::memory_order_relaxed);
+  }
+  if (total) {
+    *total = g_shader_warmup_total.load(std::memory_order_relaxed);
+  }
+  if (phase) {
+    *phase = g_shader_warmup_phase.load(std::memory_order_acquire);
+  }
+}
+
+extern "C" void rex_graphics_shader_warmup_finish() {
+  rex::graphics::vulkan::g_shader_warmup_phase.store(4, std::memory_order_release);
+}

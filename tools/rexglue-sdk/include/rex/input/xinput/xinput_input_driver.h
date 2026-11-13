@@ -26,6 +26,7 @@ class XinputInputDriver final : public InputDriver {
   ~XinputInputDriver() override;
 
   X_STATUS Setup() override;
+  std::vector<InputDevice> GetDevices() override;
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                            X_INPUT_CAPABILITIES* out_caps) override;

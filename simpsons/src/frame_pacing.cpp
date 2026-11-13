@@ -29,6 +29,9 @@
 // they were given lost up to a millisecond per frame (see sub_827C0F78).
 
 #include "guest_memory.h"
+#include "game_menu.h"
+#include "game_thread.h"
+#include "frame_wait.h"
 
 #include <algorithm>
 #include <atomic>
@@ -43,6 +46,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/platform/performance_hint.h>
 #include <rex/ppc.h>
 
 REXCVAR_DEFINE_INT32(frame_rate, 60, "GPU",
@@ -158,11 +162,17 @@ constexpr uint32_t kUiTickReturn = 0x827F75B4;
 // The menus' logic rate: 30 fps, two vblanks.
 constexpr double kMenuLogicHz = 59.94 / 2.0;
 
+// A cap the platform may set while the game runs (0 = none), such as
+// Android's battery game mode.
+std::atomic<int32_t> g_frame_rate_cap{0};
+
 // The frame rate in effect now: the menu rate in the front end, unless menus
-// follow the gameplay rate.
+// follow the gameplay rate, within the platform's cap.
 int32_t ActiveFrameRate() {
   int32_t menu_rate = REXCVAR_GET(menu_frame_rate);
-  return g_in_menu && menu_rate > 0 ? menu_rate : REXCVAR_GET(frame_rate);
+  int32_t rate = g_in_menu && menu_rate > 0 ? menu_rate : REXCVAR_GET(frame_rate);
+  int32_t cap = g_frame_rate_cap.load(std::memory_order_relaxed);
+  return cap > 0 && (rate <= 0 || rate > cap) ? cap : rate;
 }
 
 // Rates the game's whole-vblank timing reaches by itself: 60 and its whole
@@ -192,6 +202,12 @@ using simpsons::StoreGuestU32;
 
 }  // namespace
 
+// Caps the frame rate while the game runs (0 lifts the cap); android.cpp sets
+// it from the battery game mode.
+void SetFrameRateCap(int32_t fps) {
+  g_frame_rate_cap.store(fps > 0 ? fps : 0, std::memory_order_relaxed);
+}
+
 bool FractionalVblanks() {
   return !WholeVblankRate(ActiveFrameRate());
 }
@@ -213,6 +229,24 @@ uint32_t g_frame_flag = 0;
 // frame.
 uint64_t g_menu_logic_ticks = 0;
 
+#if REX_PLATFORM_ANDROID
+// When the limiter last let a frame go (0 while the clock is stopped): the
+// frame's work runs until the next limiter call.
+thread_local int64_t g_frame_work_start_ns = 0;
+
+void WaitFrameSlack(double remaining_s) {
+  static simpsons::AdaptiveFrameWait wait;
+  const int64_t sleep_ns = wait.SleepDuration(int64_t(remaining_s * 1e9));
+  if (sleep_ns > 0) {
+    const int64_t start = NowNs();
+    std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
+    wait.ObserveSleep(sleep_ns, NowNs() - start);
+  } else {
+    std::this_thread::yield();
+  }
+}
+#endif
+
 }  // namespace
 
 REX_FUNC(sub_82453EB0) {
@@ -228,14 +262,45 @@ REX_FUNC(sub_82453EB0) {
 
 REX_FUNC(sub_826B7B70) {
   if (!LoadGuestU32(base, kClockRunning)) {
+#if REX_PLATFORM_ANDROID
+    g_frame_work_start_ns = 0;
+#endif
     return;
   }
+#if REX_PLATFORM_ANDROID
+  // Tell Android how long this frame's work took against its frame time, so
+  // it keeps the game's threads fast enough (performance hints).
+  {
+    thread_local bool hinted_thread = false;
+    if (!hinted_thread) {
+      hinted_thread = true;
+      rex::platform::AddPerformanceHintThread();
+    }
+    double target_s;
+    if (!FractionalVblanks()) {
+      target_s = double(ctx.r4.u32) / double(LoadGuestFloat(base, kRefreshHz));
+    } else {
+      // Unlimited frame rates are held to 120 FPS worth of work.
+      const uint64_t period = FramePeriodTicks();
+      target_s = period ? double(period) / double(rex::chrono::Clock::guest_tick_frequency())
+                        : 1.0 / 120.0;
+    }
+    const int64_t now_ns = NowNs();
+    if (g_frame_work_start_ns && target_s > 0.0 && target_s < 1.0) {
+      rex::platform::ReportFrameWork(now_ns - g_frame_work_start_ns, int64_t(target_s * 1e9));
+    }
+  }
+  struct FrameWorkStart {
+    ~FrameWorkStart() { g_frame_work_start_ns = NowNs(); }
+  } frame_work_start;
+#endif
   if (!FractionalVblanks()) {
     // The game's own deadline, computed as it does: r4 periods of its refresh
     // rate after r3, in milliseconds by its timebase scale. It yielded until a
     // millisecond before and then spun, keeping a core busy for whatever was
     // left of every frame; on the Steam Deck the CPU shares its power with the
-    // GPU. Sleep instead, and only yield for the last 2 ms.
+    // GPU. Sleep instead. Android learns a shorter wake-up margin so the
+    // limiter does not spend 2 ms of every frame keeping a CPU core busy.
     const uint32_t start = ctx.r3.u32;
     const float target_ms =
         float(ctx.r4.u32) / LoadGuestFloat(base, kRefreshHz) * 1000.0f;
@@ -247,12 +312,16 @@ REX_FUNC(sub_826B7B70) {
         return;
       }
       const float remaining_ms = target_ms - elapsed_ms;
+#if REX_PLATFORM_ANDROID
+      WaitFrameSlack(double(remaining_ms) * .001);
+#else
       if (remaining_ms > 2.0f) {
         std::this_thread::sleep_for(
             std::chrono::duration<double, std::milli>(double(remaining_ms) - 2.0));
       } else {
         std::this_thread::yield();
       }
+#endif
     }
   }
   const uint64_t period = FramePeriodTicks();
@@ -273,14 +342,23 @@ REX_FUNC(sub_826B7B70) {
     // Sleep while more than 2 ms remain, then yield until the deadline, so a
     // coarse system timer cannot make the frame late.
     const double remaining = double(next - now) / ticks_per_second;
+#if REX_PLATFORM_ANDROID
+    WaitFrameSlack(remaining);
+#else
     if (remaining > 0.002) {
       std::this_thread::sleep_for(std::chrono::duration<double>(remaining - 0.002));
     } else {
       std::this_thread::yield();
     }
+#endif
     now = rex::chrono::Clock::QueryGuestTickCount();
   }
   next += period;
+}
+
+bool LevelStepped(int64_t within_ms) {
+  const int64_t last = g_last_level_step_ns.load(std::memory_order_relaxed);
+  return last && NowNs() - last <= within_ms * 1'000'000;
 }
 
 REX_FUNC(sub_827A55C0) {
@@ -380,6 +458,8 @@ REX_FUNC(sub_82718710) {
 }
 
 REX_FUNC(sub_82718788) {
+  TickGameMenu(ctx, base);
+  TickGameThread(ctx, base);
   __imp__sub_82718788(ctx, base);
   if (rex::perf::TraceEvent) {
     rex::perf::TraceEvent("frame_start", 0);

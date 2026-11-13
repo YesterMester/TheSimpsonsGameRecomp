@@ -15,6 +15,7 @@ tools/bench/d3d11/out/Release/dxbc_geometry.exe tools/bench/d3d11/out/geometry
 tools/bench/d3d11/out/Release/d3d11_check.exe --output d3d11-device.json
 tools/bench/d3d11/out/Release/jump_context_check.exe --output jump-context-windows.json
 tools/bench/d3d11/out/Release/clock_ratio_check.exe --output clock-ratios-windows.json
+tools/bench/d3d11/out/Release/graphics_resource_check.exe --output graphics-resource-windows.json
 tools/bench/d3d11/out/Release/bytes_equal_check.exe --output bytes-equal-windows.json
 tools/bench/d3d11/out/Release/bytes_equal_avx2_check.exe --output bytes-equal-avx2-windows.json
 tools/bench/d3d11/out/Release/d3d11_shader_check.exe --fl11-0 --geometry-directory tools/bench/d3d11/out/geometry --output d3d11-shaders.json
@@ -32,10 +33,21 @@ tools/bench/d3d11/out/Release/d3d11_texture_swizzle_check.exe --output d3d11-tex
 
 Add `--warp` to the checks for the Microsoft software
 driver. Add `--present` to the device check to exercise a real window, repeated
-presentation and resize. `--fl11-0` caps the shader checks at the older hardware
+presentation, resize and six connection rebuilds while views are bound. It
+compares actual swap-chain backbuffer pixels as well as checking `Present`.
+`--present-mode flip-sequential` and `--present-mode discard` force the older
+presentation paths; automatic mode also tries these if newer swap-chain
+combinations are rejected. A failure report includes each attempted mode and
+HRESULT, so a running command processor cannot hide a failed display connection.
+`--fl11-0` caps the shader checks at the older hardware
 baseline even when a device supports newer features. The render target check
 runs at feature level 11.0 by default; `--fl11-1` lets it use pixel shader
 stencil output where the device supports it, the path the game takes there.
+It also checks transfers between original-resolution and scaled targets in both
+directions, including differently sized MSAA layouts, partial clears and retained
+snapshots. Individual host-pixel markers catch incorrect resampling phases.
+Use `--mixed-only` to run that matrix while working on mixed-resolution transfers.
+Direct3D 12 uses the same transfer shader generator.
 
 The device check compares raw compute results and separately owned texture
 versions against CPU references at 1x and 2x. The shader check compares native
@@ -54,16 +66,70 @@ The clock ratio check compares native integer scaling with an independent
 bit-at-a-time product and long division over 50,900 cases. It covers the
 Windows QPC and nanosecond clock ratios, wide products and counter wrap.
 
+The graphics resource check runs without a GPU or game files. It checks automatic
+and explicit backend choices, queue priority fallback, adapter ordering, and
+80,004 page ownership cases against individual bit reads. It covers partial
+bitmap words, sparse owners, nonbinary validity flags, guarded output and invalid
+ranges. Its timing output measures ownership bookkeeping on the CPU, not game FPS.
+The same source builds on Linux with a C++23 compiler and the SDK include path.
+It also checks 24,096 atomic upload-validity cases, including a concurrent
+release/acquire handshake publishing the associated data. For a Linux race check,
+compile it with `-fsanitize=thread -g -O1 -pthread` and run the resulting binary.
+
 The build also compiles the production shader preparation, guest texture cache,
 command processor, presenter and shared geometry/ownership-transfer generators.
 Native Windows drivers and more of the game still need validation. See [the
 renderer state](../../../simpsons/re/d3d11_renderer.md).
+
+The optional `d3d11_native_memory_check` links the full production runtime, using
+the same compiler and C++ ABI as that runtime. Configure
+`REXGLUE_RUNTIME_IMPORT_LIBRARY` with its Windows import library (`.lib` or
+`.dll.a`), build that target, and place its runtime DLL and dependencies beside
+the executable. Run it with `--output native-memory.json`, adding `--warp` for
+the Windows software device. It checks native page ownership, deferred mirror
+allocation, partial materialization, CPU faults through guest virtual aliases,
+overlapping GPU writes, a CPU write injected during publication, trace download
+and cache clearing. It also composes three disjoint GPU owners and two CPU gaps
+into resolve preimages and texture inputs, requires that no mirror is allocated,
+and refreshes a CPU-invalidated page without losing adjacent GPU data. Unretained
+GPU writes must remain on the compatibility path. A later compatibility read
+must upload CPU gaps previously used only in a temporary native input. It fails
+if bytes or preserved padding change.
+
+Index-cache checks require contained reads and frequently reused versions to
+avoid another GPU download. They cover page boundaries, eviction pressure,
+CPU and GPU invalidation, and immutable bytes held by an earlier caller.
+Prepared native outputs must survive intervening allocations and cache clearing
+until their caller publishes the write. The fixture reports `index_cache_checks`,
+`index_cached_reads` and `retained_output_checks` separately.
+
+Five additional extent checks use a real retained GPU owner. They verify valid
+vertex reads beyond the declared stream length, refusal to estimate from stale
+CPU vertices or indices, and recovery after CPU ownership returns. These checks
+must not allocate the physical memory mirror or publish GPU bytes into CPU memory.
+
+The optional `d3d11_native_texture_check` uses the same runtime import library
+and DLL setup. Run it with `--output native-texture.json` (or add `--warp`). It
+loads textures through the production cache with a GPU-owned base and CPU mips,
+then reverses those owners. It compares all seven native image levels before
+and after CPU and GPU rewrites, covering tiled/linear storage, packed/unpacked
+mips and all four endian modes. The 32 cases decode 96 images and compare
+2,097,024 bytes exactly. The physical-address buffer must remain unallocated;
+`native-texture-coverage.json` records the strict dependency check.
 
 The buffer check queues GPU reads of changing raw, index and constant sources,
 also queues immutable GPU-to-GPU copies before rewriting their source,
 forces a small cache budget, revisits pinned versions after eviction, and clears
 the cache before completion. Every output word is compared with its original CPU
 snapshot. Cache ownership and frame ownership are checked separately.
+Multipart CPU inputs must share the contiguous content cache, compare all input
+bytes and zero padding, obey its byte budget, and leave queued versions immutable.
+The fixture also covers malformed spans and the short and long hash paths.
+The game command processor defaults to a 32 MiB combined CPU/GPU vertex/index
+content budget; `d3d11_buffer_cache_mb` selects 1–128 MiB on startup. Compare
+budgets with identical saved-frame replay counts and inspect the resource upload
+counters as well as timing. The fixture deliberately uses much smaller explicit
+budgets to exercise eviction and retained versions.
 Scaled resolve checks also retain read/write views, expand their allocations,
 evict cached views and verify that queued GPU versions remain independent.
 
@@ -84,6 +150,18 @@ Discard checks alternate vertex-only and geometry pipelines, checking vertex
 and geometry execution counters while every render target pixel stays unchanged.
 Cached reads are explicitly unbound when they become outputs, so later reuse of
 the same view cannot silently miss a binding that the runtime removed.
+
+Constant upload checks queue 2,049 draws on the exact-size discard path, then
+another 2,049 when the device supports offset bindings and constant-buffer
+`NO_OVERWRITE`. They compare every output word after multiple append-page wraps,
+including unchanged inputs, rounded zero padding, dynamic out-of-range reads,
+switches between whole-buffer and ranged bindings, trailing unbinds and state
+invalidation. Misaligned, oversized and incomplete windows must be rejected.
+Large payloads retain the exact-size path, and invalid payloads must fail.
+The fixture uses 16 KiB pages to exercise wraps frequently; the game uses 64 KiB
+pages within a 4 MiB total append-page budget. A device without both optional
+features still runs the exact-size checks. The fixture reports upload modes
+separately; these counts are not gameplay FPS measurements.
 
 The texture upload check executes the production GPU buffer-to-image transfer
 for ten integer storage families, two mips and 2D, array and 3D views. Arbitrary
@@ -114,9 +192,11 @@ The render target check executes color/depth/stencil transfers, retained source
 snapshots, integer and partial clears, and native EDRAM encoding across guest
 formats and sample conventions. With `--fl11-1` on a device with pixel shader
 stencil output, depth transfers are also checked in a single pass. The resolve check independently computes tiled
-destination addresses and source sample selection at five resolution scales,
+destination addresses and source sample selection at 1x, 2x, 3x and asymmetric scales,
 checking every byte in the destination, including untouched neighbors. The
 native depth 4x path handles vectors crossing the depth tile's swapped halves.
+Full 3x, 2x3 and 3x2 cases also cover native integer sources, array slices,
+partial regions, multisample conversion and the original-resolution output.
 
 The texture upload check also tests every 16-bit code in the packed 565, 5551
 and 4444 families. Native float storage preserves their source channel precision;

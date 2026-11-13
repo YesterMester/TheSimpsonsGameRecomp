@@ -47,6 +47,13 @@ merged `cache/shaders/shareable/45410809.xsh` for the normal bake step. Input
 files and caches are read only. The inventory records each container's address,
 metadata size, program offset, size, hash and shader type.
 
+`native-analysis.json` runs the runtime's shader analyzer on every merged program.
+It records static vertex address expressions, fetch formats, constant dependencies,
+memory exports, pixel-stage vertex fetches and dynamic register addressing. This
+finds shader prerequisites absent from native paths without launching a level.
+Draw-specific bounds, GPU ownership, resource aliases and device limits still need
+strict frame or fixture checks; this file does not declare the game fully native.
+
 The supported containers have signature `0x102A1100` (pixel) or `0x102A1101`
 (vertex). Their metadata and program descriptors use big-endian fields; the
 program bytes remain in guest byte order, just as the shader cache stores them.

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -25,6 +26,9 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/register_write.h>
+#include <rex/graphics/util/vertex_fetch_bounds.h>
+#include <rex/graphics/util/vertex_index_bounds.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
@@ -46,6 +50,11 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_native_vertex_buffers, true, "GPU/D3D12",
+                    "Read proven CPU/GPU-owned vertex streams from compact native buffers");
+REXCVAR_DEFINE_BOOL(d3d12_native_index_buffers, true, "GPU/D3D12",
+                    "Read CPU-owned DMA indices from native index buffers");
 
 namespace rex::graphics::d3d12 {
 
@@ -109,6 +118,7 @@ void D3D12CommandProcessor::ClearCaches() {
 
 void D3D12CommandProcessor::InvalidateGpuMemory() {
   if (shared_memory_) {
+    shared_memory_->InvalidateNativeResolves();
     shared_memory_->InvalidateAllPages();
   }
 }
@@ -513,6 +523,10 @@ uint64_t D3D12CommandProcessor::RequestViewBindfulDescriptors(
     view_bindful_heap_current_ = heap;
     deferred_command_list_.SetDescriptorHeaps(view_bindful_heap_current_,
                                               sampler_bindful_heap_current_);
+    // Changing either shader-visible heap invalidates all descriptor tables,
+    // including tables from the other heap. Rebind the guest root arguments
+    // after compute work or a pool rollover changes the heaps.
+    current_graphics_root_up_to_date_ = 0;
   }
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   cpu_handle_out = provider.OffsetViewDescriptor(
@@ -586,10 +600,75 @@ bool D3D12CommandProcessor::RequestOneUseSingleViewDescriptors(
   return true;
 }
 
+void D3D12CommandProcessor::InvalidateSharedMemoryBindings() {
+  // A new buffer gets new bindful descriptor copies. Already queued draws keep
+  // their old null descriptors; bindless views use separate write-once slots.
+  draw_view_bindful_heap_index_ = ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
+  current_graphics_root_up_to_date_ &= ~((1u << kRootParameter_Bindless_SharedMemory) |
+                                         (1u << kRootParameter_Bindless_SharedMemoryUAV) |
+                                         (1u << kRootParameter_Bindful_SharedMemoryAndEdram));
+}
+
 ui::d3d12::util::DescriptorCpuGpuHandlePair D3D12CommandProcessor::GetSystemBindlessViewHandlePair(
-    SystemBindlessView view) const {
+    SystemBindlessView view) {
   assert_true(bindless_resources_used_);
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  if (view == SystemBindlessView::kSharedMemoryRawSRV ||
+      view == SystemBindlessView::kSharedMemoryRawUAV ||
+      (view >= SystemBindlessView::kSharedMemoryR32UintSRV &&
+       view <= SystemBindlessView::kSharedMemoryR32G32B32A32UintUAV)) {
+    if (!shared_memory_->EnsureBuffer()) {
+      throw std::runtime_error("Could not bind D3D12 compatibility memory");
+    }
+    uint32_t offset =
+        view == SystemBindlessView::kSharedMemoryRawSRV   ? 0
+        : view == SystemBindlessView::kSharedMemoryRawUAV ? 4
+        : view <= SystemBindlessView::kSharedMemoryR32G32B32A32UintSRV
+            ? 1 + uint32_t(view) - uint32_t(SystemBindlessView::kSharedMemoryR32UintSRV)
+            : 5 + uint32_t(view) - uint32_t(SystemBindlessView::kSharedMemoryR32UintUAV);
+    uint32_t index = uint32_t(SystemBindlessView::kDeferredSharedMemoryRawSRV) + offset;
+    auto descriptor =
+        std::make_pair(provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, index),
+                       provider.OffsetViewDescriptor(view_bindless_heap_gpu_start_, index));
+    if (!(deferred_memory_views_written_ & (1u << offset))) {
+      if (!offset) {
+        shared_memory_->WriteRawSRVDescriptor(descriptor.first);
+      } else if (offset == 4) {
+        shared_memory_->WriteRawUAVDescriptor(descriptor.first);
+      } else if (offset < 4) {
+        shared_memory_->WriteUintPow2SRVDescriptor(descriptor.first, offset + 1);
+      } else {
+        shared_memory_->WriteUintPow2UAVDescriptor(descriptor.first, offset - 3);
+      }
+      deferred_memory_views_written_ |= 1u << offset;
+    }
+    return descriptor;
+  }
+  if (view >= SystemBindlessView::kEdramRawSRV &&
+      view <= SystemBindlessView::kEdramR32G32B32A32UintUAV &&
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+    auto& descriptor = edram_bindless_views_[uint32_t(view)];
+    if (!descriptor.first.ptr) {
+      if (!render_target_cache_->EnsureEdramBuffer() ||
+          !RequestOneUseSingleViewDescriptors(1, &descriptor)) {
+        throw std::runtime_error("Could not bind D3D12 compatibility render target storage");
+      }
+      // Do not rewrite the global shader-visible heap after startup. Earlier
+      // submissions must keep their original descriptor contents.
+      if (view == SystemBindlessView::kEdramRawSRV) {
+        render_target_cache_->WriteEdramRawSRVDescriptor(descriptor.first);
+      } else if (view == SystemBindlessView::kEdramRawUAV) {
+        render_target_cache_->WriteEdramRawUAVDescriptor(descriptor.first);
+      } else if (view < SystemBindlessView::kEdramRawUAV) {
+        render_target_cache_->WriteEdramUintPow2SRVDescriptor(
+            descriptor.first, 2 + uint32_t(view) - uint32_t(SystemBindlessView::kEdramR32UintSRV));
+      } else {
+        render_target_cache_->WriteEdramUintPow2UAVDescriptor(
+            descriptor.first, 2 + uint32_t(view) - uint32_t(SystemBindlessView::kEdramR32UintUAV));
+      }
+    }
+    return descriptor;
+  }
   return std::make_pair(
       provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, uint32_t(view)),
       provider.OffsetViewDescriptor(view_bindless_heap_gpu_start_, uint32_t(view)));
@@ -597,7 +676,7 @@ ui::d3d12::util::DescriptorCpuGpuHandlePair D3D12CommandProcessor::GetSystemBind
 
 ui::d3d12::util::DescriptorCpuGpuHandlePair
 D3D12CommandProcessor::GetSharedMemoryUintPow2BindlessSRVHandlePair(
-    uint32_t element_size_bytes_pow2) const {
+    uint32_t element_size_bytes_pow2) {
   SystemBindlessView view;
   switch (element_size_bytes_pow2) {
     case 2:
@@ -618,7 +697,7 @@ D3D12CommandProcessor::GetSharedMemoryUintPow2BindlessSRVHandlePair(
 
 ui::d3d12::util::DescriptorCpuGpuHandlePair
 D3D12CommandProcessor::GetSharedMemoryUintPow2BindlessUAVHandlePair(
-    uint32_t element_size_bytes_pow2) const {
+    uint32_t element_size_bytes_pow2) {
   SystemBindlessView view;
   switch (element_size_bytes_pow2) {
     case 2:
@@ -638,8 +717,7 @@ D3D12CommandProcessor::GetSharedMemoryUintPow2BindlessUAVHandlePair(
 }
 
 ui::d3d12::util::DescriptorCpuGpuHandlePair
-D3D12CommandProcessor::GetEdramUintPow2BindlessSRVHandlePair(
-    uint32_t element_size_bytes_pow2) const {
+D3D12CommandProcessor::GetEdramUintPow2BindlessSRVHandlePair(uint32_t element_size_bytes_pow2) {
   SystemBindlessView view;
   switch (element_size_bytes_pow2) {
     case 2:
@@ -659,8 +737,7 @@ D3D12CommandProcessor::GetEdramUintPow2BindlessSRVHandlePair(
 }
 
 ui::d3d12::util::DescriptorCpuGpuHandlePair
-D3D12CommandProcessor::GetEdramUintPow2BindlessUAVHandlePair(
-    uint32_t element_size_bytes_pow2) const {
+D3D12CommandProcessor::GetEdramUintPow2BindlessUAVHandlePair(uint32_t element_size_bytes_pow2) {
   SystemBindlessView view;
   switch (element_size_bytes_pow2) {
     case 2:
@@ -697,6 +774,7 @@ uint64_t D3D12CommandProcessor::RequestSamplerBindfulDescriptors(
     sampler_bindful_heap_current_ = heap;
     deferred_command_list_.SetDescriptorHeaps(view_bindful_heap_current_,
                                               sampler_bindful_heap_current_);
+    current_graphics_root_up_to_date_ = 0;
   }
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   cpu_handle_out = provider.OffsetSamplerDescriptor(
@@ -847,11 +925,14 @@ std::string D3D12CommandProcessor::GetWindowTitleText() const {
 }
 
 bool D3D12CommandProcessor::SetupContext() {
+  deferred_memory_views_written_ = 0;
   if (!CommandProcessor::SetupContext()) {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
   }
   UpdateDebugMarkersEnabled();
+  native_gpu_diagnostics().Initialize("d3d12");
+  native_gpu_diagnostics().BindRegisterFile(register_file_);
 
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
@@ -927,6 +1008,7 @@ bool D3D12CommandProcessor::SetupContext() {
   render_target_cache_ = std::make_unique<D3D12RenderTargetCache>(
       *register_file_, *memory_, trace_writer_, draw_resolution_scale_x, draw_resolution_scale_y,
       *this, bindless_resources_used_);
+  render_target_cache_->SetSharedMemory(shared_memory_.get());
   if (!render_target_cache_->Initialize()) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
@@ -1055,8 +1137,7 @@ bool D3D12CommandProcessor::SetupContext() {
     {
       auto& parameter = root_parameters_bindless[kRootParameter_Bindless_SharedMemory];
       parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      parameter.DescriptorTable.NumDescriptorRanges =
-          uint32_t(rex::countof(root_shared_memory_view_ranges));
+      parameter.DescriptorTable.NumDescriptorRanges = 1;
       parameter.DescriptorTable.pDescriptorRanges = root_shared_memory_view_ranges;
       parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
       {
@@ -1073,8 +1154,13 @@ bool D3D12CommandProcessor::SetupContext() {
         range.NumDescriptors = 1;
         range.BaseShaderRegister = UINT(DxbcShaderTranslator::UAVRegister::kSharedMemory);
         range.RegisterSpace = 0;
-        range.OffsetInDescriptorsFromTableStart = 1;
+        range.OffsetInDescriptorsFromTableStart = 0;
       }
+      auto& uav_parameter = root_parameters_bindless[kRootParameter_Bindless_SharedMemoryUAV];
+      uav_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      uav_parameter.DescriptorTable.NumDescriptorRanges = 1;
+      uav_parameter.DescriptorTable.pDescriptorRanges = root_shared_memory_view_ranges + 1;
+      uav_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
     // Sampler heap.
     D3D12_DESCRIPTOR_RANGE root_bindless_sampler_range;
@@ -1621,6 +1707,7 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  native_gpu_diagnostics().WriteReport(true);
   ShutdownOcclusionQueryResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
@@ -1724,6 +1811,9 @@ void D3D12CommandProcessor::ShutdownContext() {
     view_bindful_heap_pool_.reset();
   }
   constant_buffer_pool_.reset();
+  native_vertex_upload_pools_.clear();
+  native_vertex_buffer_ = nullptr;
+  native_vertex_streams_active_ = false;
 
   render_target_cache_.reset();
 
@@ -1761,6 +1851,10 @@ void D3D12CommandProcessor::ShutdownContext() {
 }
 
 void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31 && (*register_file_)[index] == value) {
+    return;
+  }
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -1827,7 +1921,8 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    if (!draw_util::CopyAndSwapRegisters(register_file_->values + start_index, base, num_registers))
+      return;
     if (frame_open_) {
       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
       uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
@@ -1853,14 +1948,16 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    if (!draw_util::CopyAndSwapRegisters(register_file_->values + start_index, base, num_registers))
+      return;
     cbuffer_binding_bool_loop_.up_to_date = false;
     return;
   }
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    if (!draw_util::CopyAndSwapRegisters(register_file_->values + start_index, base, num_registers))
+      return;
     cbuffer_binding_fetch_.up_to_date = false;
     uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
@@ -1870,6 +1967,11 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     return;
   }
 
+  constexpr uint32_t kFirstContextRegister = 0x2000;
+  if (start_index >= kFirstContextRegister && end_index < XE_GPU_REG_SHADER_CONSTANT_000_X) {
+    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    return;
+  }
   CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
 }
 
@@ -1883,6 +1985,9 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  NativeGpuDiagnostics::RouteScope route(&native_gpu_diagnostics(),
+                                         NativeGpuDiagnostics::RouteSystem::kHostPresentation);
+  route.Native();
   SCOPE_profile_cpu_f("gpu");
 
   if (!graphics_system_)
@@ -1973,7 +2078,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
-  presenter->RefreshGuestOutput(
+  bool refreshed = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
        guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
@@ -2242,6 +2347,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
+  route.Finish(refreshed);
+  native_gpu_diagnostics().Frame();
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -2254,6 +2361,297 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
 Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                           const uint32_t* host_address, uint32_t dword_count) {
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+}
+
+bool D3D12CommandProcessor::PrepareNativeVertexStreams(
+    const D3D12Shader& vertex, const D3D12Shader* pixel,
+    const PrimitiveProcessor::ProcessingResult& primitive, bool memexport,
+    uint32_t used_texture_mask) {
+  bool was_native = native_vertex_streams_active_;
+  native_vertex_streams_active_ = false;
+  native_vertex_buffer_ = nullptr;
+  native_memexport_buffer_.reset();
+  // The fetch CB is shared by stages. A relocated vertex slot must not also
+  // describe a texture, and no pixel-stage vertex read may use the compact SRV.
+  if (was_native) {
+    cbuffer_binding_fetch_.up_to_date = false;
+    current_graphics_root_up_to_date_ &=
+        ~((1u << (bindless_resources_used_ ? kRootParameter_Bindless_SharedMemory
+                                           : kRootParameter_Bindful_SharedMemoryAndEdram)) |
+          (1u << kRootParameter_Bindless_SharedMemoryUAV));
+  }
+  if (!REXCVAR_GET(d3d12_native_vertex_buffers) || (memexport && memexport_ranges_.empty()) ||
+      (memexport && (!draw_util::CanUseNativeMemExports(*register_file_, vertex) ||
+                     (pixel && !draw_util::CanUseNativeMemExports(*register_file_, *pixel)))) ||
+      !vertex.has_static_vertex_addresses() || (pixel && !pixel->vertex_bindings().empty()) ||
+      primitive.host_vertex_shader_type != Shader::HostVertexShaderType::kVertex) {
+    return true;
+  }
+  const RegisterFile& regs = *register_file_;
+  uint32_t index_min = regs[XE_GPU_REG_VGT_MIN_VTX_INDX];
+  uint32_t index_max = regs[XE_GPU_REG_VGT_MAX_VTX_INDX];
+  uint32_t base = regs[XE_GPU_REG_VGT_INDX_OFFSET];
+  if (index_min > index_max || !primitive.host_draw_vertex_count) {
+    return true;
+  }
+  uint32_t first = UINT32_MAX, last = 0;
+  using IndexBufferType = PrimitiveProcessor::ProcessedIndexBufferType;
+  const auto& vertex_map = vertex.constant_register_map();
+  bool has_vertex_fetches = std::any_of(std::begin(vertex_map.vertex_fetch_bitmap),
+                                        std::end(vertex_map.vertex_fetch_bitmap),
+                                        [](uint32_t bits) { return bits != 0; });
+  if (!has_vertex_fetches) {
+    // Index wrapping still happens in the shader. With no input fetch it
+    // cannot escape a vertex stream, so no input bounds proof is needed.
+    first = last = 0;
+  } else if (primitive.index_buffer_type == IndexBufferType::kNone ||
+             primitive.index_buffer_type == IndexBufferType::kHostBuiltinForAuto) {
+    auto bounds = draw_util::GetAutoVertexIndexBounds(primitive.guest_draw_vertex_count, base,
+                                                      index_min, index_max);
+    first = bounds.first;
+    last = bounds.last;
+  } else if (primitive.index_buffer_type == IndexBufferType::kHostConverted &&
+             primitive.native_index_snapshot) {
+    xenos::Endian endian = primitive.host_shader_index_endian;
+    bool index_16 = primitive.host_index_format == xenos::IndexFormat::kInt16;
+    auto bounds = draw_util::GetVertexIndexBounds(
+        primitive.native_index_snapshot, primitive.host_draw_vertex_count, index_16, endian,
+        primitive.host_primitive_reset_enabled, base, index_min, index_max);
+    first = bounds.first;
+    last = bounds.last;
+  } else {
+    return true;
+  }
+  if (first > last) {
+    return true;
+  }
+  std::array<std::pair<int32_t, int32_t>, xenos::kVertexFetchConstantCount> ranges = {};
+  std::array<bool, xenos::kVertexFetchConstantCount> proven_ranges = {};
+  for (const auto& binding : vertex.vertex_bindings()) {
+    if (binding.fetch_constant >= ranges.size()) {
+      return true;
+    }
+    auto fetch = regs.GetVertexFetch(binding.fetch_constant);
+    if (!fetch.size) {
+      continue;
+    }
+    if (fetch.type != xenos::FetchConstantType::kVertex ||
+        (used_texture_mask & (uint32_t(1) << (binding.fetch_constant / 3)))) {
+      return true;
+    }
+    int64_t first_word = INT64_MAX, end_word = INT64_MIN;
+    for (const auto& attribute : binding.attributes) {
+      const auto& instruction = attribute.fetch_instr;
+      if (!attribute.index_expression.valid ||
+          instruction.attributes.stride != binding.stride_words ||
+          instruction.operands[1].storage_index != binding.fetch_constant) {
+        return true;
+      }
+      auto indices =
+          instruction.attributes.stride
+              ? draw_util::GetVertexFetchIndexBounds(
+                    first, last, instruction.attributes.is_index_rounded,
+                    attribute.index_expression.offset_constant,
+                    attribute.index_expression.scale_constant,
+                    [&](uint32_t index) {
+                      return std::bit_cast<float>(regs[XE_GPU_REG_SHADER_CONSTANT_000_X + index]);
+                    })
+              : draw_util::VertexFetchIndexBounds{0, 0};
+      if (!indices)
+        return true;
+      uint32_t needed = xenos::GetVertexFormatNeededWords(
+          instruction.attributes.data_format, instruction.result.GetUsedResultComponents());
+      for (uint32_t word = 0; word < 4; ++word) {
+        if (!(needed & (1u << word))) {
+          continue;
+        }
+        int64_t offset = int64_t(instruction.attributes.offset) + word;
+        first_word = std::min(first_word, indices.first * binding.stride_words + offset);
+        end_word = std::max(end_word, indices.last * binding.stride_words + offset + 1);
+      }
+    }
+    // Fetch size is not a read bound in the translated shader. Some particle
+    // draws address a fourth vertex in a stream declared for three vertices.
+    if (!draw_util::GetVertexFetchByteRange(fetch.address, first_word, end_word,
+                                            SharedMemory::kBufferSize)) {
+      return true;
+    }
+    auto& range = ranges[binding.fetch_constant];
+    if (proven_ranges[binding.fetch_constant]) {
+      range.first = std::min(range.first, int32_t(first_word));
+      range.second = std::max(range.second, int32_t(end_word));
+    } else {
+      range = {int32_t(first_word), int32_t(end_word)};
+      proven_ranges[binding.fetch_constant] = true;
+    }
+  }
+  struct UploadRange {
+    uint32_t fetch, address, length, offset, first_word;
+  };
+  std::array<UploadRange, xenos::kVertexFetchConstantCount> uploads;
+  uint32_t upload_count = 0, snapshot_size = 64;
+  bool gpu_streams = false;
+  const auto& map = vertex.constant_register_map();
+  for (uint32_t block = 0; block < std::size(map.vertex_fetch_bitmap); ++block) {
+    uint32_t remaining = map.vertex_fetch_bitmap[block];
+    while (remaining) {
+      uint32_t bit = std::countr_zero(remaining);
+      remaining &= remaining - 1;
+      uint32_t fetch_index = block * 32 + bit;
+      auto fetch = regs.GetVertexFetch(fetch_index);
+      if (!fetch.size) {
+        continue;
+      }
+      if (!proven_ranges[fetch_index]) {
+        return true;
+      }
+      const auto& range = ranges[fetch_index];
+      int64_t address = (int64_t(fetch.address) + range.first) * 4;
+      uint32_t length = (range.second - range.first) << 2;
+      uint32_t offset = rex::align(snapshot_size, uint32_t(16));
+      if (address < 0 || uint64_t(address) >= SharedMemory::kBufferSize ||
+          length > SharedMemory::kBufferSize - uint64_t(address) ||
+          length > (128u << 20) - offset ||
+          (shared_memory_->IsRangeGpuWritten(uint32_t(address), length) &&
+           !shared_memory_->CanReadNativeResolveRange(uint32_t(address), length))) {
+        return true;
+      }
+      uploads[upload_count++] = {fetch_index, uint32_t(address), length, offset,
+                                 uint32_t(range.first)};
+      snapshot_size = offset + length;
+      gpu_streams |= shared_memory_->IsRangeGpuWritten(uint32_t(address), length);
+    }
+  }
+  snapshot_size = rex::align(snapshot_size, uint32_t(16));
+  if (memexport && !memexport_ranges_.empty()) {
+    uint32_t first_address = SharedMemory::kBufferSize, end_address = 0;
+    auto include = [&](uint64_t address, uint32_t length) {
+      if (!length || address >= SharedMemory::kBufferSize ||
+          length > SharedMemory::kBufferSize - address)
+        return false;
+      first_address = std::min(first_address, uint32_t(address));
+      end_address = std::max(end_address, uint32_t(address) + length);
+      return true;
+    };
+    for (const auto& range : memexport_ranges_)
+      if (!include(uint64_t(range.base_address_dwords) << 2, range.size_bytes))
+        return true;
+    for (uint32_t i = 0; i < upload_count; ++i)
+      if (!include(uploads[i].address, uploads[i].length))
+        return true;
+    if (!shared_memory_->CanReadNativeResolveRange(first_address, end_address - first_address))
+      return true;
+    auto native = shared_memory_->PrepareNativeResolve(first_address, end_address - first_address);
+    if (!native)
+      return false;
+    std::memcpy(native_vertex_fetch_constants_.data(), &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+                sizeof(native_vertex_fetch_constants_));
+    for (uint32_t i = 0; i < upload_count; ++i) {
+      uint32_t& fetch = native_vertex_fetch_constants_[uploads[i].fetch * 2];
+      fetch = ((fetch & ~uint32_t(3)) - native->address) | (fetch & 3);
+    }
+    native_memexport_buffer_ = std::move(native);
+    native_vertex_streams_active_ = true;
+    cbuffer_binding_fetch_.up_to_date = false;
+    current_graphics_root_up_to_date_ &=
+        ~((1u << (bindless_resources_used_ ? kRootParameter_Bindless_SharedMemory
+                                           : kRootParameter_Bindful_SharedMemoryAndEdram)) |
+          (1u << kRootParameter_Bindless_SharedMemoryUAV));
+    native_gpu_diagnostics().RecordOperation(NativeGpuDiagnostics::Operation::kVertexStreams);
+    return true;
+  }
+  size_t page_size = std::max(size_t(1) << 20, std::bit_ceil(size_t(snapshot_size)));
+  auto& pool = native_vertex_upload_pools_[page_size];
+  if (!pool) {
+    pool = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(GetD3D12Provider(), page_size);
+  }
+  D3D12_GPU_VIRTUAL_ADDRESS gpu_address;
+  uint8_t* mapping = pool->Request(frame_current_, snapshot_size, 16, &native_vertex_buffer_,
+                                   &native_vertex_offset_, &gpu_address);
+  if (!mapping) {
+    return false;
+  }
+  std::memcpy(native_vertex_fetch_constants_.data(), &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+              sizeof(native_vertex_fetch_constants_));
+  struct GpuCopy {
+    D3D12SharedMemory::NativeResolveHandle source;
+    uint32_t source_offset, destination_offset, length;
+  };
+  std::vector<GpuCopy> gpu_copies;
+  std::unique_lock<std::recursive_mutex> snapshot_lock;
+  if (gpu_streams)
+    snapshot_lock = thread::global_critical_region::AcquireDirect();
+  uint32_t initialized_end = 0;
+  for (uint32_t i = 0; i < upload_count; ++i) {
+    const auto& range = uploads[i];
+    // CPU copies initialize their own bytes. Keep the zero prefix, gaps and
+    // GPU replacement ranges deterministic without clearing CPU inputs twice.
+    std::memset(mapping + initialized_end, 0, range.offset - initialized_end);
+    if (shared_memory_->IsRangeGpuWritten(range.address, range.length)) {
+      auto source = shared_memory_->ComposeNativeResolveCopySource(range.address, range.length);
+      if (!source)
+        return false;
+      std::memset(mapping + range.offset, 0, range.length);
+      gpu_copies.push_back({source, range.address - source->address, range.offset, range.length});
+    } else if (!shared_memory_->SnapshotCpuRange(range.address, range.length,
+                                                 mapping + range.offset)) {
+      return true;
+    }
+    initialized_end = range.offset + range.length;
+    uint32_t& fetch_word = native_vertex_fetch_constants_[range.fetch * 2];
+    fetch_word = ((range.offset - (range.first_word << 2)) & ~uint32_t(3)) | (fetch_word & 3);
+  }
+  std::memset(mapping + initialized_end, 0, snapshot_size - initialized_end);
+  if (!gpu_copies.empty()) {
+    const auto& provider = GetD3D12Provider();
+    D3D12_RESOURCE_DESC desc;
+    ui::d3d12::util::FillBufferResourceDesc(desc, snapshot_size, D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> snapshot;
+    if (FAILED(provider.GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(), &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&snapshot))))
+      return false;
+    // Retain before recording any copy, including when a later allocation
+    // fails. The source owners are already pinned to this submission too.
+    resources_for_deletion_.emplace_back(submission_current_, snapshot.Get());
+    ID3D12Resource* destination = snapshot.Detach();
+    SubmitBarriers();
+    deferred_command_list_.D3DCopyBufferRegion(destination, 0, native_vertex_buffer_,
+                                               native_vertex_offset_, snapshot_size);
+    for (const auto& copy : gpu_copies) {
+      deferred_command_list_.D3DCopyBufferRegion(destination, copy.destination_offset,
+                                                 copy.source->resource.Get(), copy.source_offset,
+                                                 copy.length);
+    }
+    PushTransitionBarrier(destination, D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    native_vertex_buffer_ = destination;
+    native_vertex_offset_ = 0;
+  }
+  native_vertex_size_ = snapshot_size;
+  native_vertex_streams_active_ = true;
+  cbuffer_binding_fetch_.up_to_date = false;
+  current_graphics_root_up_to_date_ &=
+      ~(1u << (bindless_resources_used_ ? kRootParameter_Bindless_SharedMemory
+                                        : kRootParameter_Bindful_SharedMemoryAndEdram));
+  native_vertex_bytes_ += snapshot_size;
+  native_gpu_diagnostics().RecordOperation(NativeGpuDiagnostics::Operation::kVertexStreams);
+  if (++native_vertex_draws_ <= 8 || !(native_vertex_draws_ & 8191)) {
+    REXGPU_INFO("[d3d12-native-vertex] {} draws, {} KiB in compact native streams",
+                native_vertex_draws_, native_vertex_bytes_ >> 10);
+  }
+  return true;
+}
+
+void D3D12CommandProcessor::WriteNativeVertexSRV(D3D12_CPU_DESCRIPTOR_HANDLE handle) const {
+  D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+  desc.Format = DXGI_FORMAT_R32_TYPELESS;
+  desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  desc.Buffer.FirstElement = native_vertex_offset_ >> 2;
+  desc.Buffer.NumElements = native_vertex_size_ >> 2;
+  desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+  GetD3D12Provider().GetDevice()->CreateShaderResourceView(native_vertex_buffer_, &desc, handle);
 }
 
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
@@ -2331,7 +2729,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
-  if (!primitive_processor_->Process(primitive_processing_result)) {
+  if (!primitive_processor_->Process(primitive_processing_result,
+                                     REXCVAR_GET(d3d12_native_index_buffers))) {
     return false;
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
@@ -2406,6 +2805,29 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  memexport_ranges_.clear();
+  if (memexport_used_vertex)
+    draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
+  if (memexport_used_pixel)
+    draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
+  std::unique_lock<std::recursive_mutex> native_export_lock;
+  if (memexport_used)
+    native_export_lock = thread::global_critical_region::AcquireDirect();
+  {
+    NativeGpuDiagnostics::RouteScope route(&native_gpu_diagnostics(),
+                                           NativeGpuDiagnostics::RouteSystem::kGeometry);
+    if (!PrepareNativeVertexStreams(*vertex_shader, pixel_shader, primitive_processing_result,
+                                    memexport_used, used_texture_mask)) {
+      return false;
+    }
+    if (native_vertex_streams_active_)
+      route.Native();
+    else
+      route.Retained();
+    route.Finish(true);
+  }
+  if (!native_memexport_buffer_ && native_export_lock.owns_lock())
+    native_export_lock.unlock();
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -2416,8 +2838,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
 
   // Get dynamic rasterizer state.
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  const bool original_resolution = render_target_cache_->IsLastUpdateOriginalResolution();
+  uint32_t draw_resolution_scale_x =
+      original_resolution ? 1u : texture_cache_->draw_resolution_scale_x();
+  uint32_t draw_resolution_scale_y =
+      original_resolution ? 1u : texture_cache_->draw_resolution_scale_y();
 
   bool convert_z_to_float24 =
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader();
@@ -2435,7 +2860,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   std::memcpy(viewport_key.vport_regs, &regs[XE_GPU_REG_PA_CL_VPORT_XSCALE],
               sizeof(viewport_key.vport_regs));
   viewport_key.flags = (uint32_t(convert_z_to_float24) << 0) |
-                       (uint32_t(host_render_targets_used) << 1) | (uint32_t(ps_writes_depth) << 2);
+                       (uint32_t(host_render_targets_used) << 1) |
+                       (uint32_t(ps_writes_depth) << 2) | (uint32_t(original_resolution) << 3);
 
   draw_util::ViewportInfo viewport_info;
   if (viewport_cache_valid_ && viewport_key == previous_viewport_key_) {
@@ -2466,8 +2892,23 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
+  uint32_t native_memexport_base = native_memexport_buffer_ ? native_memexport_buffer_->address : 0;
+  if (system_constants_.native_memexport_base != native_memexport_base) {
+    system_constants_.native_memexport_base = native_memexport_base;
+    cbuffer_binding_system_.up_to_date = false;
+  }
 
   // Update constant buffers, descriptors and root parameters.
+  // Bindful descriptor copies must see the real buffer before this draw.
+  // Residency requests below may be its first use when the shader only exports.
+  if (((memexport_used && !native_memexport_buffer_) || !native_vertex_streams_active_ ||
+       primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+       primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA) &&
+      !shared_memory_->EnsureBuffer()) {
+    return false;
+  }
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
     return false;
   }
@@ -2486,7 +2927,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // caching residency across draws pinned the GPU to stale vertex data.
   uint64_t vertex_buffers_resident[2] = {};
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
-  for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+  if (!native_vertex_streams_active_) {
+    native_gpu_diagnostics().RecordDependency(NativeGpuDiagnostics::Dependency::kVertexFallback, 0,
+                                              "unproved or GPU-owned D3D12 vertex streams");
+  }
+  for (uint32_t i = 0;
+       !native_vertex_streams_active_ && i < rex::countof(constant_map_vertex.vertex_fetch_bitmap);
+       ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
     uint32_t j;
     while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
@@ -2523,15 +2970,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Gather memexport ranges and ensure the heaps for them are resident, and
   // also load the data surrounding the export and to fill the regions that
   // won't be modified by the shaders.
-  memexport_ranges_.clear();
-  if (memexport_used_vertex) {
-    draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
-  }
-  if (memexport_used_pixel) {
-    draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
-  }
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-    if (!shared_memory_->RequestRange(memexport_range.base_address_dwords << 2,
+    if (!native_memexport_buffer_ &&
+        !shared_memory_->RequestRange(memexport_range.base_address_dwords << 2,
                                       memexport_range.size_bytes)) {
       REXGPU_ERROR(
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
@@ -2628,9 +3069,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
-    if (memexport_used) {
+    if (memexport_used && !native_memexport_buffer_) {
       shared_memory_->UseForWriting();
-    } else {
+    } else if (!native_vertex_streams_active_) {
       shared_memory_->UseForReading();
     }
     SubmitBarriers();
@@ -2687,9 +3128,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         return false;
     }
     deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
-    if (memexport_used) {
+    if (memexport_used && !native_memexport_buffer_) {
       shared_memory_->UseForWriting();
-    } else {
+    } else if (!native_vertex_streams_active_ ||
+               primitive_processing_result.index_buffer_type ==
+                   PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+               primitive_processing_result.index_buffer_type ==
+                   PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA) {
       shared_memory_->UseForReading();
     }
     SubmitBarriers();
@@ -2707,7 +3152,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // memory as a UAV.
     // TODO(Triang3l): Find some PM4 command that can be used for indication of
     // when memexports should be awaited?
-    shared_memory_->MarkUAVWritesCommitNeeded();
+    if (native_memexport_buffer_) {
+      shared_memory_->MarkNativeResolveUAVWrites(native_memexport_buffer_);
+      shared_memory_->BeginNativeResolveWrite(native_memexport_buffer_);
+    } else {
+      shared_memory_->MarkUAVWritesCommitNeeded();
+    }
     // Invalidate textures in memexported memory and watch for changes.
     if (!memexport_ranges_.empty()) {
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
@@ -2719,6 +3169,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // be unknown. Keep invalidation conservative in this case.
       shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
     }
+    if (native_memexport_buffer_ && !shared_memory_->EndNativeResolveWrite())
+      return false;
+    if (native_export_lock.owns_lock())
+      native_export_lock.unlock();
     if (IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport)) &&
         !memexport_ranges_.empty()) {
       uint32_t memexport_total_size = 0;
@@ -2745,6 +3199,37 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   return true;
 }
 
+bool D3D12CommandProcessor::DownloadNativeIndexRange(uint32_t start, std::span<uint8_t> bytes) {
+  if (!BeginSubmission(true))
+    return false;
+  auto native = shared_memory_->ComposeNativeResolveCopySource(start, uint32_t(bytes.size()));
+  if (!native)
+    return false;
+  const auto& provider = GetD3D12Provider();
+  D3D12_RESOURCE_DESC desc;
+  ui::d3d12::util::FillBufferResourceDesc(desc, bytes.size(), D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  if (FAILED(provider.GetDevice()->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(), &desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback))))
+    return false;
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyBufferRegion(readback.Get(), 0, native->resource.Get(),
+                                             start - native->address, bytes.size());
+  if (!AwaitAllQueueOperationsCompletion())
+    return false;
+  if (!BeginSubmission(true))
+    return false;
+  void* mapping = nullptr;
+  D3D12_RANGE range = {0, bytes.size()};
+  if (FAILED(readback->Map(0, &range, &mapping)))
+    return false;
+  std::memcpy(bytes.data(), mapping, bytes.size());
+  D3D12_RANGE written = {0, 0};
+  readback->Unmap(0, &written);
+  return true;
+}
+
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
   if (!total_size || memexport_ranges_.empty()) {
     return true;
@@ -2755,14 +3240,17 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_s
     return true;
   }
 
-  shared_memory_->UseAsCopySource();
-  SubmitBarriers();
-  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
   uint32_t readback_buffer_offset = 0;
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    uint32_t address = memexport_range.base_address_dwords << 2;
+    auto native = shared_memory_->GetNativeResolveCopySource(address, memexport_range.size_bytes);
+    if (!native)
+      shared_memory_->UseAsCopySource();
+    SubmitBarriers();
     deferred_command_list_.D3DCopyBufferRegion(
-        readback_buffer, readback_buffer_offset, shared_memory_buffer,
-        memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
+        readback_buffer, readback_buffer_offset,
+        native ? native->resource.Get() : shared_memory_->GetBuffer(),
+        native ? address - native->address : address, memexport_range.size_bytes);
     readback_buffer_offset += memexport_range.size_bytes;
   }
 
@@ -2850,14 +3338,17 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
     return IssueDraw_MemexportReadbackFullPath(total_size);
   }
 
-  shared_memory_->UseAsCopySource();
-  SubmitBarriers();
-  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
   uint32_t readback_offset = 0;
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    uint32_t address = memexport_range.base_address_dwords << 2;
+    auto native = shared_memory_->GetNativeResolveCopySource(address, memexport_range.size_bytes);
+    if (!native)
+      shared_memory_->UseAsCopySource();
+    SubmitBarriers();
     deferred_command_list_.D3DCopyBufferRegion(
-        readback.buffers[write_index], readback_offset, shared_memory_buffer,
-        memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
+        readback.buffers[write_index], readback_offset,
+        native ? native->resource.Get() : shared_memory_->GetBuffer(),
+        native ? address - native->address : address, memexport_range.size_bytes);
     readback_offset += memexport_range.size_bytes;
   }
   readback.submission_written[write_index] = submission_current_;
@@ -2886,7 +3377,9 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
 }
 
 void D3D12CommandProcessor::InitializeTrace() {
+  NativeGpuDiagnostics::ReadbackScope readback(native_gpu_diagnostics());
   CommandProcessor::InitializeTrace();
+  texture_cache_->InvalidateCpuTextureInputsForTrace();
 
   if (!BeginSubmission(false)) {
     return;
@@ -2906,6 +3399,9 @@ void D3D12CommandProcessor::InitializeTrace() {
 }
 
 bool D3D12CommandProcessor::IssueCopy() {
+  NativeGpuDiagnostics::RouteScope route(&native_gpu_diagnostics(),
+                                         NativeGpuDiagnostics::RouteSystem::kResolves);
+  route.Native();
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -2915,10 +3411,14 @@ bool D3D12CommandProcessor::IssueCopy() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                  written_address, written_length);
+    route.Finish(resolved);
+    return resolved;
   }
-  return IssueCopy_ReadbackResolvePath();
+  bool resolved = IssueCopy_ReadbackResolvePath();
+  route.Finish(resolved);
+  return resolved;
 }
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -3034,11 +3534,10 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
 
     ID3D12Resource* scaled_resolve_buffer = texture_cache_->GetCurrentScaledResolveBufferResource();
-    size_t scaled_resolve_buffer_index = texture_cache_->GetCurrentScaledResolveBufferIndexPublic();
     if (!scaled_resolve_buffer) {
       return true;
     }
-    uint64_t scaled_buffer_base = uint64_t(scaled_resolve_buffer_index) << 30;
+    uint64_t scaled_buffer_base = texture_cache_->GetCurrentScaledResolveBufferOriginScaled();
     if (scaled_address < scaled_buffer_base) {
       return true;
     }
@@ -3097,11 +3596,16 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     texture_cache_->TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     SubmitBarriers();
   } else {
-    shared_memory_->UseAsCopySource();
+    auto native_source =
+        shared_memory_->GetNativeResolveCopySource(written_address, written_length);
+    if (!native_source) {
+      shared_memory_->UseAsCopySource();
+    }
     SubmitBarriers();
-    ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
-    deferred_command_list_.D3DCopyBufferRegion(rb.buffers[write_index], 0, shared_memory_buffer,
-                                               written_address, written_length);
+    deferred_command_list_.D3DCopyBufferRegion(
+        rb.buffers[write_index], 0,
+        native_source ? native_source->resource.Get() : shared_memory_->GetBuffer(),
+        native_source ? written_address - native_source->address : written_address, written_length);
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
@@ -3337,6 +3841,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    edram_bindless_views_.fill({});
 
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
@@ -3391,6 +3896,9 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // Reclaim pool pages - no need to do this every small submission since some
     // may be reused.
     constant_buffer_pool_->Reclaim(frame_completed_);
+    for (auto& pool : native_vertex_upload_pools_) {
+      pool.second->Reclaim(frame_completed_);
+    }
     if (!bindless_resources_used_) {
       view_bindful_heap_pool_->Reclaim(frame_completed_);
       sampler_bindful_heap_pool_->Reclaim(frame_completed_);
@@ -3530,6 +4038,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         view_bindful_heap_pool_->ClearCache();
       }
       constant_buffer_pool_->ClearCache();
+      native_vertex_upload_pools_.clear();
+      native_vertex_buffer_ = nullptr;
+      native_vertex_streams_active_ = false;
 
       texture_cache_->ClearCache();
 
@@ -3661,8 +4172,11 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
 
   bool edram_rov_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  const bool original_resolution = render_target_cache_->IsLastUpdateOriginalResolution();
+  uint32_t draw_resolution_scale_x =
+      original_resolution ? 1u : texture_cache_->draw_resolution_scale_x();
+  uint32_t draw_resolution_scale_y =
+      original_resolution ? 1u : texture_cache_->draw_resolution_scale_y();
 
   // Get the color info register values for each render target. Also, for ROV,
   // exclude components that don't exist in the format from the write mask.
@@ -4097,6 +4611,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   uint32_t root_parameter_shared_memory_and_bindful_edram =
       bindless_resources_used_ ? kRootParameter_Bindless_SharedMemory
                                : kRootParameter_Bindful_SharedMemoryAndEdram;
+  D3D12_GPU_DESCRIPTOR_HANDLE native_vertex_descriptor = {};
+  D3D12_GPU_DESCRIPTOR_HANDLE native_export_descriptor = {};
 
   //
   // Update root constant buffers that are common for bindful and bindless.
@@ -4227,7 +4743,10 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     if (fetch_constants == nullptr) {
       return false;
     }
-    std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+    std::memcpy(fetch_constants,
+                native_vertex_streams_active_ ? native_vertex_fetch_constants_.data()
+                                              : &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+                kFetchConstantsSize);
     cbuffer_binding_fetch_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_fetch_constants);
   }
@@ -4240,6 +4759,9 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       current_shared_memory_binding_is_uav_.value() != shared_memory_is_uav) {
     current_shared_memory_binding_is_uav_ = shared_memory_is_uav;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_shared_memory_and_bindful_edram);
+    if (bindless_resources_used_) {
+      current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SharedMemoryUAV);
+    }
   }
 
   // Get textures and samplers used by the vertex shader, check if the last used
@@ -4533,9 +5055,13 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     if (write_textures_pixel) {
       view_count_partial_update += texture_count_pixel;
     }
+    uint32_t native_vertex_descriptor_count =
+        native_vertex_streams_active_ ? (edram_rov_used ? 3 : 2) : 0;
+    view_count_partial_update += native_vertex_descriptor_count;
     // Shared memory SRV and null UAV + null SRV and shared memory UAV +
     // textures.
-    size_t view_count_full_update = 4 + texture_count_vertex + texture_count_pixel;
+    size_t view_count_full_update =
+        4 + texture_count_vertex + texture_count_pixel + native_vertex_descriptor_count;
     if (edram_rov_used) {
       // + EDRAM UAV in two tables (with the shared memory SRV and with the
       // shared memory UAV).
@@ -4682,11 +5208,45 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
           ~(1u << current_graphics_root_bindful_extras_.samplers_pixel);
     }
 
+    if (native_vertex_streams_active_) {
+      native_vertex_descriptor = view_gpu_handle;
+      if (native_memexport_buffer_)
+        ui::d3d12::util::CreateBufferRawSRV(device, view_cpu_handle, nullptr, 0);
+      else
+        WriteNativeVertexSRV(view_cpu_handle);
+      view_cpu_handle.ptr += descriptor_size_view;
+      view_gpu_handle.ptr += descriptor_size_view;
+      if (native_memexport_buffer_)
+        shared_memory_->WriteNativeResolveRawUAV(native_memexport_buffer_, view_cpu_handle);
+      else
+        ui::d3d12::util::CreateBufferRawUAV(device, view_cpu_handle, nullptr, 0);
+      view_cpu_handle.ptr += descriptor_size_view;
+      view_gpu_handle.ptr += descriptor_size_view;
+      if (edram_rov_used) {
+        render_target_cache_->WriteEdramUintPow2UAVDescriptor(view_cpu_handle, 2);
+      }
+    }
+
     // Wrote new descriptors on the current page.
     draw_view_bindful_heap_index_ = view_heap_index;
     if (sampler_heap_index != ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid) {
       draw_sampler_bindful_heap_index_ = sampler_heap_index;
     }
+  }
+
+  if (bindless_resources_used_ && native_vertex_streams_active_) {
+    std::array<ui::d3d12::util::DescriptorCpuGpuHandlePair, 2> descriptors;
+    if (!RequestOneUseSingleViewDescriptors(native_memexport_buffer_ ? 2 : 1, descriptors.data())) {
+      return false;
+    }
+    if (native_memexport_buffer_) {
+      ui::d3d12::util::CreateBufferRawSRV(device, descriptors[0].first, nullptr, 0);
+      shared_memory_->WriteNativeResolveRawUAV(native_memexport_buffer_, descriptors[1].first);
+      native_export_descriptor = descriptors[1].second;
+    } else {
+      WriteNativeVertexSRV(descriptors[0].first);
+    }
+    native_vertex_descriptor = descriptors[0].second;
   }
 
   // Update the root parameters.
@@ -4719,12 +5279,14 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         (1u << root_parameter_shared_memory_and_bindful_edram))) {
     assert_true(current_shared_memory_binding_is_uav_.has_value());
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_and_bindful_edram;
-    if (bindless_resources_used_) {
-      gpu_handle_shared_memory_and_bindful_edram = provider.OffsetViewDescriptor(
-          view_bindless_heap_gpu_start_,
-          uint32_t(current_shared_memory_binding_is_uav_.value()
-                       ? SystemBindlessView ::kNullRawSRVAndSharedMemoryRawUAVStart
-                       : SystemBindlessView ::kSharedMemoryRawSRVAndNullRawUAVStart));
+    if (native_vertex_streams_active_) {
+      gpu_handle_shared_memory_and_bindful_edram = native_vertex_descriptor;
+    } else if (bindless_resources_used_) {
+      gpu_handle_shared_memory_and_bindful_edram =
+          GetSystemBindlessViewHandlePair(current_shared_memory_binding_is_uav_.value()
+                                              ? SystemBindlessView::kNullRawSRV
+                                              : SystemBindlessView::kSharedMemoryRawSRV)
+              .second;
     } else {
       gpu_handle_shared_memory_and_bindful_edram = current_shared_memory_binding_is_uav_.value()
                                                        ? gpu_handle_shared_memory_uav_and_edram_
@@ -4735,6 +5297,18 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ |= 1u << root_parameter_shared_memory_and_bindful_edram;
   }
   if (bindless_resources_used_) {
+    if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_SharedMemoryUAV))) {
+      auto descriptor =
+          native_memexport_buffer_
+              ? native_export_descriptor
+              : GetSystemBindlessViewHandlePair(current_shared_memory_binding_is_uav_.value()
+                                                    ? SystemBindlessView::kSharedMemoryRawUAV
+                                                    : SystemBindlessView::kNullRawUAV)
+                    .second;
+      deferred_command_list_.D3DSetGraphicsRootDescriptorTable(
+          kRootParameter_Bindless_SharedMemoryUAV, descriptor);
+      current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_SharedMemoryUAV;
+    }
     if (!(current_graphics_root_up_to_date_ &
           (1u << kRootParameter_Bindless_DescriptorIndicesPixel))) {
       deferred_command_list_.D3DSetGraphicsRootConstantBufferView(

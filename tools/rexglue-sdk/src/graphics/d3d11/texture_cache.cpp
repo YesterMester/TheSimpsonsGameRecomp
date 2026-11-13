@@ -13,13 +13,19 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <cstring>
 
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+
+REXCVAR_DEFINE_BOOL(d3d11_native_texture_uploads, true, "GPU/D3D11",
+                    "Upload CPU-owned texture data into resource-local native buffers without "
+                    "copying it into the guest-address compatibility buffer");
 
 namespace rex::graphics::d3d11 {
 using Microsoft::WRL::ComPtr;
@@ -445,6 +451,12 @@ void D3D11TextureCache::ClearCache() {
   load_programs_ = {};
   load_attempted_ = {};
   load_errors_ = {};
+  decode_buffer_.Reset();
+  decode_source_.Reset();
+  decode_destinations_ = {};
+  decode_constants_.Reset();
+  decode_buffer_capacity_ = 0;
+  cpu_upload_snapshot_.clear();
   last_error_.clear();
 }
 
@@ -799,6 +811,191 @@ const ShaderProgram* D3D11TextureCache::GetLoadProgram(LoadShaderIndex index, bo
 
 bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& common_texture,
                                                               bool load_base, bool load_mips) {
+  if (auto* diagnostics = native_memory_.native_diagnostics()) {
+    diagnostics->RecordDependency(NativeGpuDiagnostics::Dependency::kTextureFallback,
+                                  (load_base ? common_texture.GetGuestBaseSize() : 0) +
+                                      (load_mips ? common_texture.GetGuestMipsSize() : 0),
+                                  "decode a Direct3D 11 texture from guest-address storage");
+  }
+  return LoadTextureDataImpl(common_texture, load_base, load_mips, false);
+}
+
+bool D3D11TextureCache::CanLoadTextureDataFromCpu(const Texture& texture, bool load_base,
+                                                  bool load_mips) const {
+  const auto& key = texture.key();
+  if (!REXCVAR_GET(d3d11_native_texture_uploads) || key.scaled_resolve)
+    return false;
+  auto cpu_owned = [&](uint32_t page, uint32_t size) {
+    uint32_t address = page << 12;
+    uint64_t length = rex::align(uint64_t(size), uint64_t(16));
+    return length && length <= 128u * 1024 * 1024 &&
+           uint64_t(address) + length <= SharedMemory::kBufferSize &&
+           !native_memory_.IsRangeGpuWritten(address, uint32_t(length));
+  };
+  return (!load_base || cpu_owned(key.base_page, texture.GetGuestBaseSize())) &&
+         (!load_mips || cpu_owned(key.mip_page, texture.GetGuestMipsSize()));
+}
+
+bool D3D11TextureCache::LoadTextureDataFromCpuImpl(Texture& texture, bool load_base,
+                                                   bool load_mips) {
+  if (!CanLoadTextureDataFromCpu(texture, load_base, load_mips)) {
+    last_error_ = "Native DX11 texture source changed ownership before upload";
+    return false;
+  }
+  if (!LoadTextureDataImpl(texture, load_base, load_mips, true))
+    return false;
+  if (auto* diagnostics = native_memory_.native_diagnostics())
+    diagnostics->RecordOperation(NativeGpuDiagnostics::Operation::kCpuTextureUpload);
+  return true;
+}
+
+bool D3D11TextureCache::CanLoadTextureDataFromNativeGpu(const Texture& texture, bool load_base,
+                                                        bool load_mips) const {
+  const auto& key = texture.key();
+  bool gpu = false;
+  auto has_native_source = [&](uint32_t page, uint32_t size) {
+    uint32_t address = page << 12;
+    uint64_t aligned_length = rex::align(uint64_t(size), uint64_t(16));
+    if (!aligned_length || aligned_length > 128u * 1024 * 1024 ||
+        uint64_t(address) + aligned_length > SharedMemory::kBufferSize)
+      return false;
+    uint32_t length = uint32_t(aligned_length);
+    bool range_gpu = native_memory_.IsRangeGpuWritten(address, length);
+    gpu |= range_gpu;
+    if (key.scaled_resolve) {
+      if (!range_gpu || uint64_t(length) * draw_resolution_scale_x() * draw_resolution_scale_y() >
+                            (uint64_t(512) << 20))
+        return false;
+      if (scaled_memory_.Contains(address, length))
+        return true;
+      // A sampled layout can extend beyond the written resolve rectangle.
+      // Read() grows the native storage, retaining GPU pages and initializing
+      // the untouched padding just like the existing scaled decoder path.
+      // An unretained GPU page must still take the compatibility path.
+      constexpr uint32_t page_size = xenos::kTextureSubresourceAlignmentBytes;
+      for (uint32_t page = address & ~(page_size - 1); page < address + length; page += page_size) {
+        if (native_memory_.IsRangeGpuWritten(page, page_size) &&
+            !scaled_memory_.Contains(page, page_size))
+          return false;
+      }
+      return true;
+    }
+    // The base and mip inputs have independent ownership. CPU-only levels
+    // use an immutable snapshot, while GPU levels retain their native owners
+    // and compose any CPU gaps without allocating the address-space mirror.
+    return range_gpu ? native_memory_.CanReadNativeResolveRange(address, length)
+                     : REXCVAR_GET(d3d11_native_texture_uploads);
+  };
+  return (!load_base || has_native_source(key.base_page, texture.GetGuestBaseSize())) &&
+         (!load_mips || has_native_source(key.mip_page, texture.GetGuestMipsSize())) && gpu;
+}
+
+bool D3D11TextureCache::LoadTextureDataFromNativeGpuImpl(Texture& texture, bool load_base,
+                                                         bool load_mips) {
+  if (!CanLoadTextureDataFromNativeGpu(texture, load_base, load_mips)) {
+    last_error_ = "Native DX11 resolve source changed ownership before texture upload";
+    return false;
+  }
+  if (!LoadTextureDataImpl(texture, load_base, load_mips, false, true))
+    return false;
+  if (auto* diagnostics = native_memory_.native_diagnostics())
+    diagnostics->RecordOperation(NativeGpuDiagnostics::Operation::kGpuTextureUpload);
+  return true;
+}
+
+ComPtr<ID3D11ShaderResourceView> D3D11TextureCache::CaptureCpuTextureSource(
+    uint32_t address, uint32_t length, uint32_t element_size_log2) {
+  if (element_size_log2 < 2 || element_size_log2 > 4 || !length || length > 128u * 1024 * 1024) {
+    last_error_ = "Invalid native DX11 texture upload range";
+    return {};
+  }
+  length = rex::align(length, uint32_t(16));
+  cpu_upload_snapshot_.resize(length);
+  {
+    auto global_lock = thread::global_critical_region::AcquireDirect();
+    // A mixed GPU/CPU load does not take the common CPU-only upload path.
+    // Arm the CPU callbacks for these levels too, so later in-place writes
+    // invalidate their texture watches without making the mirror current.
+    if (!native_memory_.WatchCpuMemoryRange(address, length) ||
+        !native_memory_.CopyCpuRange(address, cpu_upload_snapshot_)) {
+      last_error_ = "Native DX11 texture upload source is not CPU-owned or could not be watched";
+      return {};
+    }
+  }
+  D3D11_BUFFER_DESC description = {};
+  description.ByteWidth = length;
+  description.Usage = D3D11_USAGE_IMMUTABLE;
+  description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  D3D11_SUBRESOURCE_DATA initial = {cpu_upload_snapshot_.data(), 0, 0};
+  ComPtr<ID3D11Buffer> buffer;
+  if (Failed(device_.device()->CreateBuffer(&description, &initial, buffer.GetAddressOf()),
+             "Native texture source"))
+    return {};
+  constexpr std::array<DXGI_FORMAT, 3> formats = {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_UINT,
+                                                  DXGI_FORMAT_R32G32B32A32_UINT};
+  D3D11_SHADER_RESOURCE_VIEW_DESC view = {};
+  view.Format = formats[element_size_log2 - 2];
+  view.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+  view.Buffer.NumElements = length >> element_size_log2;
+  ComPtr<ID3D11ShaderResourceView> source;
+  if (Failed(device_.device()->CreateShaderResourceView(buffer.Get(), &view, source.GetAddressOf()),
+             "Native texture source view"))
+    return {};
+  cpu_texture_upload_bytes_ += length;
+  if (++cpu_texture_uploads_ <= 8 || !(cpu_texture_uploads_ & 255)) {
+    REXGPU_INFO("[d3d11-native-texture] {} uploads, {} KiB, without the guest-address buffer",
+                cpu_texture_uploads_, cpu_texture_upload_bytes_ >> 10);
+  }
+  return source;
+}
+
+bool D3D11TextureCache::EnsureDecodeBuffer(uint32_t size) {
+  if (!size || size > (1u << 30)) {
+    last_error_ = "The native DX11 texture decode workspace exceeds the buffer limit";
+    return false;
+  }
+  if (decode_buffer_capacity_ >= size)
+    return true;
+  uint32_t capacity = std::bit_ceil(size);
+  D3D11_BUFFER_DESC description = {};
+  description.ByteWidth = capacity;
+  description.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+  description.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+  ComPtr<ID3D11Buffer> buffer;
+  if (Failed(device_.device()->CreateBuffer(&description, nullptr, buffer.GetAddressOf()),
+             "Native decode buffer"))
+    return false;
+  constexpr std::array<DXGI_FORMAT, 3> formats = {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_UINT,
+                                                  DXGI_FORMAT_R32G32B32A32_UINT};
+  std::array<ComPtr<ID3D11UnorderedAccessView>, 3> destinations;
+  for (uint32_t i = 0; i < destinations.size(); ++i) {
+    D3D11_UNORDERED_ACCESS_VIEW_DESC view = {};
+    view.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    view.Format = formats[i];
+    view.Buffer.NumElements = capacity >> (i + 2);
+    if (Failed(device_.device()->CreateUnorderedAccessView(buffer.Get(), &view,
+                                                           destinations[i].GetAddressOf()),
+               "Native decode buffer view"))
+      return false;
+  }
+  D3D11_SHADER_RESOURCE_VIEW_DESC view = {};
+  view.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+  view.Format = DXGI_FORMAT_R32_TYPELESS;
+  view.BufferEx.NumElements = capacity / 4;
+  view.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+  ComPtr<ID3D11ShaderResourceView> source;
+  if (Failed(device_.device()->CreateShaderResourceView(buffer.Get(), &view, source.GetAddressOf()),
+             "Native decoded buffer reads"))
+    return false;
+  decode_buffer_ = std::move(buffer);
+  decode_destinations_ = std::move(destinations);
+  decode_source_ = std::move(source);
+  decode_buffer_capacity_ = capacity;
+  return true;
+}
+
+bool D3D11TextureCache::LoadTextureDataImpl(Texture& common_texture, bool load_base, bool load_mips,
+                                            bool from_cpu, bool from_native_gpu) {
   auto& texture = static_cast<D3D11Texture&>(common_texture);
   auto key = texture.key();
   bool scaled = key.scaled_resolve;
@@ -845,50 +1042,48 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& common_te
     layouts[loop] = {uint32_t(buffer_size), uint32_t(pitch), uint32_t(plane), uint32_t(size)};
     buffer_size += size * layers;
   }
-  D3D11_BUFFER_DESC desc = {};
-  desc.ByteWidth = uint32_t(buffer_size);
-  desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-  desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-  ComPtr<ID3D11Buffer> buffer;
-  if (Failed(device_.device()->CreateBuffer(&desc, nullptr, buffer.GetAddressOf()),
-             "Native decode buffer"))
-    return false;
-  D3D11_UNORDERED_ACCESS_VIEW_DESC output_desc = {};
-  output_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-  output_desc.Format = info.dest_bpe_log2 == 2   ? DXGI_FORMAT_R32_UINT
-                       : info.dest_bpe_log2 == 3 ? DXGI_FORMAT_R32G32_UINT
-                                                 : DXGI_FORMAT_R32G32B32A32_UINT;
-  output_desc.Buffer.NumElements = uint32_t(buffer_size) >> info.dest_bpe_log2;
-  ComPtr<ID3D11UnorderedAccessView> output;
-  if (Failed(device_.device()->CreateUnorderedAccessView(buffer.Get(), &output_desc,
-                                                         output.GetAddressOf()),
-             "Native decode buffer view"))
-    return false;
-  D3D11_SHADER_RESOURCE_VIEW_DESC input_desc = {};
-  input_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
-  input_desc.Format = DXGI_FORMAT_R32_TYPELESS;
-  input_desc.BufferEx.NumElements = uint32_t(buffer_size) / 4;
-  input_desc.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
-  ComPtr<ID3D11ShaderResourceView> decoded;
-  if (Failed(device_.device()->CreateShaderResourceView(buffer.Get(), &input_desc,
-                                                        decoded.GetAddressOf()),
-             "Native decoded buffer reads"))
+  // The immediate context orders every decode and image upload. A single
+  // growing workspace can be reused without changing any retained texture.
+  if (!EnsureDecodeBuffer(uint32_t(buffer_size)))
     return false;
   draws_.Invalidate();
-  auto* destination = output.Get();
+  auto* destination = decode_destinations_[info.dest_bpe_log2 - 2].Get();
+  std::array<ComPtr<ID3D11ShaderResourceView>, 2> cpu_sources;
   for (uint32_t loop = loop_first; loop <= loop_last; ++loop) {
     uint32_t address = (loop ? key.mip_page : key.base_page) << 12;
+    uint32_t length = loop ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize();
+    bool level_from_cpu = from_cpu || (from_native_gpu && !scaled &&
+                                       !native_memory_.IsRangeGpuWritten(address, length));
     ComPtr<ID3D11ShaderResourceView> scaled_source;
+    ComPtr<ID3D11ShaderResourceView> native_source;
     if (scaled) {
-      scaled_source = scaled_memory_.Read(
-          address, loop ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize(),
-          info.source_bpe_log2, last_error_);
+      scaled_source = scaled_memory_.Read(address, length, info.source_bpe_log2, last_error_);
       if (!scaled_source)
         return false;
+    } else if (!level_from_cpu && native_memory_.CanReadNativeResolveRange(address, length)) {
+      native_source =
+          native_memory_.ReadNativeResolveRange(address, length, info.source_bpe_log2, last_error_);
+      if (!native_source)
+        return false;
+    } else if (from_native_gpu && !level_from_cpu) {
+      last_error_ = "Native DX11 texture level lost its GPU owner before decode";
+      return false;
+    }
+    if (level_from_cpu && !cpu_sources[bool(loop)]) {
+      cpu_sources[bool(loop)] = CaptureCpuTextureSource(address, length, info.source_bpe_log2);
+      if (!cpu_sources[bool(loop)])
+        return false;
+      if (from_native_gpu) {
+        if (auto* diagnostics = native_memory_.native_diagnostics())
+          diagnostics->RecordOperation(NativeGpuDiagnostics::Operation::kCpuTextureUpload);
+      }
     }
     // Expanding scaled storage may unbind the compute state to preserve old
     // ranges. Bind the decoder only after the source view has been acquired.
-    auto* source = scaled ? scaled_source.Get() : native_memory_.typed_srv(info.source_bpe_log2);
+    auto* source = level_from_cpu  ? cpu_sources[bool(loop)].Get()
+                   : scaled        ? scaled_source.Get()
+                   : native_source ? native_source.Get()
+                                   : native_memory_.typed_srv(info.source_bpe_log2);
     device_.context()->CSSetShader(program->compute(), nullptr, 0);
     device_.context()->CSSetShaderResources(0, 1, &source);
     device_.context()->CSSetUnorderedAccessViews(0, 1, &destination, nullptr);
@@ -903,7 +1098,7 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& common_te
     constants.is_tiled_3d_endian_scale =
         uint32_t(key.tiled) | (uint32_t(volume || texture.force_load_3d_tiling()) << 1) |
         (uint32_t(key.endianness) << 2) | (scale_x << 4) | (scale_y << 7);
-    constants.guest_offset = scaled ? 0 : address;
+    constants.guest_offset = (scaled || level_from_cpu || native_source) ? 0 : address;
     if (loop)
       constants.guest_offset += guest.mip_offsets_bytes[level] * scale_area;
     constants.guest_pitch_aligned = key.tiled
@@ -926,18 +1121,25 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& common_te
     for (uint32_t layer = 0; layer < layers; ++layer) {
       std::array<uint32_t, (sizeof(LoadConstants) + 15) / 16 * 4> padded = {};
       std::memcpy(padded.data(), &constants, sizeof(constants));
-      D3D11_BUFFER_DESC cb_desc = {};
-      cb_desc.ByteWidth = sizeof(padded);
-      cb_desc.Usage = D3D11_USAGE_IMMUTABLE;
-      cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-      D3D11_SUBRESOURCE_DATA cb_data = {padded.data(), 0, 0};
-      ComPtr<ID3D11Buffer> cb;
-      if (Failed(device_.device()->CreateBuffer(&cb_desc, &cb_data, cb.GetAddressOf()),
-                 "Native decode constants")) {
-        draws_.Invalidate();
-        return false;
+      if (!decode_constants_) {
+        D3D11_BUFFER_DESC cb_desc = {};
+        cb_desc.ByteWidth = sizeof(padded);
+        cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+        cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (Failed(
+                device_.device()->CreateBuffer(&cb_desc, nullptr, decode_constants_.GetAddressOf()),
+                "Native decode constants"))
+          return false;
       }
-      auto* cb_pointer = cb.Get();
+      D3D11_MAPPED_SUBRESOURCE mapping = {};
+      if (Failed(device_.context()->Map(decode_constants_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+                                        &mapping),
+                 "Native decode constants update"))
+        return false;
+      std::memcpy(mapping.pData, padded.data(), sizeof(padded));
+      device_.context()->Unmap(decode_constants_.Get(), 0);
+      auto* cb_pointer = decode_constants_.Get();
       device_.context()->CSSetConstantBuffers(0, 1, &cb_pointer);
       device_.context()->Dispatch(groups_x, groups_y, d);
       constants.guest_offset += stored.array_slice_stride_bytes * scale_area;
@@ -962,11 +1164,13 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& common_te
     transfer.width = std::max((width * scale_x) >> level, 1u);
     transfer.height = std::max((height * scale_y) >> level, 1u);
     transfer.depth_or_layers = volume ? std::max(depth >> level, 1u) : layers;
-    if (!uploader_.Upload(decoded.Get(), texture.mip_views[level].Get(), transfer, last_error_))
+    if (!uploader_.Upload(decode_source_.Get(), texture.mip_views[level].Get(), transfer,
+                          last_error_))
       return false;
     if (volume && !level) {
       transfer.depth_or_layers = 1;
-      if (!uploader_.Upload(decoded.Get(), texture.volume_slice_write.Get(), transfer, last_error_))
+      if (!uploader_.Upload(decode_source_.Get(), texture.volume_slice_write.Get(), transfer,
+                            last_error_))
         return false;
     }
   }

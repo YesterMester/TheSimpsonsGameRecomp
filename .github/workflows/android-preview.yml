@@ -1,0 +1,71 @@
+name: Android preview (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Signed ARM64 preview artifact
+    runs-on: ubuntu-24.04
+    env:
+      RECOMP_ANDROID_SIGNING_STORE_FILE: ${{ runner.temp }}/simpsons-release.keystore
+      RECOMP_ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+      RECOMP_ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+      RECOMP_ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+      RECOMP_ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare owner signing key
+        env:
+          SIGNING_STORE_BASE64: ${{ secrets.ANDROID_SIGNING_STORE_BASE64 }}
+        run: |
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          required = ['SIGNING_STORE_BASE64', 'RECOMP_ANDROID_SIGNING_STORE_PASSWORD',
+                      'RECOMP_ANDROID_SIGNING_KEY_ALIAS', 'RECOMP_ANDROID_SIGNING_KEY_PASSWORD',
+                      'RECOMP_ANDROID_SIGNING_CERT_SHA256']
+          if any(not os.environ.get(name) for name in required):
+              raise SystemExit('Configure all Android signing secrets listed in android/README.md.')
+          path = Path(os.environ['RECOMP_ANDROID_SIGNING_STORE_FILE'])
+          with path.open('xb') as stream:
+              os.chmod(path, 0o600)
+              stream.write(base64.b64decode(os.environ['SIGNING_STORE_BASE64'], validate=True))
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;29.0.14206865'
+      - name: Build and verify preview
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+          tools/android/build.sh release
+          python3 tools/android/check_apk.py android/app/build/outputs/apk/release/app-release.apk \
+            --release --build-tools "$ANDROID_HOME/build-tools/36.0.0" \
+            --readelf "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            --native-manifest android/.cxx/native-arm64/jniLibs/native-libraries.json \
+            --output android-apk-check.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Simpsons-Android-arm64-preview
+          path: |
+            android/app/build/outputs/apk/release/app-release.apk
+            android-apk-check.json
+          if-no-files-found: error
+      - name: Remove temporary signing key
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          Path(os.environ['RECOMP_ANDROID_SIGNING_STORE_FILE']).unlink(missing_ok=True)
+          PY

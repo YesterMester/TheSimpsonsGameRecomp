@@ -603,6 +603,9 @@ void Shader::GatherAluInstructionInformation(const AluInstruction& op, uint32_t 
   // they don't write to eM#).
   // Export is done to vector_dest of the ucode instruction for both vector and
   // scalar operations - no need to check separately.
+  if (instr.scalar_result.storage_target == InstructionStorageTarget::kExportAddress &&
+      (instr.scalar_result.GetUsedWriteMask() & 0b1101))
+    has_static_memexport_addresses_ = false;
   if (instr.vector_and_constant_result.storage_target == InstructionStorageTarget::kExportAddress) {
     uint32_t memexport_stream_constant = instr.GetMemExportStreamConstant();
     if (memexport_stream_constant != UINT32_MAX) {
@@ -611,6 +614,32 @@ void Shader::GatherAluInstructionInformation(const AluInstruction& op, uint32_t 
       REXGPU_ERROR(
           "ShaderTranslator::GatherAluInstructionInformation: Couldn't extract "
           "memexport stream constant index");
+    }
+    if (memexport_stream_constant == UINT32_MAX ||
+        !instr.vector_and_constant_result.IsStandardSwizzle()) {
+      has_static_memexport_addresses_ = false;
+    } else {
+      std::array<uint32_t, 6> factors;
+      for (uint32_t field = 0; field < 3; ++field) {
+        uint32_t component = field ? field + 1 : 0;
+        for (uint32_t source = 0; source < 2; ++source) {
+          const auto& operand = instr.vector_operands[source];
+          auto swizzle = operand.GetComponent(component);
+          uint32_t factor = UINT32_MAX - 1;
+          if (swizzle == SwizzleSource::k0) {
+            factor = UINT32_MAX;
+          } else if (swizzle <= SwizzleSource::kW &&
+                     operand.storage_source == InstructionStorageSource::kConstantFloat &&
+                     operand.storage_addressing_mode ==
+                         InstructionStorageAddressingMode::kAbsolute) {
+            factor = operand.storage_index * 4 + uint32_t(swizzle);
+          }
+          factors[field * 2 + source] = factor;
+        }
+        if (factors[field * 2] == UINT32_MAX - 1 && factors[field * 2 + 1] == UINT32_MAX - 1)
+          has_static_memexport_addresses_ = false;
+      }
+      memexport_address_zero_factors_.push_back(factors);
     }
   }
 }

@@ -1,4 +1,5 @@
 #include <rex/graphics/d3d11/draw_context.h>
+#include <rex/graphics/d3d11/constant_buffer.h>
 #include <rex/graphics/d3d11/sampler_cache.h>
 
 #include <algorithm>
@@ -106,12 +107,31 @@ void ExactPixels(D3D11Device& owner, ID3D11Texture2D* texture, uint32_t subresou
   D3D11_MAPPED_SUBRESOURCE mapped;
   Check(owner.context()->Map(staging.Get(), subresource, D3D11_MAP_READ, 0, &mapped), "Draw map");
   bool exact = true;
+  std::string difference;
   for (uint32_t y = 0; y < height; ++y) {
-    exact &= !std::memcmp(static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch,
-                          static_cast<const uint8_t*>(expected) + y * row_bytes, row_bytes);
+    auto* actual_row = static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch;
+    auto* expected_row = static_cast<const uint8_t*>(expected) + y * row_bytes;
+    for (uint32_t x = 0; x < row_bytes; ++x) {
+      if (actual_row[x] != expected_row[x]) {
+        if (difference.empty())
+          difference = " at row " + std::to_string(y) + ", byte " + std::to_string(x) + ": got " +
+                       std::to_string(actual_row[x]) + ", expected " +
+                       std::to_string(expected_row[x]);
+        if (difference.size() < 300) {
+          for (uint32_t n = x & ~uint32_t(15); n < std::min(row_bytes, (x & ~uint32_t(15)) + 16);
+               ++n)
+            difference +=
+                " [" + std::to_string(actual_row[n]) + "/" + std::to_string(expected_row[n]) + "]";
+        }
+        exact = false;
+        break;
+      }
+    }
   }
   owner.context()->Unmap(staging.Get(), subresource);
-  Require(exact, "Native draw pixels differ from the independent reference");
+  if (!exact)
+    throw std::runtime_error("Native draw pixels differ from the independent reference" +
+                             difference);
 }
 
 struct Results {
@@ -126,6 +146,8 @@ struct Results {
   uint32_t sampler_draws = 0;
   uint64_t discard_vertex_invocations = 0;
   uint64_t discard_geometry_invocations = 0;
+  uint32_t constant_draws = 0, constant_appends = 0, constant_discards = 0;
+  uint32_t constant_reuses = 0, constant_range_rejections = 0;
 };
 
 void CheckAlternatingFrames(D3D11Device& owner, ShaderCache& shaders, BufferCache& buffers,
@@ -746,6 +768,165 @@ float4 main(float4 p : SV_Position) : SV_Target {
   ++results.hazards;
 }
 
+void CheckConstantUploads(D3D11Device& owner, ShaderCache& shaders, BufferCache& buffers,
+                          DrawContext& context, Results& results) {
+  constexpr uint32_t draws = 2049;
+  bool supports_ranges = ConstantBuffer::SupportsRanges(owner);
+  for (bool ranged : {false, true}) {
+    if (ranged && !supports_ranges)
+      continue;
+    std::string declaration = ranged ? "uint4 values[16];" : "uint4 values[2];";
+    std::string vertex_source = "cbuffer V:register(b0) {" + declaration + R"(};
+cbuffer C:register(b1) {uint4 flags;};
+struct O {float4 position:SV_Position; nointerpolation uint value:TEXCOORD0;};
+O main(uint id:SV_VertexID) {
+ O o; o.position=float4(id==0?float2(-1,-1):id==1?float2(-1,3):float2(3,-1),0.5,1);
+ o.value=values[0].x ^ (flags.x ? values[flags.w].x : 0); return o;
+})";
+    std::string pixel_source = "cbuffer P:register(b0) {" + declaration + R"(};
+cbuffer C:register(b1) {uint4 flags;};
+uint4 main(float4 position:SV_Position, nointerpolation uint value:TEXCOORD0):SV_Target {
+ return uint4(value ^ uint(position.y),values[0].x,values[1].x,
+  (values[flags.z].w | (flags.x ? values[flags.w].x : 0)) ^ flags.y);
+})";
+    auto* vertex = Program(shaders, vertex_source.c_str(), "vs_5_1");
+    auto* pixel = Program(shaders, pixel_source.c_str(), "ps_5_1");
+    const std::array<uint32_t, 4> range_flags = {1, 0x145A40F3, ranged ? 15u : 1u,
+                                                 ranged ? 16u : 2u};
+    const std::array<uint32_t, 4> whole_flags = {0, 0xC8762103, ranged ? 15u : 1u, 0};
+    auto flags_range =
+        Buffer(buffers, range_flags.data(), sizeof(range_flags), BufferKind::kConstant);
+    auto flags_whole =
+        Buffer(buffers, whole_flags.data(), sizeof(whole_flags), BufferKind::kConstant);
+    auto texture = CreateTexture(owner, draws, 1, DXGI_FORMAT_R32G32B32A32_UINT);
+    ID3D11RenderTargetView* target = texture.rtv.Get();
+    ConstantBuffer vertex_data, pixel_data;
+    std::array<uint8_t, 17> vbytes = {}, pbytes = {};
+    std::vector<std::array<uint32_t, 4>> expected;
+    uint32_t vvalue = 0, pvalue = 0, base_v = 0, base_p = 0, base_extra = 0;
+    for (uint32_t i = 0; i < draws; ++i) {
+      bool unchanged = i && !(i % 13);
+      if (!unchanged) {
+        vvalue = 0xA135976B ^ (i * 0x9E3779B9u);
+        pvalue = 0x61BC0783 + i * 37;
+        std::memcpy(vbytes.data(), &vvalue, 4);
+        std::memcpy(pbytes.data(), &pvalue, 4);
+        pbytes[16] = uint8_t(i * 13 + 7);
+      }
+      std::string error;
+      auto v = vertex_data.Upload(owner, vbytes, ranged ? 16384 : 0, error);
+      auto p = pixel_data.Upload(owner, pbytes, ranged ? 16384 : 0, error);
+      Require(v != ConstantBuffer::Update::kFailed && p != ConstantBuffer::Update::kFailed,
+              "Native constant upload failed");
+      if (unchanged) {
+        Require(v == ConstantBuffer::Update::kUnchanged && p == ConstantBuffer::Update::kUnchanged,
+                "Unchanged constant data was uploaded again");
+        results.constant_reuses += 2;
+      }
+      if (v == ConstantBuffer::Update::kDiscard)
+        base_v = vvalue;
+      if (p == ConstantBuffer::Update::kDiscard) {
+        base_p = pvalue;
+        base_extra = pbytes[16];
+      }
+      for (auto update : {v, p}) {
+        results.constant_appends += update == ConstantBuffer::Update::kAppend;
+        results.constant_discards += update == ConstantBuffer::Update::kDiscard;
+      }
+      if (ranged)
+        Require(vertex_data.capacity() == 16384 && pixel_data.capacity() == 16384,
+                "Supported constant ranges fell back unexpectedly");
+      bool whole = ranged && i % 7 == 3;
+      bool control = i % 17 != 9;
+      auto* flags = whole ? flags_whole->buffer() : flags_range->buffer();
+      std::array<ID3D11Buffer*, 2> vb = {vertex_data.buffer(), flags};
+      std::array<ID3D11Buffer*, 2> pb = {pixel_data.buffer(), flags};
+      std::array<uint32_t, 2> vf = {vertex_data.first(), 0}, pf = {pixel_data.first(), 0};
+      std::array<uint32_t, 2> vc = {vertex_data.count(), 4096}, pc = {pixel_data.count(), 4096};
+      uint32_t slots = control ? 2 : 1;
+      DrawCommand command;
+      command.programs[kVertex] = vertex;
+      command.programs[kPixel] = pixel;
+      command.bindings[kVertex].constants = {vb.data(), slots};
+      command.bindings[kPixel].constants = {pb.data(), slots};
+      if (ranged && !whole) {
+        command.bindings[kVertex].constant_first = {vf.data(), slots};
+        command.bindings[kVertex].constant_count = {vc.data(), slots};
+        command.bindings[kPixel].constant_first = {pf.data(), slots};
+        command.bindings[kPixel].constant_count = {pc.data(), slots};
+      }
+      command.render_targets = {&target, 1};
+      command.state = DrawState::Default(draws, 1);
+      command.state.viewport = {float(i), 0, 1, 1, 0, 1};
+      command.state.scissor = {LONG(i), 0, LONG(i + 1), 1};
+      command.topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+      command.count = 3;
+      if (!(i % 137))
+        context.Invalidate();
+      Draw(context, command);
+      expected.push_back({whole ? base_v : vvalue, whole ? base_p : pvalue,
+                          whole ? base_extra : uint32_t(pbytes[16]),
+                          control ? (whole ? whole_flags[1] : range_flags[1]) : 0});
+      if (ranged && i == draws - 1) {
+        // Reject malformed windows without changing the already queued draw.
+        command.bindings[kVertex].constant_first = {vf.data(), slots};
+        command.bindings[kVertex].constant_count = {vc.data(), slots};
+        uint32_t saved = vf[0];
+        vf[0] = 1;
+        Require(!context.Draw(command, error), "Misaligned constant offset was accepted");
+        vf[0] = saved;
+        saved = vc[0];
+        vc[0] = 4112;
+        Require(!context.Draw(command, error), "Oversized constant window was accepted");
+        vc[0] = saved;
+        command.bindings[kVertex].constant_count = {};
+        Require(!context.Draw(command, error), "An incomplete constant window was accepted");
+        results.constant_range_rejections += 3;
+      }
+    }
+    // Only read back after all wraps: queued commands must retain old discard versions.
+    try {
+      ExactPixels(owner, texture.texture.Get(), 0, expected.data(), draws * 16, 1);
+    } catch (const std::exception& error) {
+      throw std::runtime_error(std::string(ranged ? "Ranged constants: " : "Legacy constants: ") +
+                               error.what());
+    }
+    results.constant_draws += draws;
+    results.words += uint64_t(draws) * 4;
+    context.Clear();
+  }
+  // Above the append-page limit, exact-size buffers retain the legacy path.
+  ConstantBuffer large;
+  std::vector<uint8_t> data(65535, 0xAB), expected = data;
+  expected.push_back(0);
+  std::string error;
+  Require(large.Upload(owner, data, 16384, error) == ConstantBuffer::Update::kDiscard &&
+              !large.capacity(),
+          "A large constant input used an undersized append page");
+  D3D11_BUFFER_DESC desc = {};
+  large.buffer()->GetDesc(&desc);
+  Require(desc.ByteWidth == 65536, "The largest constant payload lost its alignment padding");
+  desc.Usage = D3D11_USAGE_STAGING;
+  desc.BindFlags = 0;
+  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ComPtr<ID3D11Buffer> staging;
+  Check(owner.device()->CreateBuffer(&desc, nullptr, staging.GetAddressOf()),
+        "Large constant readback");
+  owner.context()->CopyResource(staging.Get(), large.buffer());
+  Check(owner.WaitForCompletion(), "Large constant completion");
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  Check(owner.context()->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Large constant map");
+  bool exact = std::memcmp(mapped.pData, expected.data(), expected.size()) == 0;
+  owner.context()->Unmap(staging.Get(), 0);
+  Require(exact, "The largest constant payload or its zero padding changed");
+  Require(large.Upload(owner, {}, 16384, error) == ConstantBuffer::Update::kFailed,
+          "An empty constant input was accepted");
+  data.resize(65537);
+  Require(large.Upload(owner, data, 16384, error) == ConstantBuffer::Update::kFailed,
+          "An oversized constant input was accepted");
+  results.words += 65536 / 4;
+}
+
 void CheckDebugMessages(D3D11Device& owner) {
   ComPtr<ID3D11InfoQueue> queue;
   if (FAILED(owner.device()->QueryInterface(IID_PPV_ARGS(queue.GetAddressOf()))))
@@ -785,6 +966,7 @@ float4 main(uint id : SV_VertexID) : SV_Position {
   CheckSamplers(owner, shaders, context, results, vertex);
   CheckReadOnlyDepth(owner, shaders, context, results, vertex);
   statistics = context.statistics();
+  CheckConstantUploads(owner, shaders, buffers, context, results);
   Require(statistics.explicit_resource_unbinds >= 62,
           "Native resource transitions were not exercised");
   context.Clear();
@@ -828,6 +1010,13 @@ int main(int argc, char** argv) {
     report += "  \"graphics_uav_draws\": " + std::to_string(result.uav_draws) + ",\n";
     report += "  \"exact_words\": " + std::to_string(result.words) + ",\n";
     report += "  \"sampler_draws\": " + std::to_string(result.sampler_draws) + ",\n";
+    report += "  \"constant_draws\": " + std::to_string(result.constant_draws) + ",\n";
+    report += "  \"constant_appends\": " + std::to_string(result.constant_appends) + ",\n";
+    report += "  \"constant_discards\": " + std::to_string(result.constant_discards) + ",\n";
+    report += "  \"constant_reuses\": " + std::to_string(result.constant_reuses) + ",\n";
+    report +=
+        "  \"constant_range_rejections\": " + std::to_string(result.constant_range_rejections) +
+        ",\n";
     report +=
         "  \"discard_vertex_invocations\": " + std::to_string(result.discard_vertex_invocations) +
         ",\n";

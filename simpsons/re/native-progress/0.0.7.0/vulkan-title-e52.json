@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "backend": "vulkan",
+  "strict": false,
+  "complete": true,
+  "failed": false,
+  "frames": 1079,
+  "dependencies": {
+    "edram": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "memory_mirror": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "scaled_mirror_read": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "scaled_mirror_write": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "resolve_fallback": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "vertex_fallback": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "texture_fallback": {"calls": 0, "bytes": 0, "first_detail": ""}
+  },
+  "operations": {
+    "vertex_streams": 3365345,
+    "cpu_texture_upload": 49,
+    "gpu_texture_upload": 2,
+    "resolve": 2157,
+    "alias_transfer": 0,
+    "native_draw_call": 3367526,
+    "legacy_draw_packet": 0
+  },
+  "allocations": {
+    "edram": {"calls": 0, "virtual_bytes": 0, "resident_bytes": 0},
+    "memory_mirror": {"calls": 0, "virtual_bytes": 0, "resident_bytes": 0},
+    "scaled_mirror": {"calls": 0, "virtual_bytes": 0, "resident_bytes": 0}
+  },
+  "diagnostic_readback": {"calls": 8, "bytes": 11304960, "allocations": 5, "virtual_bytes": 547356672, "resident_bytes": 27262976},
+  "route_coverage": {"version": 1, "systems": {
+    "draw_dispatch": {"attempts": 3367526, "in_flight": 0, "native": 3367526, "retained": 0, "mixed": 0, "failed": 0, "skipped": 0, "unclassified": 0},
+    "geometry": {"attempts": 3365345, "in_flight": 0, "native": 3365345, "retained": 0, "mixed": 0, "failed": 0, "skipped": 0, "unclassified": 0},
+    "textures": {"attempts": 51, "in_flight": 0, "native": 51, "retained": 0, "mixed": 0, "failed": 0, "skipped": 0, "unclassified": 0},
+    "resolves": {"attempts": 2157, "in_flight": 0, "native": 2157, "retained": 0, "mixed": 0, "failed": 0, "skipped": 0, "unclassified": 0},
+    "shader_commands": {"attempts": 10127186, "in_flight": 0, "native": 10116449, "retained": 10737, "mixed": 0, "failed": 0, "skipped": 0, "unclassified": 0},
+    "synchronization": {"attempts": 3453598, "in_flight": 0, "native": 3444820, "retained": 8778, "mixed": 0, "failed": 0, "skipped": 0, "unclassified": 0},
+    "submission": {"attempts": 53691, "in_flight": 0, "native": 53687, "retained": 4, "mixed": 0, "failed": 0, "skipped": 0, "unclassified": 0},
+    "presentation": {"attempts": 1079, "in_flight": 0, "native": 1079, "retained": 0, "mixed": 0, "failed": 0, "skipped": 0, "unclassified": 0},
+    "state_commands": {"attempts": 20448724, "in_flight": 0, "native": 20356284, "retained": 92440, "mixed": 0, "failed": 0, "skipped": 0, "unclassified": 0},
+    "queries": {"attempts": 0, "in_flight": 0, "native": 0, "retained": 0, "mixed": 0, "failed": 0, "skipped": 0, "unclassified": 0},
+    "other_commands": {"attempts": 13582267, "in_flight": 0, "native": 0, "retained": 1082, "mixed": 0, "failed": 0, "skipped": 13581185, "unclassified": 0},
+    "host_presentation": {"attempts": 1079, "in_flight": 0, "native": 1072, "retained": 0, "mixed": 0, "failed": 7, "skipped": 0, "unclassified": 0}
+  }}
+}

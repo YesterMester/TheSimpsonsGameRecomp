@@ -1,0 +1,6 @@
+{
+  "title": "My first mod",
+  "count": "Times used: {count}",
+  "action": "Run my action",
+  "message": "My mod action ran."
+}

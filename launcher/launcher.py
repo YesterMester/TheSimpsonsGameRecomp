@@ -36,19 +36,45 @@ import zipfile
 import zlib
 from pathlib import Path
 
+if __package__:
+    from . import mod_packages
+    from . import mod_projects
+    from . import modkit_process
+    from . import steam_shortcut
+    from . import xiso_extract
+else:
+    try:
+        import mod_packages
+        import mod_projects
+        import modkit_process
+        import steam_shortcut
+        import xiso_extract
+    except ModuleNotFoundError:
+        # A launcher from before 0.0.7.0 updates launcher.py and ui/ but adds
+        # none of the modules that came later. Linux packages keep a copy of
+        # them in ui/modules so the launcher still starts after that update
+        # and can then fetch the files the old updater left out.
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "ui" / "modules"))
+        import mod_packages
+        import mod_projects
+        import modkit_process
+        import steam_shortcut
+        import xiso_extract
+
 # Dev-tree fallback only: release.yml stamps the real release tag over this
 # at build time, so packaged builds always know exactly which release they
 # are (otherwise every launcher shipped inside vX.Y.Z.W would compare itself
 # against its own release and nag "update available" forever).
-VERSION = "0.0.6.5"
+VERSION = "0.0.7.0"
+MODKIT_APP = "--modkit" in sys.argv
 
 FROZEN = getattr(sys, "frozen", False)
 if FROZEN:
-    # Packaged .exe: the launcher lives in a flat release directory next to
-    # simpsons.exe / extract-xiso.exe / gamedata/. The web UI is bundled and
-    # unpacked to PyInstaller's temp dir (sys._MEIPASS).
+    # Windows keeps the executable beside the game. Linux keeps it inside
+    # launcher/ so settings and backups stay in the same place after updates.
+    # The bundled UI is unpacked to PyInstaller's temp dir (sys._MEIPASS).
     LAUNCHER_DIR = Path(sys.executable).resolve().parent
-    ROOT = LAUNCHER_DIR
+    ROOT = LAUNCHER_DIR.parent if sys.platform == "linux" else LAUNCHER_DIR
     UI_DIR = Path(getattr(sys, "_MEIPASS", LAUNCHER_DIR)) / "ui"
 else:
     LAUNCHER_DIR = Path(__file__).resolve().parent
@@ -117,15 +143,46 @@ POPEN_NO_WINDOW = ({"creationflags": subprocess.CREATE_NO_WINDOW}
                    if PLAT == "Windows" else {})
 
 
+def external_environment():
+    """Use the player's libraries for programs outside the launcher bundle."""
+    env = os.environ.copy()
+    if FROZEN and PLAT == "Linux":
+        original = env.get("LD_LIBRARY_PATH_ORIG")
+        if original is None:
+            env.pop("LD_LIBRARY_PATH", None)
+        else:
+            env["LD_LIBRARY_PATH"] = original
+        bundle = str(getattr(sys, "_MEIPASS", ""))
+        for name in ("QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QML2_IMPORT_PATH",
+                     "QTWEBENGINEPROCESS_PATH"):
+            if bundle and bundle in env.get(name, ""):
+                env.pop(name, None)
+    return env
+
+
+def extractor_environment():
+    env = external_environment()
+    if PLAT == "Windows":
+        runtime = EXTRACT_XISO.parent
+        if not (runtime / "VCRUNTIME140.dll").is_file():
+            runtime = runtime / "extract-xiso-runtime"
+        if (runtime / "VCRUNTIME140.dll").is_file():
+            env["PATH"] = str(runtime) + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def _resolve(p):
     p = Path(p)
     return p if p.is_absolute() else ROOT / p
 
 
-if FROZEN:
+if FROZEN and PLAT == "Windows":
     # Flat release layout: game binary and tools sit beside the launcher.
     GAME_BIN = ROOT / ("simpsons.exe" if PLAT == "Windows" else "simpsons")
     EXTRACT_XISO = ROOT / ("extract-xiso.exe" if PLAT == "Windows" else "extract-xiso")
+    isolated_extractor = ROOT / "extract-xiso-runtime/extract-xiso.exe"
+    if isolated_extractor.is_file():
+        EXTRACT_XISO = isolated_extractor
 else:
     GAME_BIN = _resolve(CONFIG["engine"].get(PLAT, CONFIG["engine"]["Linux"]))
     EXTRACT_XISO = _resolve(CONFIG["extract_xiso"].get(PLAT, CONFIG["extract_xiso"]["Linux"]))
@@ -229,7 +286,7 @@ def set_capture(enable):
     return True, "Capture disarmed."
 
 
-SETTINGS_VERSION = 4
+SETTINGS_VERSION = 6
 SETTINGS_VERSION_MARKER = "# settings_version ="
 SETTINGS_DEFAULT_MIGRATIONS = (
     # The v1 migration moved everyone from "none" to the then-new FXAA default.
@@ -241,6 +298,8 @@ SETTINGS_DEFAULT_MIGRATIONS = (
     # old "fsi" hand patch; move them over once, and the Renderer setting can
     # still pick "fsi" deliberately afterwards.
     (3, "render_target_path_vulkan", "fsi"),
+    # v6 makes native GPU API calls the default in the launcher and runtime.
+    (6, "native_gpu_calls", False),
 )
 # The same for the runtime defaults kept outside the managed block (see
 # write_settings): a stored value still equal to the default it supersedes is
@@ -248,6 +307,11 @@ SETTINGS_DEFAULT_MIGRATIONS = (
 RUNTIME_DEFAULT_MIGRATIONS = (
     # v4 turned on copy-free resolves, whose old-frame flicker kept them off.
     (4, "native_resolve_copy_free", "false"),
+    # Return existing installs to the verified resolve path. Native GPU
+    # buffers and image copies stay enabled; these two shortcuts need more
+    # driver qualification before becoming launcher defaults.
+    (5, "native_resolve_copy_free", "true"),
+    (5, "native_buffer_write_watches", "true"),
 )
 
 # key -> (type, default, needs_restart)
@@ -334,10 +398,11 @@ SETTINGS_SCHEMA = {
         "keybind_rstick_left": "",
         "keybind_rstick_right": "",
     }.items()},
-    # Keys that open the in-game overlays (one key each). The runtime keeps
-    # these until the overlays register, so a saved key survives a restart.
+    # Keys that open in-game menus and overlays (one key each). The runtime
+    # keeps these until they register, so a saved key survives a restart.
     **{k: ("str", d, False) for k, d in {
         "bind_controls": "F1",
+        "bind_debug_menu": "F2",
         "bind_settings": "F4",
         "bind_debug_overlay": "F3",
         "bind_console": "Backtick",
@@ -346,9 +411,12 @@ SETTINGS_SCHEMA = {
     }.items()},
     # game
     "user_language": ("int", 1, True),
+    "mods_language": ("str", "", True),
     # Always show subtitles, even in a new game's first cutscene (the engine
     # then overrides the in-game option, so it starts off).
     "subtitles": ("bool", False, True),
+    "cutscene_skip": ("bool", True, True),
+    "freeroam_coop": ("bool", True, True),
     # graphics backend: "" = automatic (Vulkan first, D3D12 fallback on
     # Windows), "vulkan", "d3d12" or the experimental "d3d11" (Windows) to
     # force one. Chosen at startup.
@@ -357,9 +425,15 @@ SETTINGS_SCHEMA = {
     # renderer: "native" = GPU render targets; "fsi" = Xbox EDRAM emulated in
     # the pixel shader (accurate fallback). Vulkan only; chosen at startup.
     "render_target_path_vulkan": ("str", "native", True),
+    # Native GPU API calls (simpsons/src/native_gpu_calls.cpp): direct native
+    # draw builders, bounded state flushes, and fast vertex/constant paths.
+    "native_gpu_calls": ("bool", True, True),
     # audio
     "audio_mute": ("bool", False, False),
     "audio_maxqframes": ("int", 32, True),
+    # Centre (dialogue) channel level when the 5.1 mix is folded to stereo:
+    # 1 = the Xbox 360's own mix, higher = clearer voices.
+    "audio_dialogue_level": ("float", 1.0, True),
 }
 
 # Kept in the launcher so updates from older launchers, which preserve
@@ -369,6 +443,7 @@ SETTINGS_SCHEMA = {
 RUNTIME_DEFAULTS = {
     "gpu_allow_invalid_fetch_constants": False,
     "gpu_shader_max_cf_iterations": 0,
+    "native_gpu_calls": True,
     "native_index_buffers": True,
     "native_vertex_buffers": True,
     "native_texture_uploads": True,
@@ -386,7 +461,7 @@ RUNTIME_DEFAULTS = {
     "native_resolve_buffer_texture_first": True,
     "native_buffer_write_watches": False,
     "native_vertex_cache_check_order": False,
-    "native_resolve_copy_free": True,
+    "native_resolve_copy_free": False,
     "frame_pacing_vblank_lock": False,
 }
 # Sleeping in timer queues between deadlines was checked against the audio
@@ -405,7 +480,7 @@ game_proc_lock = threading.Lock()
 game_proc = None
 install_state = {"running": False, "log": [], "ok": None}
 update_state = {"checked": False, "msg": "", "update_available": False, "download_url": None,
-                "latest_tag": "", "applying": False, "apply_msg": ""}
+                "latest_tag": "", "applying": False, "apply_msg": "", "repair": False}
 
 
 # ----------------------------------------------------------------- settings
@@ -480,6 +555,10 @@ def write_settings(new_values):
         typ = SETTINGS_SCHEMA[k][0]
         values[k] = (bool(v) if typ == "bool" else str(v) if typ == "str"
                      else float(v) if typ == "float" else int(v))
+    language = values["mods_language"].strip()
+    if language and not re.fullmatch(r"[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8}){0,3}", language):
+        raise ValueError("Use a mod language code such as fr or pt-BR")
+    values["mods_language"] = language.lower().replace("_", "-")
     lines = []
     if GAME_TOML.exists():
         text = GAME_TOML.read_text(encoding="utf-8")
@@ -604,6 +683,19 @@ def patch_skip_intro(enable):
 # Chocolate). Moving that call makes new games start elsewhere; games in
 # progress keep their own progress. The untouched file is kept beside it as
 # simpsons_gameflow.lua.original while another episode is chosen.
+#
+# Progress before the start episode, after frankyfife's fork (commit 8da8827f):
+# the game tracks the story in scores (simpsons_scores.lua), and its episode
+# cheat, SCORE_EVENT_<episode>_CHEAT, marks every earlier episode complete.
+# Chaining that cheat to the start of the chosen episode gives a new game the
+# progress it would have had (a game started in Springfield can then leave the
+# house). An episode's _START event only fires as that episode begins, when an
+# ordinary save has its earlier episodes complete anyway, so other saves are
+# unaffected; the cheat's best-time value (362340 s) never beats a real time.
+# Springfield has no cheat of its own: Bartman Begins', which it unlocks,
+# marks Land of Chocolate complete. Not the video game hub: both hubs start
+# with the shared SCORE_EVENT_RESTART_GAME_TIME, so a chain there would mark
+# Bargain Bin and everything before it complete in any save entering Springfield.
 GAMEFLOW_LUA = "simpsons_gameflow.lua"
 EPISODE_NAMES = {
     "SPR_HUB": "Springfield (hub)",
@@ -673,8 +765,20 @@ def start_episode_options():
             for e, _, _ in _episodes(text)]
 
 
-def _episode_text(original, episode_id):
-    """Move the default call, preserving the untouched file's bytes and newlines."""
+def _start_progress_events(episode_id):
+    """(the event the episode starts with, the cheat to chain to it), or None."""
+    if episode_id == "SPR_HUB":
+        return "SCORE_EVENT_RESTART_GAME_TIME", "SCORE_EVENT_BARTMAN_BEGINS_CHEAT"
+    if episode_id in ("GAME_HUB", "LAND_OF_CHOCOLATE"):
+        return None
+    return f"SCORE_EVENT_{episode_id}_START", f"SCORE_EVENT_{episode_id}_CHEAT"
+
+
+def _episode_text(original, episode_id, progress=True):
+    """Move the default call, preserving the untouched file's bytes and newlines.
+
+    progress=False gives the text launchers before 0.0.7.0 wrote, without the
+    earlier episodes' progress, which is still accepted as the launcher's own."""
     if episode_id == _start_episode_of(original):
         return original
     newline = "\r\n" if "\r\n" in original else "\n"
@@ -688,8 +792,18 @@ def _episode_text(original, episode_id):
         line_end = len(text)
     else:
         line_end += 1
-    text = (text[:line_end] + f"{match.group(1)}episode:SetDefault()  -- start episode chosen in the launcher"
-            + newline + text[line_end:])
+    lines = ["episode:SetDefault()  -- start episode chosen in the launcher"]
+    events = _start_progress_events(episode_id) if progress else None
+    if events:
+        trigger, cheat = events
+        lines += ["-- the episodes before it count as done, as with the game's episode cheat",
+                  "local launcherStart = ScoreKeeper ~= nil and ScoreKeeper:GetScoreKeeper() or nil",
+                  f'launcherStart = launcherStart and launcherStart:FindEvent("{trigger}")',
+                  "if launcherStart ~= nil then",
+                  f'\tlauncherStart:AddEventOp("{cheat}")',
+                  "end"]
+    text = (text[:line_end] + "".join(match.group(1) + line + newline for line in lines)
+            + text[line_end:])
     if _start_episode_of(text) != episode_id or len(_SET_DEFAULT_RE.findall(text)) != 1:
         raise ValueError("could not move the start episode")
     return text
@@ -725,7 +839,8 @@ def set_start_episode(episode_id):
             if backup.is_file():
                 current = _read_lua(lua)
                 selected = _start_episode_of(current)
-                if selected not in episodes or current != _episode_text(original, selected):
+                if selected not in episodes or current not in (
+                        _episode_text(original, selected), _episode_text(original, selected, progress=False)):
                     return False, "gameflow was edited outside the launcher; original backup kept"
             text = _episode_text(original, episode_id)
             if episode_id == original_start:
@@ -775,6 +890,10 @@ def patches_list():
         {"id": "skip_intro", "name": "Skip intro logo videos",
          "desc": "Boots straight past the EA / Fox / Gracie logo movies.",
          "state": patch_skip_intro_state(), "available": patch_skip_intro_state() != "unavailable"},
+        {"id": "cutscene_skip", "name": "Skip cutscenes",
+         "desc": "Tap a button to show the skip prompt. B (or your current input's equivalent) "
+                 "opens an in-game confirmation. Takes effect next launch.",
+         "state": "on" if read_settings()["cutscene_skip"] else "off", "available": True},
         {"id": "start_episode", "name": "Start episode (level select)",
          "desc": "New games start in the chosen episode, skipping the ones before it. Games "
                  "already in progress keep their progress. Takes effect the next time the game "
@@ -791,12 +910,51 @@ def patches_list():
 # ------------------------------------------------------------------ status
 
 def game_running_pids():
+    if game_proc and game_proc.poll() is None:
+        own = [game_proc.pid]
+    else:
+        own = []
+    if PLAT == "Windows":
+        # Both desktop applications must observe the same native process.
+        # pgrep is unavailable on a normal Windows installation.
+        return sorted(set(own + modkit_process.windows_game_pids(GAME_BIN)))
+    if PLAT == "Linux":
+        return sorted(set(own + modkit_process.linux_game_pids(GAME_BIN)))
     try:
-        out = subprocess.run(["pgrep", "-f", str(GAME_BIN)], capture_output=True, text=True,
+        out = subprocess.run(["pgrep", "-x", GAME_BIN.name[:15]], capture_output=True, text=True,
                              **POPEN_NO_WINDOW)
-        return [int(p) for p in out.stdout.split()]
+        found = []
+        for item in out.stdout.split():
+            try:
+                if os.path.samefile(Path('/proc') / item / 'exe', GAME_BIN):
+                    found.append(int(item))
+            except (OSError, ValueError):
+                continue
+        return sorted(set(own + found))
     except Exception:
-        return []
+        return own
+
+
+def open_modkit(identifier=None):
+    if identifier is not None and (not isinstance(identifier, str) or not mod_packages.ID.fullmatch(identifier)):
+        return False, "Choose a valid project id."
+    if FROZEN:
+        entry = LAUNCHER_DIR / ("simpsons-modkit.exe" if PLAT == "Windows" else "simpsons-modkit")
+        command = [str(entry)] if entry.is_file() else [sys.executable, "--modkit"]
+    else:
+        command = [sys.executable, str(Path(__file__).resolve()), "--modkit"]
+    if identifier:
+        command += ["--project", identifier]
+    try:
+        environment = external_environment()
+        # The apps have independent lifetimes. Reusing a onefile parent's
+        # extraction directory would remove the kit's Qt files on launcher exit.
+        environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        subprocess.Popen(command, cwd=LAUNCHER_DIR, env=environment,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **POPEN_NO_WINDOW)
+        return True, "Opened Modkit."
+    except OSError as error:
+        return False, "Could not open Modkit: " + str(error)
 
 
 def _find_ci(directory, name, *, folder=False):
@@ -846,7 +1004,76 @@ art_state = {"running": False}
 
 def list_mods():
     MODS_DIR.mkdir(exist_ok=True)
-    return sorted(p.name for p in MODS_DIR.iterdir() if not p.name.startswith("."))
+    try:
+        selected = mod_packages.profile(MODS_DIR)["enabled"]
+        # Status refreshes read manifest metadata, not multi-gigabyte assets.
+        installed = mod_packages.installed(MODS_DIR)
+        order = mod_packages.resolve(installed, selected, verify_contents=False)
+        active = {m["id"] for m in order}
+        return [{"id": m["id"], "name": m["name"], "version": m["version"],
+                 "author": m.get("author", ""), "description": m.get("description", ""),
+                 "kind": m["kind"], "enabled": m["id"] in active,
+                 "editable": (Path(m["folder"]) / ".modkit/project.json").is_file(),
+                 "requested": m["id"] in selected,
+                 "priority": selected.index(m["id"]) if m["id"] in selected else -1}
+                for m in installed.values()]
+    except (ValueError, OSError) as error:
+        return [{"id": "", "name": "Could not read mods", "error": str(error)}]
+
+
+def modkit_ready():
+    try:
+        return json.loads((BUILD_DIR / "simpsons-modkit.json").read_text()).get("api") == 1
+    except (OSError, ValueError):
+        return False
+
+
+def change_mod(body):
+    with game_proc_lock:
+        return _change_mod(body)
+
+
+def change_project(body):
+    if body.get("action") == "test":
+        ok, message = launch_game(creator_id=body.get("id", ""), creator_preview=body.get('preview'))
+        return {"ok": ok, "msg": "Testing with separate progress. Installed mods and normal saves are unchanged." if ok else message}
+    with game_proc_lock:
+        if body.get('action') not in ('open', 'read') and (game_running_pids() or install_state["running"]):
+            return {"ok": False, "msg": "Close the game and wait for installation to finish before editing projects."}
+        try:
+            return {"ok": True, **mod_projects.dispatch(MODS_DIR, UI_DIR / "modkit-templates.json", body, USER_DATA)}
+        except (ValueError, OSError, UnicodeError, zipfile.BadZipFile) as error:
+            return {"ok": False, "msg": str(error)}
+
+
+def _change_mod(body):
+    if game_running_pids():
+        return {"ok": False, "msg": "Close the game before changing mods."}
+    try:
+        action = body.get("action")
+        if action == "install":
+            item = mod_packages.install(Path(body.get("path", "")).resolve(), MODS_DIR)
+            return {"ok": True, "msg": item["name"] + " installed. Enable it when you are ready."}
+        if action == "enable":
+            if not modkit_ready():
+                return {"ok": False, "msg": "This game build needs the Modkit runtime before mods can be enabled."}
+            mod_packages.set_enabled(MODS_DIR, body.get("id", ""), body.get("enabled") is True)
+        elif action == "order":
+            selected = body.get("enabled")
+            if not isinstance(selected, list) or len(selected) != len(set(selected)):
+                raise ValueError("Invalid mod order")
+            previous = mod_packages.profile(MODS_DIR)
+            if set(selected) != set(previous["enabled"]):
+                raise ValueError("Use Enable or Disable to change the active mods")
+            mod_packages.resolve(mod_packages.installed(MODS_DIR), selected)
+            mod_packages.write_json(mod_packages.profile_path(MODS_DIR), {"version": 1, "enabled": selected})
+        else:
+            raise ValueError("Unknown mod action")
+        selected = mod_packages.profile(MODS_DIR)["enabled"]
+        conflicts = mod_packages.conflicts(mod_packages.resolve(mod_packages.installed(MODS_DIR), selected))
+        return {"ok": True, "msg": "Mods updated.", "conflicts": conflicts}
+    except (ValueError, OSError, zipfile.BadZipFile) as error:
+        return {"ok": False, "msg": str(error)}
 
 
 def list_backups():
@@ -869,6 +1096,7 @@ def status():
         "art_running": art_state["running"],
         "running": bool(game_running_pids()),
         "mods": list_mods(),
+        "modkit_ready": modkit_ready(),
         "backups": list_backups(),
         "patches": patches_list(),
         "github_repo": CONFIG.get("github_repo", ""),
@@ -881,7 +1109,7 @@ def status():
         "platforms": [
             {"name": "Linux / Steam Deck", "state": "ready"},
             {"name": "Windows", "state": "experimental"},
-            {"name": "Android", "state": "planned"},
+            {"name": "Android", "state": "preview"},
         ],
     }
 
@@ -897,7 +1125,7 @@ def browse_roots():
     return [Path.home(), Path("/run/media"), Path("/media"), Path("/mnt")]
 
 
-def browse(path_str):
+def browse(path_str, kind="iso"):
     roots = browse_roots()
     if not path_str:
         entries = [{"name": str(r), "path": str(r), "dir": True} for r in roots if r.is_dir()]
@@ -908,11 +1136,11 @@ def browse(path_str):
     prefixes = tuple(os.path.join(os.path.realpath(r), "") for r in roots)
     folder = os.path.join(os.path.realpath(path_str), "")
     if folder.startswith(prefixes):
-        return _browse_folder(folder, prefixes)
-    return _browse_folder(os.path.join(os.path.realpath(Path.home()), ""), prefixes)
+        return _browse_folder(folder, prefixes, kind)
+    return _browse_folder(os.path.join(os.path.realpath(Path.home()), ""), prefixes, kind)
 
 
-def _browse_folder(folder, prefixes):
+def _browse_folder(folder, prefixes, kind="iso"):
     p = Path(folder)
     entries = []
     try:
@@ -921,7 +1149,7 @@ def _browse_folder(folder, prefixes):
                 continue
             if child.is_dir():
                 entries.append({"name": child.name, "path": str(child), "dir": True})
-            elif child.suffix.lower() in (".iso", ".xiso", ".360", ".img"):
+            elif child.suffix.lower() in ((".zip",) if kind == "mod" else (".iso", ".xiso", ".360", ".img")):
                 entries.append({"name": child.name, "path": str(child), "dir": False,
                                 "size_mb": child.stat().st_size // (1 << 20)})
     except OSError:
@@ -976,7 +1204,7 @@ def _extract_frame(movie, ts, out):
         subprocess.run(
             [ffmpeg_path(), "-loglevel", "error", "-y", "-i", str(movie), "-ss", ts,
              "-frames:v", "1", "-q:v", "3", str(out)],
-            capture_output=True, timeout=60, **POPEN_NO_WINDOW)
+            capture_output=True, timeout=60, env=external_environment(), **POPEN_NO_WINDOW)
     except (subprocess.TimeoutExpired, OSError):
         return False
     # The exit code isn't trusted either way: a frame that was written is good
@@ -1105,23 +1333,51 @@ def write_donut_icon(path, size=128):
 
 
 def install_desktop_entry():
+    if PLAT != "Linux":
+        return
     icon = LAUNCHER_DIR / "icon.png"
     if not icon.exists():
         try:
             write_donut_icon(icon)
         except Exception:
             pass
-    apps = Path.home() / ".local/share/applications"
+    # The shell launcher escapes Flatpak/Steam containers. Keep its desktop
+    # entry on the host too, where the Steam client can read it.
+    apps = _user_data_dir().parent / "applications"
     apps.mkdir(parents=True, exist_ok=True)
+    # Exec uses Desktop Entry quoting, not shell quoting. Its escape layer
+    # consumes one backslash before the argument parser sees the next one.
+    entry_point = str(LAUNCHER_DIR / "simpsons-launcher.sh")
+    entry_point = entry_point.replace("\\", "\\\\\\\\").replace("%", "%%")
+    for character in ('"', '`', '$'):
+        entry_point = entry_point.replace(character, "\\\\" + character)
     (apps / "simpsons-recompiled.desktop").write_text(f"""[Desktop Entry]
 Type=Application
 Name=The Simpsons Game (Recompiled)
 Comment=Launcher for the Simpsons Game native recompilation
-Exec={LAUNCHER_DIR}/simpsons-launcher.sh
+Exec="{entry_point}"
 Icon={icon if icon.exists() else 'applications-games'}
 Terminal=false
 Categories=Game;
 """)
+    tool_icon = LAUNCHER_DIR / "modkit-icon.svg"
+    if (UI_DIR / "modkit-icon.svg").is_file():
+        if (UI_DIR / "modkit-icon.svg").resolve() != tool_icon.resolve():
+            shutil.copyfile(UI_DIR / "modkit-icon.svg", tool_icon)
+    tool_entry = str(LAUNCHER_DIR / "simpsons-modkit.sh").replace("\\", "\\\\\\\\").replace("%", "%%")
+    for character in ('"', '`', '$'):
+        tool_entry = tool_entry.replace(character, "\\\\" + character)
+    (apps / "simpsons-modkit.desktop").write_text(f"""[Desktop Entry]
+Type=Application
+Name=The Simpsons Game Modkit
+Comment=Create, test and package mods for The Simpsons Game
+Exec="{tool_entry}"
+Icon={tool_icon}
+Terminal=false
+Categories=Development;
+StartupWMClass=simpsons-modkit
+""")
+    return apps / "simpsons-recompiled.desktop"
 
 
 # ---------------------------------------------------------------- install
@@ -1153,26 +1409,42 @@ def run_install(iso_path):
                             "happens when it is started from inside the ZIP. Extract the "
                             "whole archive first (right-click the ZIP -> Extract All), "
                             "then run simpsons-launcher.exe from the extracted folder.")
-            return fail(f"extract-xiso tool missing - expected it at {EXTRACT_XISO}, next to "
-                        "the launcher. If an antivirus quarantined it, restore it or "
-                        "re-extract the release archive.")
+            log.append(f"extract-xiso is missing (expected at {EXTRACT_XISO}); "
+                       "using the launcher's built-in extractor instead.")
+            use_builtin = True
+        else:
+            use_builtin = False
         target = ROOT / "gamedata_extracting"
         if target.exists():
             shutil.rmtree(target)
         target.mkdir()
         log.append(f"Extracting {iso.name} ... (this can take a few minutes)")
-        # Options must precede the positional ISO: the Windows getopt does not
-        # permute argv, so "-x <iso> -d <target>" would leave -d unparsed.
-        p = subprocess.Popen([str(EXTRACT_XISO), "-x", "-d", str(target), str(iso)],
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             **POPEN_NO_WINDOW)
-        for line in p.stdout:
-            if line.strip():
-                log.append(line.rstrip())
+        if not use_builtin:
+            try:
+                # Options must precede the positional ISO: the Windows getopt does not
+                # permute argv, so "-x <iso> -d <target>" would leave -d unparsed.
+                p = subprocess.Popen([str(EXTRACT_XISO), "-x", "-d", str(target), str(iso)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                     env=extractor_environment(), **POPEN_NO_WINDOW)
+            except OSError as error:
+                # Windows Smart App Control and similar policies refuse to start
+                # unsigned programs (WinError 4551, #54); so can an antivirus.
+                log.append(f"extract-xiso could not start ({error}); "
+                           "using the launcher's built-in extractor instead.")
+                use_builtin = True
+            else:
+                for line in p.stdout:
+                    if line.strip():
+                        log.append(line.rstrip())
+                        del log[:-400]
+                p.wait()
+                if p.returncode != 0:
+                    return fail(f"extract-xiso exited with {p.returncode}")
+        if use_builtin:
+            def report(message):
+                log.append(message)
                 del log[:-400]
-        p.wait()
-        if p.returncode != 0:
-            return fail(f"extract-xiso exited with {p.returncode}")
+            xiso_extract.extract(iso, target, report)
         if not _looks_like_game_dir(target):
             nested = [d for d in target.iterdir() if d.is_dir() and _looks_like_game_dir(d)]
             if not nested:
@@ -1243,14 +1515,27 @@ def restore_saves(name):
 # (regenerated locally from the player's own files), gamedata/, and
 # simpsons.toml (the player's own runtime settings).
 if PLAT == "Windows":
-    UPDATE_MANAGED_PATHS = ["simpsons.exe", "extract-xiso.exe", "ffmpeg.exe", "README.md",
-                            "build_variant.txt", "native_shaders"]
+    UPDATE_MANAGED_PATHS = ["simpsons.exe", "simpsons-modkit.json", "modkit_streams.exe", "extract-xiso.exe",
+                            "extract-xiso-runtime", "extract-xiso-source.json",
+                            "licenses/extract-xiso", "ffmpeg.exe", "simpsons-modkit.exe",
+                            "README.md", "build_variant.txt", "native_shaders"]
     UPDATE_GLOB_PATHS = ["*.dll"]
 else:
-    UPDATE_MANAGED_PATHS = ["simpsons", "extract-xiso", "launcher/ui",
-                            "launcher/launcher.py", "launcher/simpsons-launcher.sh", "README.md",
+    UPDATE_MANAGED_PATHS = ["simpsons", "simpsons-modkit.json", "modkit_streams", "extract-xiso", "launcher/ui",
+                            "launcher/launcher.py", "launcher/simpsons-launcher.sh",
+                            "launcher/simpsons-launcher", "launcher/simpsons-modkit", "launcher/simpsons-modkit.sh",
+                            "launcher/licenses", "Play.sh", "Modkit.sh", "README.md",
                             "build_variant.txt"]
-    UPDATE_GLOB_PATHS = ["*.so*"]
+    # The launcher's own modules too: Play.sh falls back to launcher.py when
+    # the bundled native launcher cannot run.
+    UPDATE_GLOB_PATHS = ["*.so*", "launcher/*.py"]
+# What a 0.0.7.0 package adds that an updater from before it never copied.
+# Without them mods cannot be enabled, the Modkit has no entry and (on Linux)
+# the launcher runs on the system's Python instead of its own.
+UPDATE_ADDED_PATHS = (["simpsons-modkit.json", "modkit_streams.exe", "simpsons-modkit.exe",
+                       "extract-xiso-runtime"] if PLAT == "Windows" else
+                      ["simpsons-modkit.json", "modkit_streams", "launcher/simpsons-launcher",
+                       "launcher/simpsons-modkit", "launcher/mod_packages.py"])
 # The launcher's own executable (Windows only, PyInstaller-frozen release)
 # needs special handling: it can't overwrite its own running file's content,
 # but Windows does allow renaming a running exe out of the way first.
@@ -1304,6 +1589,18 @@ def _platform_asset_name(variant=VARIANT_DEFAULT):
             else f"TheSimpsonsGame-Recompiled-Linux-x64{suffix}.tar.gz")
 
 
+def missing_release_files():
+    """Files this release's package has that this installation lacks.
+
+    An updater from before 0.0.7.0 copies only the files it knew about, so an
+    installation it updated runs the new game without the files added since.
+    A source checkout is not a package and is never reported.
+    """
+    if not (FROZEN or BUILD_VARIANT_FILE.is_file()):
+        return []
+    return [rel for rel in UPDATE_ADDED_PATHS if not (ROOT / rel).exists()]
+
+
 def check_updates():
     repo = CONFIG.get("github_repo", "")
     if not repo:
@@ -1311,6 +1608,29 @@ def check_updates():
                             msg="No GitHub repository configured.")
         return
     try:
+        missing = missing_release_files()
+        if missing:
+            # Finish this version before looking for the next one: the same
+            # release's package holds the files the older updater left out.
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{repo}/releases/tags/v{VERSION}",
+                headers={"User-Agent": f"simpsons-launcher/{VERSION}"})
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    own = json.loads(r.read())
+            except urllib.error.HTTPError:
+                own = {}
+            asset_name = _platform_asset_name(installed_build_variant() or wanted_build_variant())
+            asset = next((a for a in own.get("assets", []) if a.get("name") == asset_name), None)
+            if asset:
+                update_state.update(checked=True, update_available=True, repair=True,
+                                    download_url=asset["browser_download_url"],
+                                    latest_tag=own.get("tag_name", "v" + VERSION),
+                                    msg=f"The update to {VERSION} is not complete: "
+                                        f"{len(missing)} of its files are missing "
+                                        f"({', '.join(missing)}). Install them now.")
+                return
+        update_state["repair"] = False
         # /releases/latest is exactly what we want: the release GitHub marks
         # "latest" — published, non-draft, non-prerelease. release.yml always
         # publishes with make_latest on and prerelease off, so this is always
@@ -1423,7 +1743,15 @@ def apply_update():
                     shutil.copytree(src, dst)
                 else:
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
+                    # Replacing a running Linux executable's directory entry
+                    # keeps this launcher alive and updates the next launch.
+                    with tempfile.NamedTemporaryFile(dir=dst.parent, delete=False) as f:
+                        staged = Path(f.name)
+                    try:
+                        shutil.copy2(src, staged)
+                        os.replace(staged, dst)
+                    finally:
+                        staged.unlink(missing_ok=True)
                 # Normalise to a string: UPDATE_MANAGED_PATHS supplies plain
                 # strings, but the glob pass below hands us a Path. Mixing the
                 # two blew up the "Installed: ..." join at the end -- after the
@@ -1515,7 +1843,7 @@ def set_diagnostics(enable):
 def _run_quiet(cmd, timeout=6):
     try:
         return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, **POPEN_NO_WINDOW).stdout.strip()
+                              timeout=timeout, env=external_environment(), **POPEN_NO_WINDOW).stdout.strip()
     except Exception:
         return ""
 
@@ -2076,16 +2404,17 @@ def restore_slot_from_guard(slot_name):
     return snaps[-1] if snaps else None
 
 
-def _watch_game_exit(proc, diag=None):
+def _watch_game_exit(proc, diag=None, isolated=False):
     """Record how the game ended; a GPU hang / kill mid-load can leave a corrupt
     shader cache behind, which then hangs the GPU on every later load. Purge the
     cache automatically after any abnormal exit."""
     code = proc.wait()
-    stop_save_guard()  # game is gone; nothing left to snapshot
+    if not isolated:
+        stop_save_guard()  # game is gone; nothing left to snapshot
     notes = []
     try:
         (LAUNCHER_DIR / "last_exit.txt").write_text(str(code))
-        if code != 0:
+        if code != 0 and not isolated:
             good = BACKUPS_DIR / "goodcache"
             if good.is_dir():
                 shutil.rmtree(USER_DATA / "cache", ignore_errors=True)
@@ -2102,12 +2431,32 @@ def _watch_game_exit(proc, diag=None):
             pass
 
 
-def launch_game():
-    global game_proc
+def launch_game(creator_id=None, creator_preview=None, quick_launch=None):
+    try:
+        with modkit_process.game_launch_lock(LAUNCHER_DIR):
+            return _launch_game(creator_id, creator_preview, quick_launch)
+    except BlockingIOError:
+        return False, "Another application is preparing the game. Wait for it to finish."
+
+
+def _launch_game(creator_id=None, creator_preview=None, quick_launch=None):
+    global game_proc, last_creator_session
     with game_proc_lock:
         if game_running_pids():
             return False, "Game is already running"
-        retire_instant_popin_patch()
+        if install_state["running"]:
+            return False, "Wait for installation to finish."
+        creator_session = None
+        if creator_id is not None:
+            try:
+                if not modkit_ready():
+                    return False, "This game build needs the Modkit runtime to test projects."
+                creator_session = mod_projects.prepare_test(MODS_DIR, creator_id, USER_DATA,
+                    mod_packages.read_json(BUILD_DIR / "simpsons-modkit.json"), creator_preview, GAMEDATA)
+            except (ValueError, OSError) as error:
+                return False, str(error)
+        if not creator_session:
+            retire_instant_popin_patch()
         if not GAMEDATA.is_dir():
             return False, ("No game data installed yet — use the Install tab to install "
                            "from your Xbox 360 ISO.")
@@ -2125,10 +2474,11 @@ def launch_game():
                            "2015 on). Open the About tab and check for updates to install "
                            "the build for older CPUs, or download the NoAVX2 package from "
                            "the Releases page.")
-        repaired = repair_saves()
-        if repaired:
-            install_state["log"].append("Save self-heal: " + ", ".join(repaired))
-        auto_backup_saves()
+        if not creator_session:
+            repaired = repair_saves()
+            if repaired:
+                install_state["log"].append("Save self-heal: " + ", ".join(repaired))
+            auto_backup_saves()
         # Re-sync the managed settings block so default migrations apply on
         # launch, not only when the player next touches a setting.
         write_settings({})
@@ -2154,7 +2504,7 @@ def launch_game():
                 return False, (f"rexruntimerd.dll is missing from {BUILD_DIR} - the game "
                                "cannot start without it. If an antivirus quarantined it, "
                                "restore it or re-extract the release archive.")
-        env = os.environ.copy()
+        env = external_environment()
         env_notes = []
         # Lossless Scaling frame-gen (lsfg-vk) hooks Vulkan via a RenderDoc-style
         # capture layer that deadlocks this game's FSI render path (GPU hang,
@@ -2180,8 +2530,25 @@ def launch_game():
         # Pass the user data root explicitly: the engine derives it from
         # XDG_DATA_HOME independently, so without this the launcher and the
         # game can disagree about where saves live.
+        try:
+            selected = ([creator_session["project"]["id"]] if creator_session
+                        else mod_packages.profile(MODS_DIR)["enabled"])
+            ordered = mod_packages.resolve(mod_packages.installed(MODS_DIR), selected) if selected else []
+            if selected and not modkit_ready():
+                return False, "The selected mods require a game build with the Modkit runtime."
+            user_data = creator_session["user_data"] if creator_session else mod_packages.prepare_playthrough(USER_DATA, ordered)
+        except (ValueError, OSError) as error:
+            return False, "Could not prepare mods: " + str(error)
         cmd = [str(GAME_BIN), "--game_data_root", str(GAMEDATA),
-               "--user_data_root", str(USER_DATA)]
+               "--user_data_root", str(user_data)]
+        if modkit_ready():
+            cmd += ["--mods_root", str(MODS_DIR)]
+        if creator_session:
+            cmd += ["--mods_profile_file", str(creator_session["profile"]), "--mods_developer=true"]
+            if creator_session['preview'] is not None:
+                cmd += ['--mods_editor_preview=true', '--saves_screen=false', '--fullscreen=false']
+        elif quick_launch:
+            cmd += [f"--quick_launch_level={quick_launch}", "--saves_screen=false"]
         debug_gdb = LAUNCHER_DIR / "debug_run.gdb"
         crash_log = LAUNCHER_DIR / "last_run_debug.txt"
         if debug_gdb.exists() and shutil.which("gdb"):
@@ -2213,7 +2580,14 @@ def launch_game():
         finally:
             if out is not subprocess.DEVNULL:
                 out.close()  # the child holds its own duplicate of the fd
-        start_save_guard()
+        if creator_session:
+            last_creator_session = creator_session
+            try:
+                mod_projects.record_test(creator_session)
+            except OSError as error:
+                install_state['log'].append('Could not record the latest Test draft path: ' + str(error))
+        if not creator_session:
+            start_save_guard()
         # HAND PATCH: level-load memory spikes were getting the game SIGKILLed
         # by systemd-oomd. This used to be handled by wrapping the launch in
         # `systemd-run --user --scope`, which hands the process off into a
@@ -2230,7 +2604,7 @@ def launch_game():
             pass
         if diag:
             threading.Thread(target=diag.monitor, args=(game_proc,), daemon=True).start()
-        threading.Thread(target=_watch_game_exit, args=(game_proc, diag), daemon=True).start()
+        threading.Thread(target=_watch_game_exit, args=(game_proc, diag, bool(creator_session)), daemon=True).start()
         return True, "launched"
 
 
@@ -2246,19 +2620,88 @@ def stop_game():
     return False, "not started by launcher"
 
 
+_steam_add_lock = threading.Lock()
+
+
+def _run_steam_command(command, env):
+    # Starting Steam can outlive this request. Pipes kept open by the client
+    # used to time out even after it accepted the shortcut. Do not kill it.
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, env=env)
+        try:
+            code = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return None
+        output.seek(0)
+        return subprocess.CompletedProcess(command, code, output.read(16384).decode("utf-8", errors="replace"), "")
+
+
 def add_to_steam():
-    script = LAUNCHER_DIR / "simpsons-launcher.sh"
+    with _steam_add_lock:
+        return _add_to_steam()
+
+
+def _add_to_steam():
+    if PLAT != "Linux":
+        return False, "In Steam, choose Games → Add a Non-Steam Game and select the launcher."
+    script = (LAUNCHER_DIR / "simpsons-launcher.sh").resolve()
+    if not script.is_file():
+        return False, f"Launcher entry point is missing: {script}"
+    try:
+        script.chmod(script.stat().st_mode | 0o111)
+    except OSError as e:
+        return False, f"Could not make the launcher executable: {e}"
+    try:
+        desktop = install_desktop_entry()
+    except OSError as e:
+        return False, f"Could not prepare the Steam shortcut: {e}"
+    targets = [script, desktop, LAUNCHER_DIR / "simpsons-launcher"]
+    existing = steam_shortcut.existing_shortcut(targets)
+    if existing:
+        return True, f"Already in Steam as {existing}. Find it in Library → Non-Steam Games."
+    # Pass Steam a desktop entry, so it gets the game's name and donut icon.
+    # Encode the whole path, including slashes, spaces, quotes and '#'.
+    url = "steam://addnonsteamgame/" + urllib.parse.quote(str(desktop), safe="")
+    host = (["flatpak-spawn", "--host"]
+            if Path("/.flatpak-info").exists() and shutil.which("flatpak-spawn") else [])
+    steam = shutil.which("steam")
     tool = shutil.which("steamos-add-to-steam")
-    if tool:
-        subprocess.Popen([tool, str(script)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True, "Sent to Steam — check your library (may need a Steam restart)."
-    if shutil.which("steam"):
-        subprocess.Popen(["steam", f"steam://addnonsteamgame/{urllib.parse.quote(str(script))}"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True, "Asked Steam to add the launcher — confirm the dialog in Steam."
-    return False, ("Steam tools not found. Add manually: Steam → Games → "
-                   f"Add a Non-Steam Game → browse to {script}")
+    try:
+        # The marker and client command must share /tmp. A sandbox's marker
+        # is invisible to the host Steam client; its command can still exit 0.
+        if host:
+            command = host + ["sh", "-c", 'touch /tmp/addnonsteamgamefile && exec steam "$1"',
+                              "simpsons-add-to-steam", url]
+        elif steam:
+            Path("/tmp/addnonsteamgamefile").touch()
+            command = [steam, url]
+        elif tool:
+            command = [tool, str(desktop)]
+        elif shutil.which("flatpak") and (Path.home() / ".var/app/com.valvesoftware.Steam").is_dir():
+            command = ["flatpak", "run", "--command=sh", "com.valvesoftware.Steam", "-c",
+                       'touch /tmp/addnonsteamgamefile && exec steam "$1"',
+                       "simpsons-add-to-steam", url]
+        else:
+            return False, ("Steam tools not found. In Desktop Mode, open Steam → Games → "
+                           f"Add a Non-Steam Game → browse to {script}")
+        env = external_environment()
+        for key in ("SteamAppId", "SteamGameId", "STEAM_COMPAT_APP_ID"):
+            env.pop(key, None)
+        result = _run_steam_command(command, env)
+        error = (result.stderr.strip() or result.stdout.strip()) if result else ""
+        if result and (result.returncode != 0 or "Unsupported file type" in error):
+            return False, "Steam could not add the launcher: " + (error or str(result.returncode))
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            existing = steam_shortcut.existing_shortcut(targets)
+            if existing:
+                return True, f"Added to Steam as {existing}. Find it in Library → Non-Steam Games."
+            time.sleep(.2)
+        return True, ("Request sent to Steam. Check Library → Non-Steam Games for "
+                      "The Simpsons Game (Recompiled). If it is missing, switch to Desktop Mode "
+                      "and finish any Add a Game dialog in Steam.")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"Steam could not add the launcher: {e}"
 
 
 def tail_game_log(n=60):
@@ -2308,6 +2751,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, html.encode(), "text/html; charset=utf-8")
         if path == "/api/ping":
             return self._send(200, {"app": "simpsons-launcher", "version": VERSION})
+        if path == "/mission-editor.js":
+            return self._send(200, (UI_DIR / "mission-editor.js").read_bytes(),
+                              "text/javascript; charset=utf-8")
         # The rest of the API answers only the launcher's own page, which has
         # the token. /api/browse lists folders on this computer.
         if path.startswith("/api/") and not self._token_ok():
@@ -2324,7 +2770,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, diagnostics_report())
         if path == "/api/browse":
             q = urllib.parse.parse_qs(parsed.query)
-            return self._send(200, browse((q.get("path") or [""])[0]))
+            return self._send(200, browse((q.get("path") or [""])[0], (q.get("kind") or ["iso"])[0]))
         # Art and fonts are served by exact name from their folder's own
         # listing, so a request can't name a file anywhere else.
         if path.startswith("/art/"):
@@ -2347,16 +2793,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._addressed_here() or not self._token_ok():
             return self._send(403, {"error": "bad token"})
         path = urllib.parse.urlparse(self.path).path
-        length = int(self.headers.get("Content-Length") or 0)
-        body = json.loads(self.rfile.read(length) or b"{}")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self._send(400, {"ok": False, "msg": "Invalid request length."})
+        if length < 0 or length > 2 * 1024 * 1024:
+            return self._send(413, {"ok": False, "msg": "Request is too large."})
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("The request needs a JSON object")
+        except (ValueError, UnicodeError):
+            return self._send(400, {"ok": False, "msg": "The request needs a valid JSON object."})
         if path == "/api/launch":
-            ok, msg = launch_game()
+            ok, msg = launch_game(quick_launch=body.get("quick_launch"))
             return self._send(200 if ok else 409, {"ok": ok, "msg": msg})
         if path == "/api/stop":
             ok, msg = stop_game()
             return self._send(200, {"ok": ok, "msg": msg})
+        if path == "/api/mods":
+            result = change_mod(body)
+            return self._send(200 if result["ok"] else 409, result)
+        if path == "/api/mod-projects":
+            return self._send(409, {"ok": False, "msg": "Open the separate Modkit application to create and edit projects."})
+        if path == "/api/open-modkit":
+            ok, msg = open_modkit(body.get("id"))
+            return self._send(200 if ok else 409, {"ok": ok, "msg": msg})
         if path == "/api/settings":
-            return self._send(200, {"values": write_settings(body.get("values", {}))})
+            try:
+                return self._send(200, {"values": write_settings(body.get("values", {}))})
+            except ValueError as error:
+                return self._send(400, {"error": str(error)})
         if path == "/api/install":
             if install_state["running"]:
                 return self._send(409, {"ok": False, "msg": "install already running"})
@@ -2382,6 +2849,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ok, msg = add_to_steam()
             return self._send(200, {"ok": ok, "msg": msg})
         if path == "/api/patch":
+            if body.get("id") == "cutscene_skip":
+                if not isinstance(body.get("enable"), bool):
+                    return self._send(400, {"ok": False, "msg": "Choose On or Off."})
+                if game_running_pids():
+                    return self._send(409, {"ok": False, "msg": "Close the game before changing patches."})
+                write_settings({"cutscene_skip": body["enable"]})
+                return self._send(200, {"ok": True, "msg": "Cutscene skipping updated."})
             if body.get("id") == "skip_intro":
                 ok, msg = patch_skip_intro(bool(body.get("enable")))
                 return self._send(200, {"ok": ok, "msg": msg})
@@ -2469,15 +2943,44 @@ programs from talking to this computer (127.0.0.1) can cause this.</p>
 says where it got stuck; please attach it to a report on GitHub.</p></body></html>"""
 
 
+def gaming_mode():
+    return PLAT == "Linux" and (
+        os.environ.get("SteamGamepadUI") == "1" or os.environ.get("STEAM_GAMEPADUI") == "1"
+        or "gamescope" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower())
+
+
+def finish_update_before_window():
+    """Complete an update that an older launcher started, in Game Mode.
+
+    There the launcher needs the native window a 0.0.7.0 package includes,
+    and an updater from before it does not copy that file, so the window that
+    would offer the missing files cannot open. Fetch them first and start
+    again. On the desktop the launcher still opens and asks instead. Returns
+    True when this process has been replaced or should stop.
+    """
+    if PLAT != "Linux" or not gaming_mode() or "launcher/simpsons-launcher" not in missing_release_files():
+        return False
+    startup_log("finishing the update: fetching the files an older updater left out")
+    check_updates()
+    if not (update_state.get("repair") and update_state.get("download_url")):
+        startup_log(f"could not finish the update: {update_state.get('msg')}")
+        return False
+    dialog = shutil.which("kdialog")
+    if dialog:
+        subprocess.Popen([dialog, "--title", "The Simpsons Game Recompiled", "--passivepopup",
+                          f"Finishing the update to {VERSION}. This downloads the rest of the "
+                          "release and takes a minute or two.", "60"], env=external_environment())
+    ok, message = apply_update()
+    startup_log(f"finish update: {message}")
+    script = LAUNCHER_DIR / "simpsons-launcher.sh"
+    if not ok or not (LAUNCHER_DIR / "simpsons-launcher").is_file() or not script.is_file():
+        return False
+    os.execv(str(script), [str(script)] + sys.argv[1:])
+
+
 def run_native(url):
     """Native desktop window via PySide6 QWebEngineView."""
-    # HAND PATCH: a Steam shortcut that needs a compatibility tool (e.g.
-    # Steam Linux Runtime) to launch runs this inside a sandboxed container
-    # that can't see the host's ~/.local Python packages, so a normal
-    # `pip install --user PySide6` isn't visible and this silently fell back
-    # to a browser tab. Vendoring a trimmed PySide6+QtWebEngine directly
-    # under launcher/vendor/ (not gitignored intentionally -- see .gitignore
-    # comment) means it travels with the code regardless of sandbox.
+    # Source checkouts may keep PySide6 locally; release executables bundle it.
     vendor_dir = LAUNCHER_DIR / "vendor"
     if vendor_dir.is_dir() and str(vendor_dir) not in sys.path:
         sys.path.insert(0, str(vendor_dir))
@@ -2488,6 +2991,8 @@ def run_native(url):
     from PySide6.QtWidgets import QApplication, QMainWindow
 
     app = QApplication(sys.argv)
+    app.setApplicationName("simpsons-launcher")
+    app.setDesktopFileName("simpsons-recompiled")
     win = QMainWindow()
     win.setWindowTitle("The Simpsons Game — Recompiled")
     icon = LAUNCHER_DIR / "icon.png"
@@ -2513,7 +3018,8 @@ def run_native(url):
     view.setUrl(QUrl(url))
     win.setCentralWidget(view)
     win.resize(1180, 800)
-    win.show()
+    win.showFullScreen() if gaming_mode() else win.show()
+    startup_log("native launcher window opened")
     app.exec()
 
 
@@ -2526,33 +3032,73 @@ def open_browser(url):
         exe = shutil.which(browser)
         if exe:
             subprocess.Popen([exe, f"--app={url}", "--window-size=1180,800"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             env=external_environment())
             return True
     for browser in ("firefox", "brave-browser", "vivaldi", "epiphany"):
         exe = shutil.which(browser)
         if exe:
             subprocess.Popen([exe, url],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             env=external_environment())
             return True
     if shutil.which("flatpak"):
         for app_id in ("org.mozilla.firefox", "org.chromium.Chromium",
                        "com.brave.Browser", "com.google.Chrome"):
             r = subprocess.run(["flatpak", "info", app_id],
-                               capture_output=True, **POPEN_NO_WINDOW)
+                               capture_output=True, env=external_environment(), **POPEN_NO_WINDOW)
             if r.returncode == 0:
                 subprocess.Popen(["flatpak", "run", app_id, url],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 env=external_environment())
                 return True
     import webbrowser
     return webbrowser.open(url)
 
 
 def main():
-    if "--play" in sys.argv:
+    if MODKIT_APP:
+        vendor_dir = LAUNCHER_DIR / "vendor"
+        if vendor_dir.is_dir() and str(vendor_dir) not in sys.path:
+            # A checkout may retain an older, partial Qt installation here.
+            # Prefer the complete environment selected by the entry script;
+            # vendor is a fallback when Qt is not installed there.
+            sys.path.append(str(vendor_dir))
+        project = None
+        if "--project" in sys.argv:
+            index = sys.argv.index("--project") + 1
+            if index < len(sys.argv):
+                project = sys.argv[index]
+        try:
+            if __package__:
+                from .modkit_app import run
+            else:
+                from modkit_app import run
+            run(sys.modules[__name__], project)
+        except Exception:
+            import traceback
+            (LAUNCHER_DIR / "modkit_native_error.log").write_text(traceback.format_exc())
+            message = "Modkit could not start. Use the complete desktop package. Details are in modkit_native_error.log."
+            if PLAT == "Windows":
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(None, message, "The Simpsons Game Modkit", 0x10)
+            else:
+                print(message, file=sys.stderr)
+                if shutil.which("kdialog"):
+                    subprocess.run(["kdialog", "--title", "The Simpsons Game Modkit", "--error", message], env=external_environment())
+            raise
+        return
+    quick_arg = None
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg == "--quick-launch" and i < len(sys.argv):
+            quick_arg = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
+        elif arg.startswith("--quick-launch="):
+            quick_arg = arg.split("=", 1)[1]
+    if "--play" in sys.argv or quick_arg:
         # Start the game straight away without the launcher window, e.g. from
         # a Steam shortcut in Game Mode (#18, #20). Settings, save protection
         # and the environment are handled exactly as by the Play button.
-        ok, message = launch_game()
+        ok, message = launch_game(quick_launch=quick_arg)
         if not ok:
             print(message)
             sys.exit(1)
@@ -2564,6 +3110,13 @@ def main():
     except OSError:
         pass
     startup_log(f"launcher {VERSION} on {PLAT} {platform.release()}, frozen={FROZEN}")
+    if finish_update_before_window():
+        return
+    try:
+        # The example mods that ship with the launcher, disabled until chosen.
+        mod_packages.seed_bundled(UI_DIR / "bundled-mods", MODS_DIR)
+    except Exception as e:  # noqa: BLE001
+        startup_log(f"bundled mods: {e!r}")
     # In the background: a full artwork sweep can take a minute on a slow
     # disk, and players were staring at nothing until it finished.
     threading.Thread(target=generate_art, daemon=True).start()
@@ -2614,6 +3167,17 @@ def main():
             (LAUNCHER_DIR / "launcher_native_error.log").write_text(tb)
         except Exception:
             pass
+        if gaming_mode():
+            message = ("The native launcher could not start. Use the complete Linux release "
+                       "package, which includes Python and Qt. See launcher_native_error.log "
+                       "for details. Steam Runtime 1.0 can also be used with a source checkout.")
+            startup_log(message)
+            print(message, file=sys.stderr)
+            dialog = shutil.which("kdialog")
+            if dialog:
+                subprocess.run([dialog, "--title", "The Simpsons Game Recompiled", "--error", message],
+                               env=external_environment())
+            return
         startup_log("native window unavailable, opening a browser (launcher_native_error.log)")
         print("(native window unavailable; opening in your browser instead — "
               "details in launcher_native_error.log)")

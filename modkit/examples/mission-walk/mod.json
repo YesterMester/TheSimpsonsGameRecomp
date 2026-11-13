@@ -1,0 +1,13 @@
+{
+  "id": "examples.mission-walk",
+  "name": "There and back",
+  "author": "",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "state",
+  "default_locale": "en",
+  "locales": {"en": "locales/en.json"},
+  "description": "A commented authored mission with objectives, failure, retry points and native menu controls."
+}

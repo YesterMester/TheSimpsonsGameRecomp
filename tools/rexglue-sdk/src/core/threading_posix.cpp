@@ -40,7 +40,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #if REX_PLATFORM_ANDROID
 #include <dlfcn.h>
 
-#include <rex/main_android.h>
+#include <android/api-level.h>
 #include <rex/string/util.h>
 #endif
 
@@ -66,7 +66,7 @@ static void* android_libc_;
 static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf, size_t n);
 
 void AndroidInitialize() {
-  if (rex::GetAndroidApiLevel() >= 26) {
+  if (android_get_device_api_level() >= 26) {
     android_libc_ = dlopen("libc.so", RTLD_NOW);
     assert_not_null(android_libc_);
     if (android_libc_) {
@@ -216,8 +216,9 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
 class PosixConditionBase {
  public:
   PosixConditionBase() {
-#if REX_PLATFORM_LINUX
-    // Use robust mutexes so waits can recover if owner thread terminates.
+#if REX_PLATFORM_GNU_LINUX
+    // glibc provides robust mutexes for recovering after owner termination.
+    // Bionic does not expose this extension; use the portable wait locks there.
     pthread_mutexattr_t attr;
     if (pthread_mutexattr_init(&attr) == 0) {
       if (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) == 0) {
@@ -235,7 +236,7 @@ class PosixConditionBase {
 
   // Locks mutex_, recovering it if its owner died while holding it.
   std::unique_lock<std::mutex> LockRobust() {
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_GNU_LINUX
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
     int lock_result = pthread_mutex_lock(native_mutex);
     if (lock_result == EOWNERDEAD) {
@@ -252,7 +253,7 @@ class PosixConditionBase {
   WaitResult Wait(std::chrono::milliseconds timeout) {
     bool executed;
     auto predicate = [this] { return this->signaled(); };
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_GNU_LINUX
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
     int lock_result = pthread_mutex_lock(native_mutex);
     if (lock_result == EOWNERDEAD) {
@@ -342,7 +343,7 @@ class PosixConditionBase {
         // lock at once, backing off on contention instead of deadlocking.
         bool all_locked = true;
         for (size_t i = 0; i < handles.size(); ++i) {
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_GNU_LINUX
           auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
           int result = pthread_mutex_trylock(native_mutex);
           if (result == 0 || result == EOWNERDEAD) {
@@ -1289,7 +1290,7 @@ class PosixTimer : public PosixConditionHandle<Timer> {
   }
   bool SetOnceAt(WClock_::time_point due_time,
                  std::function<void()> opt_callback = nullptr) override {
-    return SetOnceAt(std::chrono::clock_cast<GClock_>(due_time), std::move(opt_callback));
+    return SetOnceAt(rex::chrono::clock_cast<GClock_>(due_time), std::move(opt_callback));
   };
   bool SetOnceAt(GClock_::time_point due_time,
                  std::function<void()> opt_callback = nullptr) override {
@@ -1303,7 +1304,7 @@ class PosixTimer : public PosixConditionHandle<Timer> {
   }
   bool SetRepeatingAt(WClock_::time_point due_time, std::chrono::milliseconds period,
                       std::function<void()> opt_callback = nullptr) override {
-    return SetRepeatingAt(std::chrono::clock_cast<GClock_>(due_time), period,
+    return SetRepeatingAt(rex::chrono::clock_cast<GClock_>(due_time), period,
                           std::move(opt_callback));
   }
   bool SetRepeatingAt(GClock_::time_point due_time, std::chrono::milliseconds period,

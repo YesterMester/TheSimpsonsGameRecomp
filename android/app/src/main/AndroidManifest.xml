@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x00401000" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <application android:label="The Simpsons Game Recompiled" android:theme="@style/LauncherTheme"
+        android:appCategory="game"
+        android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher"
+        android:allowBackup="false" android:hasFragileUserData="true" android:extractNativeLibs="false">
+        <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
+        <activity android:name=".LauncherActivity" android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service android:name=".GameSessionService" android:process=":game" android:exported="false" />
+        <receiver android:name=".AppUpdater$Receiver" android:exported="false" />
+        <activity android:name=".TouchEditorActivity" android:screenOrientation="sensorLandscape" android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+        <service android:name=".GameImportService" android:exported="false"
+            android:foregroundServiceType="dataSync" android:stopWithTask="false" />
+        <activity android:name=".GameActivity" android:process=":game" android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:exported="false" android:resizeableActivity="true">
+            <meta-data android:name="android.app.lib_name" android:value="main" />
+        </activity>
+    </application>
+</manifest>

@@ -11,11 +11,14 @@
  */
 
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -27,6 +30,7 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/guest_write_tracker.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/gpu_profiler.h>
 #include <rex/graphics/vulkan/graphics_system.h>
@@ -46,8 +50,60 @@
 
 namespace rex::graphics::vulkan {
 
+// Counters of native vertex and index snapshot work for the gpu_wait_stats log.
+enum NativeSnapshotStat : uint32_t {
+  kNativeSnapshotLookups,
+  kNativeSnapshotUnchanged,
+  kNativeSnapshotChangedAgain,
+  kNativeSnapshotChanged,
+  kNativeSnapshotNew,
+  kNativeSnapshotUncached,
+  kNativeSnapshotHashedBytes,
+  kNativeSnapshotCopiedBytes,
+  kNativeSnapshotUploadedBytes,
+  kNativeSnapshotIndexReused,
+  kNativeSnapshotIndexHashedBytes,
+  kNativeSnapshotSettled,
+  kNativeSnapshotEpochReused,
+  // Bytes hashed to compare streams already compared earlier in the frame.
+  kNativeSnapshotRepeatHashedBytes,
+  // Bytes of streams found unwritten by the write tracker, not compared.
+  kNativeSnapshotUnwrittenBytes,
+  // The write tracker's scans and the nanoseconds they took.
+  kWriteTrackingScans,
+  kWriteTrackingScanNs,
+  // guest_progress_epoch_ advances, and those after primary ring packets.
+  kNativeSnapshotEpochs,
+  kNativeSnapshotPrimaryEpochs,
+  // Image copies recorded by each render target cache path.
+  kImageCopiesTileRows,
+  kImageCopiesSurface,
+  kImageCopiesDepthSnapshot,
+  kImageCopiesResolve,
+  kNativeSnapshotStatCount,
+};
+extern std::atomic<uint64_t> g_native_snapshot_stats[kNativeSnapshotStatCount];
+// Whether the counters are kept: only while gpu_wait_stats logs them (set at
+// each swap), so draws don't pay for the atomic adds and the extra comparisons
+// otherwise.
+extern std::atomic<bool> g_native_snapshot_stats_enabled;
+inline bool NativeSnapshotStatsEnabled() {
+  return g_native_snapshot_stats_enabled.load(std::memory_order_relaxed);
+}
+inline void CountNativeSnapshot(NativeSnapshotStat stat, uint64_t value = 1) {
+  if (NativeSnapshotStatsEnabled()) {
+    g_native_snapshot_stats[stat].fetch_add(value, std::memory_order_relaxed);
+  }
+}
+// The bytes BufferContentMatches hashes to compare a stream.
+inline uint64_t NativeSnapshotHashedBytes(const void* source, const void* snapshot, size_t size) {
+  return NativeSnapshotStatsEnabled() && size > 256 && !std::memcmp(source, snapshot, 64) ? size
+                                                                                          : 0;
+}
+
 class VulkanCommandProcessor : public CommandProcessor {
  public:
+  bool DownloadNativeIndexRange(uint32_t start, std::span<uint8_t> bytes);
   // Single-descriptor layouts for use within a single frame.
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
@@ -478,18 +534,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   // draw and read back once per frame in IssueSwap, where the submission is
   // ending anyway; the guest consumes the data on the following frame.
   void PerformDeferredMemexportReadback();
+  bool GetMemexportReadbackSource(const draw_util::MemExportRange& range,
+                                  VkDescriptorBufferInfo& source);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
-  struct NativeVertexRange {
-    uint32_t address;
-    uint32_t size;
-    uint32_t offset;
-  };
+  using NativeVertexRange = VulkanRenderTargetCache::NativeVertexRange;
   struct NativeVertexCache;
+  uint8_t* RequestNativeVertexUpload(uint32_t size, VkDescriptorBufferInfo& buffer_info);
+  // The set covering a whole page of native_vertex_buffer_pool_, for snapshots
+  // uploaded to it: their offset in the page is added to the private fetch
+  // constants instead of writing and binding a set per draw.
+  VkDescriptorSet GetNativeVertexPageDescriptor(VkBuffer page);
   VkDescriptorSet TryCachedNativeVertexStreams(const NativeVertexRange* ranges, size_t range_count,
                                                uint32_t snapshot_size);
 
   bool PrepareNativeVertexStreams(const VulkanShader& shader, const VulkanShader* pixel_shader,
-                                  const PrimitiveProcessor::ProcessingResult& primitives);
+                                  const PrimitiveProcessor::ProcessingResult& primitives,
+                                  bool memexport = false, bool memexport_compute = false);
 
   void SplitPendingBarrier();
 
@@ -549,6 +609,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // gpu_null_optional_draw_limit bookkeeping.
   uint64_t null_optional_draw_frame_ = UINT64_MAX;
   uint32_t null_optional_draws_this_frame_ = 0;
+  // Whether this frame's draws feed the batch probe (with gpu_wait_stats).
+  bool batch_probe_ = false;
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
   void UpdateSystemConstantValues(
@@ -558,6 +620,13 @@ class VulkanCommandProcessor : public CommandProcessor {
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
   bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  bool IssueVertexMemExportCompute(VulkanShader& vertex_shader, const VulkanShader* pixel_shader,
+                                   const PrimitiveProcessor::ProcessingResult& primitives,
+                                   bool primitive_polygonal,
+                                   const draw_util::ViewportInfo& viewport_info,
+                                   uint32_t used_texture_mask,
+                                   reg::RB_DEPTHCONTROL normalized_depth_control,
+                                   uint32_t normalized_color_mask);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -566,12 +635,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Returns how many VkWriteDescriptorSet structure instances have been
   // written, or 0 if there was a failure to allocate the descriptor set or no
   // bindings were requested.
-  uint32_t WriteTransientTextureBindings(bool is_vertex, uint32_t texture_count,
-                                         uint32_t sampler_count,
-                                         VkDescriptorSetLayout descriptor_set_layout,
-                                         const VkDescriptorImageInfo* texture_image_info,
-                                         const VkDescriptorImageInfo* sampler_image_info,
-                                         VkWriteDescriptorSet* descriptor_set_writes_out);
+  // Returns the set for the bindings, with descriptor_set_write_count_out
+  // writes to make to it (none if a set with the same contents was written
+  // earlier in the submission), or VK_NULL_HANDLE on failure.
+  VkDescriptorSet WriteTransientTextureBindings(bool is_vertex, uint32_t texture_count,
+                                                uint32_t sampler_count,
+                                                VkDescriptorSetLayout descriptor_set_layout,
+                                                const VkDescriptorImageInfo* texture_image_info,
+                                                const VkDescriptorImageInfo* sampler_image_info,
+                                                VkWriteDescriptorSet* descriptor_set_writes_out,
+                                                uint32_t& descriptor_set_write_count_out);
 
   bool device_lost_ = false;
 
@@ -619,6 +692,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+  // With vulkan_parallel_command_recording, the command buffer the deferred
+  // one is recorded into on its worker thread while the submission is open.
+  CommandBuffer recording_command_buffer_ = {};
+  // Takes a writable command buffer (creating one if there's none) and begins
+  // it.
+  bool BeginCommandBuffer(CommandBuffer& command_buffer_out);
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;
@@ -637,12 +716,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> native_vertex_buffer_pool_;
   std::unique_ptr<NativeVertexCache> native_vertex_cache_;
+  // Large cached vertex streams skip their comparison while their memory has
+  // not been written (null where write tracking is unavailable).
+  std::unique_ptr<GuestWriteTracker> write_tracker_;
+  // Keys of vertex snapshots looked up once, so only those used again are
+  // cached: one-off streams (written to new memory every frame) are uploaded
+  // directly instead of filling the cache and evicting what it should keep.
+  std::vector<uint64_t> native_vertex_seen_;
   std::deque<std::pair<uint64_t, std::unique_ptr<NativeVertexCache>>> native_vertex_caches_retired_;
 
   std::unordered_map<size_t, std::unique_ptr<ui::vulkan::VulkanUploadBufferPool>>
       native_texture_buffer_pools_;
 
   std::array<uint32_t, 6 * 32> native_vertex_fetch_constants_{};
+  // Page buffer -> GetNativeVertexPageDescriptor's set, until the transient
+  // descriptor pools are cleared.
+  std::unordered_map<VkBuffer, VkDescriptorSet> native_vertex_page_descriptor_sets_;
   VkDescriptorSet native_vertex_descriptor_set_ = VK_NULL_HANDLE;
   uint32_t shared_memory_binding_count_ = 0;
   bool native_vertex_streams_active_ = false;
@@ -677,15 +766,33 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
   std::array<std::vector<VkDescriptorSet>, size_t(SingleTransientDescriptorLayout::kCount)>
       single_transient_descriptors_free_;
-  // <Usage frame, set>.
-  std::deque<std::pair<uint64_t, VkDescriptorSet>> constants_transient_descriptors_used_;
-  std::vector<VkDescriptorSet> constants_transient_descriptors_free_;
+  // Guest constant buffers are dynamic uniform buffers, all uploaded to the
+  // same page of uniform_buffer_pool_, so one descriptor set per page serves
+  // every draw, and changing constants only changes the dynamic offsets.
+  static constexpr uint32_t kConstantsDescriptorPoolSetCount = 64;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeConstants;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator constants_descriptor_allocator_;
+  // <Page buffer, set>.
+  std::vector<std::pair<VkBuffer, VkDescriptorSet>> constants_descriptor_sets_;
 
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_textures_;
   std::deque<UsedTextureTransientDescriptorSet> texture_transient_descriptor_sets_used_;
   std::unordered_map<TextureDescriptorSetLayoutKey, std::vector<VkDescriptorSet>,
                      TextureDescriptorSetLayoutKey::Hasher>
       texture_transient_descriptor_sets_free_;
+  // Texture sets written in the current submission, by contents (layout, image
+  // views and samplers), so draws binding the same textures share one. Kept for
+  // one submission only: the views and samplers it uses can't be destroyed
+  // before it completes, so no handle in the cache can name a new object.
+  struct CachedTextureDescriptorSet {
+    VkDescriptorSet set;
+    TextureDescriptorSetLayoutKey layout_key;
+    // Into texture_descriptor_cache_contents_: the texture, then the sampler
+    // image infos written to the set.
+    uint32_t contents_offset;
+  };
+  std::unordered_multimap<uint64_t, CachedTextureDescriptorSet> texture_descriptor_cache_;
+  std::vector<VkDescriptorImageInfo> texture_descriptor_cache_contents_;
 
   std::unique_ptr<VulkanSharedMemory> shared_memory_;
 
@@ -889,6 +996,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   const PipelineLayout* current_guest_graphics_pipeline_layout_;
   VkDescriptorBufferInfo
       current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferCount];
+  // Dynamic offsets of the constant buffers for binding
+  // current_graphics_descriptor_sets_[kDescriptorSetConstants].
+  uint32_t current_constant_buffer_offsets_[SpirvShaderTranslator::kConstantBufferCount];
   // Whether up-to-date data has been written to constant (uniform) buffers, and
   // the buffer infos in current_constant_buffer_infos_ point to them.
   uint32_t current_constant_buffers_up_to_date_;
@@ -920,6 +1030,9 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+  VkDescriptorBufferInfo native_memexport_buffer_ = {};
+  uint32_t native_memexport_base_ = 0;
+  uint32_t native_vertex_index_address_ = UINT32_MAX;
 };
 
 }  // namespace rex::graphics::vulkan

@@ -21,6 +21,8 @@ class BufferVersion {
   BufferKind kind() const { return kind_; }
   size_t size() const { return gpu_source_size_ ? gpu_source_size_ : source_.size(); }
   uint32_t allocation_size() const { return allocation_size_; }
+  // GPU-owned versions have no CPU snapshot.
+  std::span<const uint8_t> cpu_bytes() const { return source_; }
 
  private:
   friend class BufferCache;
@@ -49,11 +51,28 @@ class BufferCache {
       : device_(device), budget_(budget) {}
   std::shared_ptr<const BufferVersion> GetOrCreate(std::span<const uint8_t> source, BufferKind kind,
                                                    std::string& error);
+  struct CpuRange {
+    const uint8_t* data;
+    uint32_t offset, length;
+  };
+  // Ordered destination ranges with zero padding. Hash and compare the inputs
+  // directly; only a cache miss copies them into the immutable version.
+  std::shared_ptr<const BufferVersion> GetOrCreate(std::span<const CpuRange> ranges, uint32_t size,
+                                                   BufferKind kind, std::string& error);
   // Caller unbinds the immediate context first. GPU-owned inputs receive a
   // fresh retained copy without a CPU download or reuse by guest address.
   std::shared_ptr<const BufferVersion> SnapshotGpuRange(ID3D11Buffer* source, uint32_t offset,
                                                         uint32_t length, BufferKind kind,
                                                         std::string& error);
+  struct GpuCopy {
+    ID3D11Buffer* source;
+    uint32_t source_offset, destination_offset, length;
+  };
+  // CPU bytes initialize the snapshot; retained GPU versions replace only
+  // their own ranges. Neither source is downloaded or cached by CPU contents.
+  std::shared_ptr<const BufferVersion> SnapshotMixedRanges(std::span<const uint8_t> cpu_bytes,
+                                                           std::span<const GpuCopy> copies,
+                                                           std::string& error);
   void Clear();
   const Statistics& statistics() const { return statistics_; }
 
@@ -64,6 +83,8 @@ class BufferCache {
     std::shared_ptr<const BufferVersion> version;
   };
   using Entries = std::list<Entry>;
+  std::shared_ptr<const BufferVersion> Create(std::shared_ptr<BufferVersion> version, uint64_t hash,
+                                              std::string& error);
   void Trim();
 
   ui::d3d11::D3D11Device& device_;

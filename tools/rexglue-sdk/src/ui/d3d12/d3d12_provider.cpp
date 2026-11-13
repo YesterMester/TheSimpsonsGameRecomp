@@ -17,6 +17,8 @@
 #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
+#include <rex/ui/graphics_backend.h>
+#include <dxgi1_6.h>
 
 #include <malloc.h>
 
@@ -51,14 +53,9 @@ bool D3D12Provider::IsD3D12APIAvailable() {
 std::unique_ptr<D3D12Provider> D3D12Provider::Create() {
   std::unique_ptr<D3D12Provider> provider(new D3D12Provider);
   if (!provider->Initialize()) {
-    rex::FatalError(
-        "Unable to initialize Direct3D 12 graphics subsystem.\n"
-        "\n"
-        "Ensure that you have the latest drivers for your GPU and it supports "
-        "Direct3D 12 with the feature level of at least 11_0.\n"
-        "\n"
-        "See https://xenia.jp/faq/ for more information and a list of "
-        "supported GPUs.");
+    REXLOG_ERROR(
+        "Unable to initialize Direct3D 12. A Direct3D 12 driver with feature level "
+        "11_0 or newer is required; try Automatic or Direct3D 11 in the launcher.");
     return nullptr;
   }
   return provider;
@@ -253,10 +250,19 @@ bool D3D12Provider::Initialize() {
   // Choose the adapter.
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+  Microsoft::WRL::ComPtr<IDXGIFactory6> preferred_factory;
+  if (REXCVAR_GET(d3d12_adapter) == -1)
+    dxgi_factory->QueryInterface(IID_PPV_ARGS(&preferred_factory));
+  auto enumerate_adapter = [&]() {
+    return preferred_factory
+               ? preferred_factory->EnumAdapterByGpuPreference(
+                     adapter_index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter))
+               : dxgi_factory->EnumAdapters1(adapter_index, &adapter);
+  };
+  while (enumerate_adapter() == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
-      if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
+      if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, IID_ID3D12Device,
                                              nullptr))) {
         if (REXCVAR_GET(d3d12_adapter) >= 0) {
           if (adapter_index == REXCVAR_GET(d3d12_adapter)) {
@@ -373,24 +379,22 @@ bool D3D12Provider::Initialize() {
   }
   queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
   queue_desc.NodeMask = 0;
-  ID3D12CommandQueue* direct_queue;
-  if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&direct_queue)))) {
-    bool queue_created = false;
-    if (queue_desc.Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
-      REXLOG_WARN(
-          "Failed to create a Direct3D 12 direct command queue with global "
-          "realtime priority, falling back to high priority, try launching "
-          "Xenia as administrator");
-      queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
-      queue_created =
-          SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&direct_queue)));
-    }
-    if (!queue_created) {
-      REXLOG_ERROR("Failed to create a Direct3D 12 direct command queue");
-      device->Release();
-      dxgi_factory->Release();
-      return false;
-    }
+  ID3D12CommandQueue* direct_queue = nullptr;
+  auto queue_priority = TryGraphicsQueuePriority(
+      queue_desc.Priority, D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME,
+      D3D12_COMMAND_QUEUE_PRIORITY_HIGH, D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, [&](int priority) {
+        queue_desc.Priority = priority;
+        HRESULT result = device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&direct_queue));
+        if (FAILED(result))
+          REXLOG_WARN("Direct3D 12 command queue priority {} failed ({:08X})", priority,
+                      uint32_t(result));
+        return SUCCEEDED(result);
+      });
+  if (!queue_priority) {
+    REXLOG_ERROR("Failed to create a Direct3D 12 direct command queue at normal priority");
+    device->Release();
+    dxgi_factory->Release();
+    return false;
   }
 
   dxgi_factory_ = dxgi_factory;

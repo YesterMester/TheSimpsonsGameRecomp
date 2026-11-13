@@ -1,0 +1,29 @@
+{
+  "id": "examples.mission-editor",
+  "name": "Mission editor",
+  "author": "",
+  "description": "Author and playtest routes in the native menus, with prerequisites, retry points and a shared prop scene.",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "state",
+  "mission": {
+    "schema": 1,
+    "name": "My mission",
+    "description": "",
+    "level_root": "",
+    "revision": 1,
+    "time_limit": 0,
+    "fail_on_defeat": true,
+    "auto_start": false,
+    "objectives": []
+  },
+  "scene": {
+    "schema": 1,
+    "name": "My scene",
+    "level_root": "",
+    "autoload": false,
+    "objects": []
+  }
+}

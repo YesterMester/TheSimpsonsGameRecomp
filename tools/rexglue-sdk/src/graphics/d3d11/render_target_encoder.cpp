@@ -15,9 +15,9 @@ bool Failed(HRESULT result, const char* operation, std::string& error) {
 }  // namespace
 
 bool RenderTargetEncoder::Initialize(const DxbcRenderTargetDumpShader::Options& options,
-                                     std::string& error) {
+                                     std::string& error, bool defer_buffer) {
   error.clear();
-  if (buffer_ || !options.resolution_scale_x || !options.resolution_scale_y ||
+  if (initialized_ || !options.resolution_scale_x || !options.resolution_scale_y ||
       options.resolution_scale_x > 3 || options.resolution_scale_y > 3) {
     error = "Invalid native resolve encoder initialization or resolution scale";
     return false;
@@ -27,6 +27,20 @@ bool RenderTargetEncoder::Initialize(const DxbcRenderTargetDumpShader::Options& 
   byte_size_ = xenos::kEdramTileCount * xenos::kEdramTileWidthSamples *
                xenos::kEdramTileHeightSamples * 4 * options.resolution_scale_x *
                options.resolution_scale_y;
+  initialized_ = true;
+  if (defer_buffer || EnsureBuffer(error))
+    return true;
+  initialized_ = false;
+  return false;
+}
+
+bool RenderTargetEncoder::EnsureBuffer(std::string& error) {
+  if (buffer_)
+    return true;
+  if (!initialized_) {
+    error = "Native render target encoder is not initialized";
+    return false;
+  }
   D3D11_BUFFER_DESC description = {};
   description.ByteWidth = byte_size_;
   description.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
@@ -58,7 +72,6 @@ bool RenderTargetEncoder::Initialize(const DxbcRenderTargetDumpShader::Options& 
     srvs_ = {};
     uavs_ = {};
     buffer_.Reset();
-    byte_size_ = 0;
     return false;
   }
   draws_.Invalidate();
@@ -77,6 +90,8 @@ bool RenderTargetEncoder::Encode(const RenderTargetSurface& source, uint32_t fir
                                  uint32_t source_pitch, uint32_t width_tiles, uint32_t height_tiles,
                                  std::string& error) {
   error.clear();
+  if (!EnsureBuffer(error))
+    return false;
   if (!buffer_ || first_tile >= 2 * xenos::kEdramTileCount ||
       source_base >= xenos::kEdramTileCount || !destination_pitch ||
       destination_pitch >= (1u << xenos::kEdramPitchTilesBits) || !source_pitch ||
@@ -163,6 +178,8 @@ bool RenderTargetEncoder::DownsampleFrom(const RenderTargetEncoder& source, uint
                                          uint32_t pitch_tiles, bool wide,
                                          xenos::MsaaSamples samples, std::string& error) {
   error.clear();
+  if (!EnsureBuffer(error))
+    return false;
   uint64_t words = uint64_t(width_tiles) * height_tiles * 1280;
   if (!buffer_ || !source.buffer_ || buffer_.Get() == source.buffer_.Get() ||
       options_.resolution_scale_x != 1 || options_.resolution_scale_y != 1 || !width_tiles ||

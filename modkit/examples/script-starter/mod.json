@@ -1,0 +1,15 @@
+{
+  "id": "examples.script-starter",
+  "name": "Script starter",
+  "author": "",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "state",
+  "default_locale": "en",
+  "locales": {
+    "en": "locales/en.json"
+  },
+  "description": "A small translated native menu and a saved counter."
+}

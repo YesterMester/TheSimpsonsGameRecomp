@@ -1,4 +1,5 @@
 #include "simpsons_init.h"
+#include <rex/ppc/barriers.h>
 
 DEFINE_REX_FUNC(sub_823223E8) {
 	REX_FUNC_PROLOGUE();
@@ -17922,6 +17923,7 @@ loc_82329BA8:
 	goto loc_82329C58;
 loc_82329BF0:
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// lwz r11,0(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);
 	// cmpwi r11,0
@@ -18030,6 +18032,7 @@ DEFINE_REX_FUNC(sub_82329C70) {
 	// beq 0x82329d4c
 	if (ctx.cr0.eq) goto loc_82329D4C;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// addi r11,r31,8
 	ctx.r11.s64 = ctx.r31.s64 + 8;
 	// lwz r10,0(r11)
@@ -20118,6 +20121,7 @@ DEFINE_REX_FUNC(sub_8232A868) {
 	// mr r31,r3
 	ctx.r31.u64 = ctx.r3.u64;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// li r4,0
 	ctx.r4.s64 = 0;
 	// lwz r30,16(r31)
@@ -20741,6 +20745,7 @@ DEFINE_REX_FUNC(sub_8232ABF8) {
 	// mr r31,r3
 	ctx.r31.u64 = ctx.r3.u64;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// li r4,0
 	ctx.r4.s64 = 0;
 	// lwz r30,16(r31)
@@ -21396,6 +21401,7 @@ loc_8232AFB4:
 	ctx.lr = 0x8232AFD4;
 	sub_824329D0(ctx, base);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// b 0x8232af9c
 	goto loc_8232AF9C;
 loc_8232AFDC:
@@ -21409,6 +21415,7 @@ loc_8232AFDC:
 	ctx.r29.s64 = 0;
 loc_8232AFEC:
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// lwz r11,0(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);
 	// cmplwi cr6,r11,0
@@ -21490,6 +21497,7 @@ loc_8232B07C:
 	// beq cr6,0x8232b094
 	if (ctx.cr6.eq) goto loc_8232B094;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// lwz r11,0(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);
 	// lwz r11,12(r11)
@@ -21528,6 +21536,7 @@ DEFINE_REX_FUNC(sub_8232B0A8) {
 	// mr r31,r3
 	ctx.r31.u64 = ctx.r3.u64;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// lwz r11,0(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 0);
 	// cmplwi r11,0

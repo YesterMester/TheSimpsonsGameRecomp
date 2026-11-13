@@ -27,11 +27,12 @@ namespace vulkan {
 // try not to waste that padding.
 VulkanUploadBufferPool::VulkanUploadBufferPool(const VulkanDevice* const vulkan_device,
                                                const VkBufferUsageFlags usage,
-                                               const size_t page_size)
+                                               const size_t page_size, const size_t tail_padding)
     : GraphicsUploadBufferPool(size_t(
           rex::round_up(VkDeviceSize(page_size), vulkan_device->properties().nonCoherentAtomSize))),
       vulkan_device_(vulkan_device),
-      usage_(usage) {}
+      usage_(usage),
+      tail_padding_(tail_padding) {}
 
 uint8_t* VulkanUploadBufferPool::Request(uint64_t submission_index, size_t size, size_t alignment,
                                          VkBuffer& buffer_out, VkDeviceSize& offset_out) {
@@ -74,7 +75,7 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
   buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   buffer_create_info.pNext = nullptr;
   buffer_create_info.flags = 0;
-  buffer_create_info.size = VkDeviceSize(page_size_);
+  buffer_create_info.size = VkDeviceSize(page_size_ + tail_padding_);
   buffer_create_info.usage = usage_;
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
@@ -100,7 +101,7 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
       return nullptr;
     }
     allocation_size_ = memory_requirements.size;
-    if (allocation_size_ > page_size_) {
+    if (allocation_size_ > page_size_ + tail_padding_) {
       // Try to occupy the allocation padding. If that's going to require even
       // more memory for some reason, don't.
       buffer_create_info.size = allocation_size_;
@@ -110,10 +111,10 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
         VkMemoryRequirements memory_requirements_expanded;
         dfn.vkGetBufferMemoryRequirements(device, buffer_expanded, &memory_requirements_expanded);
         uint32_t memory_type_expanded = util::ChooseHostMemoryType(
-            vulkan_device_->memory_types(), memory_requirements.memoryTypeBits, false);
+            vulkan_device_->memory_types(), memory_requirements_expanded.memoryTypeBits, false);
         if (memory_requirements_expanded.size <= allocation_size_ &&
             memory_type_expanded != UINT32_MAX) {
-          page_size_ = size_t(allocation_size_);
+          page_size_ = size_t(allocation_size_) - tail_padding_;
           allocation_size_ = memory_requirements_expanded.size;
           memory_type_ = memory_type_expanded;
           dfn.vkDestroyBuffer(device, buffer, nullptr);

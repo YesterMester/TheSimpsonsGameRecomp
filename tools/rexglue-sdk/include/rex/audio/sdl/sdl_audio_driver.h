@@ -44,6 +44,8 @@ class SDLAudioDriver : public AudioDriver {
   std::FILE* dump_ = nullptr;
   std::FILE* dump_timestamps_ = nullptr;
   uint8_t sdl_device_channels_ = 0;
+  // Centre (dialogue) gain for the stereo downmix, from audio_dialogue_level.
+  float stereo_center_gain_ = 0.0f;
 
   static const uint32_t frame_frequency_ = 48000;
   static const uint32_t frame_channels_ = 6;

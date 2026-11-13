@@ -8,6 +8,44 @@ if(NOT WIN32)
 endif()
 get_filename_component(REXGLUE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../rexglue-sdk" ABSOLUTE)
 
+# Ownership checks exercise the production memory tracker and physical CPU
+# aliases. Link a matching full runtime rather than substituting a mock tracker.
+set(REXGLUE_RUNTIME_IMPORT_LIBRARY "" CACHE FILEPATH "Import library for a matching Windows runtime")
+if(REXGLUE_RUNTIME_IMPORT_LIBRARY)
+    if(NOT EXISTS "${REXGLUE_RUNTIME_IMPORT_LIBRARY}")
+        message(FATAL_ERROR "REXGLUE_RUNTIME_IMPORT_LIBRARY does not exist")
+    endif()
+    add_executable(d3d11_native_memory_check ../d3d11_native_memory_check.cpp)
+    target_compile_features(d3d11_native_memory_check PRIVATE cxx_std_23)
+    target_include_directories(d3d11_native_memory_check PRIVATE
+        ${REXGLUE_ROOT}/include ${REXGLUE_ROOT}/thirdparty/simde
+        ${REXGLUE_ROOT}/thirdparty/fmt/include ${REXGLUE_ROOT}/thirdparty/spdlog/include)
+    target_link_libraries(d3d11_native_memory_check PRIVATE
+        "${REXGLUE_RUNTIME_IMPORT_LIBRARY}" d3d11 dxgi dxguid)
+    add_executable(d3d11_native_texture_check ../d3d11_native_texture_check.cpp)
+    target_compile_features(d3d11_native_texture_check PRIVATE cxx_std_23)
+    target_include_directories(d3d11_native_texture_check SYSTEM PRIVATE
+        ${REXGLUE_ROOT}/include ${REXGLUE_ROOT}/thirdparty/simde
+        ${REXGLUE_ROOT}/thirdparty/fmt/include ${REXGLUE_ROOT}/thirdparty/spdlog/include
+        ${REXGLUE_ROOT}/thirdparty/xxHash)
+    target_link_libraries(d3d11_native_texture_check PRIVATE
+        "${REXGLUE_RUNTIME_IMPORT_LIBRARY}" d3d11 dxgi dxguid)
+    add_executable(memexport_bounds_check ../memexport_bounds_check.cpp)
+    target_compile_features(memexport_bounds_check PRIVATE cxx_std_23)
+    target_include_directories(memexport_bounds_check SYSTEM PRIVATE
+        ${REXGLUE_ROOT}/include ${REXGLUE_ROOT}/thirdparty/simde
+        ${REXGLUE_ROOT}/thirdparty/fmt/include ${REXGLUE_ROOT}/thirdparty/spdlog/include
+        ${REXGLUE_ROOT}/thirdparty/xxHash)
+    target_link_libraries(memexport_bounds_check PRIVATE "${REXGLUE_RUNTIME_IMPORT_LIBRARY}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(d3d11_native_memory_check PRIVATE
+            -Wall -Wextra -Werror -Wno-unused-parameter)
+        target_compile_options(d3d11_native_texture_check PRIVATE
+            -Wall -Wextra -Werror -Wno-unused-parameter)
+        target_compile_options(memexport_bounds_check PRIVATE -Wall -Wextra -Werror)
+    endif()
+endif()
+
 add_executable(bytes_equal_check ../bytes_equal_check.cpp)
 target_compile_features(bytes_equal_check PRIVATE cxx_std_23)
 target_include_directories(bytes_equal_check PRIVATE
@@ -30,6 +68,30 @@ add_executable(clock_ratio_check ../clock_ratio_check.cpp)
 target_compile_features(clock_ratio_check PRIVATE cxx_std_23)
 target_include_directories(clock_ratio_check PRIVATE ${REXGLUE_ROOT}/include)
 
+add_executable(graphics_resource_check ../graphics_resource_check.cpp)
+target_compile_features(graphics_resource_check PRIVATE cxx_std_23)
+target_include_directories(graphics_resource_check PRIVATE ${REXGLUE_ROOT}/include)
+
+add_executable(register_write_check ../register_write_check.cpp
+    ${REXGLUE_ROOT}/src/graphics/util/buffer_hash.cpp)
+target_compile_features(register_write_check PRIVATE cxx_std_23)
+target_include_directories(register_write_check PRIVATE
+    ${REXGLUE_ROOT}/include ${REXGLUE_ROOT}/thirdparty/simde ${REXGLUE_ROOT}/thirdparty/xxHash)
+
+add_executable(native_resolve_image_copy_check ../native_resolve_image_copy_check.cpp)
+target_compile_features(native_resolve_image_copy_check PRIVATE cxx_std_23)
+target_include_directories(native_resolve_image_copy_check PRIVATE ${REXGLUE_ROOT}/include)
+
+add_executable(vertex_fetch_bounds_check ../vertex_fetch_bounds_check.cpp)
+target_compile_features(vertex_fetch_bounds_check PRIVATE cxx_std_23)
+target_include_directories(vertex_fetch_bounds_check PRIVATE
+    ${REXGLUE_ROOT}/include
+    ${REXGLUE_ROOT}/thirdparty/simde)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(vertex_fetch_bounds_check PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter)
+endif()
+
 add_executable(d3d11_resolve_check
     ../d3d11_resolve_check.cpp
     ${REXGLUE_ROOT}/src/ui/d3d11/d3d11_device.cpp
@@ -41,6 +103,7 @@ add_executable(d3d11_resolve_check
     ${REXGLUE_ROOT}/src/graphics/d3d11/render_target_surface.cpp
     ${REXGLUE_ROOT}/src/graphics/d3d11/render_target_encoder.cpp
     ${REXGLUE_ROOT}/src/graphics/d3d11/resolve_copy.cpp
+    ${REXGLUE_ROOT}/src/graphics/pipeline/texture/info_formats.cpp
     ${REXGLUE_ROOT}/src/graphics/util/dxbc_render_target_dump.cpp
     ${REXGLUE_ROOT}/src/graphics/util/dxbc_render_target_transfer.cpp
     ${REXGLUE_ROOT}/src/graphics/util/dxbc_float.cpp

@@ -11,6 +11,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <list>
@@ -279,6 +280,12 @@ class KernelState {
   void OnThreadExit(XThread* thread);
   object_ref<XThread> GetThreadByID(uint32_t thread_id);
 
+  // Exact game saves: stops the dispatch thread taking deferred work (async
+  // I/O completions, which write guest memory) once its queue has drained and
+  // nothing is running. False, and nothing paused, if it doesn't drain in time.
+  bool PauseDispatch(std::chrono::milliseconds timeout);
+  void ResumeDispatch();
+
   FiberInfo* LookupFiber(uint32_t guest_addr);
   void RegisterFiber(uint32_t guest_addr, const FiberInfo& info);
   void UnregisterFiber(uint32_t guest_addr);
@@ -374,6 +381,8 @@ class KernelState {
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+  bool dispatch_paused_ = false;  // under the global lock
+  bool dispatch_busy_ = false;    // an item is running
 
   friend class XObject;
 };

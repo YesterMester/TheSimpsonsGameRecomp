@@ -36,6 +36,7 @@ inline bool BuildNativeSurfaceCopyRegions(uint32_t source_base, uint32_t source_
   uint32_t y_end = y + height;
   for (uint32_t dest_y = y; dest_y < y_end;) {
     uint32_t row_height = std::min(y_end - dest_y, kTileHeight - dest_y % kTileHeight);
+    size_t row_begin = regions.size();
     for (uint32_t dest_x = x; dest_x < x_end;) {
       uint32_t tile = uint32_t((uint64_t(dest_base) + uint64_t(dest_y / kTileHeight) * dest_pitch +
                                 dest_x / tile_width) &
@@ -49,7 +50,7 @@ inline bool BuildNativeSurfaceCopyRegions(uint32_t source_base, uint32_t source_
       uint32_t source_x = (source_tile % source_pitch) * tile_width + dest_x % tile_width;
       uint32_t source_y = source_row * kTileHeight + dest_y % kTileHeight;
       uint32_t column_width = std::min(x_end - dest_x, tile_width - dest_x % tile_width);
-      if (!regions.empty()) {
+      if (regions.size() > row_begin) {
         auto& previous = regions.back();
         if (previous.source_y == source_y && previous.dest_y == dest_y &&
             previous.height == row_height && previous.source_x + previous.width == source_x &&
@@ -62,6 +63,28 @@ inline bool BuildNativeSurfaceCopyRegions(uint32_t source_base, uint32_t source_
       regions.push_back({source_x, source_y, dest_x, dest_y, column_width, row_height});
       dest_x += column_width;
     }
+    // Where both surfaces map the next tile row the same way (equal pitches),
+    // extend the regions above instead: every region of a copy costs the
+    // driver two image views and a draw.
+    size_t kept = row_begin;
+    for (size_t i = row_begin; i < regions.size(); ++i) {
+      const NativeSurfaceCopyRegion region = regions[i];
+      bool extended = false;
+      for (size_t j = 0; j < row_begin; ++j) {
+        NativeSurfaceCopyRegion& above = regions[j];
+        if (above.dest_y + above.height == region.dest_y &&
+            above.source_y + above.height == region.source_y && above.dest_x == region.dest_x &&
+            above.source_x == region.source_x && above.width == region.width) {
+          above.height += region.height;
+          extended = true;
+          break;
+        }
+      }
+      if (!extended) {
+        regions[kept++] = region;
+      }
+    }
+    regions.resize(kept);
     dest_y += row_height;
   }
   return true;

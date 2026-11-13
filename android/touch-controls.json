@@ -1,0 +1,50 @@
+{
+  "version": 2,
+  "default_scheme": "simple",
+  "schemes": {
+    "simple": {
+      "label": "Simple touch",
+      "controls": [
+        {"id":"move","kind":7,"button":0,"label":"MOVE","x":0.13,"y":0.74,"radius":58,
+         "area":{"left":0,"top":0.2,"right":0.42,"bottom":1}},
+        {"id":"look","kind":8,"button":0,"label":"LOOK","x":0.6,"y":0.42,"radius":40,
+         "area":{"left":0.42,"top":0.2,"right":1,"bottom":1}},
+        {"id":"jump","kind":4,"button":4096,"label":"JUMP","color":"#2ea043","x":0.91,"y":0.8,"radius":38},
+        {"id":"attack","kind":4,"button":16384,"label":"ATTACK","color":"#2f81f7","x":0.79,"y":0.88,"radius":34},
+        {"id":"power","kind":4,"button":8192,"label":"POWER","color":"#da3633","x":0.93,"y":0.56,"radius":29},
+        {"id":"use","kind":4,"button":32768,"label":"USE","color":"#d29922","x":0.81,"y":0.66,"radius":27},
+        {"id":"target","kind":5,"button":0,"label":"LOCK","x":0.67,"y":0.9,"radius":25},
+        {"id":"team","kind":3,"button":0,"label":"TEAM","x":0.08,"y":0.34,"radius":34},
+        {"id":"list","kind":4,"button":32,"label":"LIST","x":0.07,"y":0.09,"radius":20},
+        {"id":"lb","kind":4,"button":256,"label":"LB","x":0.26,"y":0.09,"radius":18},
+        {"id":"menu","kind":9,"button":0,"label":"CONTROLS","x":0.45,"y":0.09,"radius":20},
+        {"id":"pause","kind":4,"button":16,"label":"PAUSE","x":0.55,"y":0.09,"radius":20},
+        {"id":"rb","kind":4,"button":512,"label":"RB","x":0.74,"y":0.09,"radius":18},
+        {"id":"rt","kind":6,"button":0,"label":"RT","x":0.86,"y":0.09,"radius":18},
+        {"id":"l3","kind":4,"button":64,"label":"L3","x":0.17,"y":0.09,"radius":16,"hidden":true},
+        {"id":"r3","kind":4,"button":128,"label":"R3","x":0.95,"y":0.09,"radius":16,"hidden":true}
+      ]
+    },
+    "gamepad": {
+      "label": "Touch gamepad",
+      "controls": [
+        {"id":"left_stick","kind":1,"button":0,"label":"MOVE","x":0.15,"y":0.75,"radius":58},
+        {"id":"right_stick","kind":2,"button":0,"label":"CAMERA","x":0.70,"y":0.78,"radius":48},
+        {"id":"dpad","kind":3,"button":0,"label":"D-PAD","x":0.10,"y":0.39,"radius":42},
+        {"id":"a","kind":4,"button":4096,"label":"A","color":"#2ea043","x":0.87,"y":0.48,"dy":45,"radius":29},
+        {"id":"b","kind":4,"button":8192,"label":"B","color":"#da3633","x":0.87,"y":0.48,"dx":45,"radius":27},
+        {"id":"x","kind":4,"button":16384,"label":"X","color":"#2f81f7","x":0.87,"y":0.48,"dx":-45,"radius":27},
+        {"id":"y","kind":4,"button":32768,"label":"Y","color":"#d29922","x":0.87,"y":0.48,"dy":-45,"radius":27},
+        {"id":"lb","kind":4,"button":256,"label":"LB","x":0.09,"y":0.12,"radius":27},
+        {"id":"lt","kind":5,"button":0,"label":"LT","x":0.22,"y":0.12,"radius":27},
+        {"id":"rt","kind":6,"button":0,"label":"RT","x":0.78,"y":0.12,"radius":27},
+        {"id":"rb","kind":4,"button":512,"label":"RB","x":0.91,"y":0.12,"radius":27},
+        {"id":"back","kind":4,"button":32,"label":"BACK","x":0.39,"y":0.09,"radius":22},
+        {"id":"menu","kind":9,"button":0,"label":"CONTROLS","x":0.5,"y":0.09,"radius":22},
+        {"id":"pause","kind":4,"button":16,"label":"PAUSE","x":0.61,"y":0.09,"radius":22},
+        {"id":"l3","kind":4,"button":64,"label":"L3","x":0.29,"y":0.88,"radius":22},
+        {"id":"r3","kind":4,"button":128,"label":"R3","x":0.56,"y":0.88,"radius":22}
+      ]
+    }
+  }
+}

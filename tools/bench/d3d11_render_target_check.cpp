@@ -1,6 +1,8 @@
 #include <rex/graphics/d3d11/render_target_encoder.h>
 #include <rex/graphics/util/dxbc_render_target_transfer.h>
 
+#include <d3d11shader.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -31,11 +33,58 @@ void Check(HRESULT result, const char* operation) {
     throw std::runtime_error(message);
   }
 }
+
+void CheckNativeHelpers(D3D11Device& device) {
+  // These helpers must work with the system SM 5.0 compiler. Compiling them
+  // as SM 5.1 used to fail on Windows before any game draw could complete.
+  using Stage = D3D11Device::ShaderStage;
+  struct Source {
+    Stage stage;
+    const char* text;
+  };
+  constexpr std::array sources = {
+      Source{Stage::kVertex,
+             "float4 main(uint id:SV_VertexID):SV_Position {"
+             "return float4(float(id),0,0,1); }"},
+      Source{Stage::kPixel, "float4 main():SV_Target { return float4(1,0,0,1); }"},
+      Source{Stage::kCompute, "[numthreads(1,1,1)] void main() {}"}};
+  for (const auto& source : sources) {
+    std::string error;
+    auto program = ShaderProgram::CompileNative(device, source.text, source.stage, error);
+    Require(bool(program), error);
+    const auto& bytecode = program->bytecode();
+    ComPtr<ID3D11ShaderReflection> reflection;
+    Check(D3DReflect(bytecode.data.data(), bytecode.data.size(), IID_ID3D11ShaderReflection,
+                     reinterpret_cast<void**>(reflection.GetAddressOf())),
+          "Native helper reflection");
+    D3D11_SHADER_DESC description = {};
+    Check(reflection->GetDesc(&description), "Native helper description");
+    Require((description.Version & 0xFFFF) == 0x50,
+            "A native DX11 helper requires a newer compiler than SM 5.0");
+    Require((description.Version >> 16) == bytecode.program_type,
+            "Native helper stage differs from its compiled bytecode");
+    Require((source.stage == Stage::kVertex && program->vertex()) ||
+                (source.stage == Stage::kPixel && program->pixel()) ||
+                (source.stage == Stage::kCompute && program->compute()),
+            "Native helper has no shader object for its stage");
+    ShaderCache translated(device);
+    Require(!translated.GetOrCreate(bytecode.data, false, error) && !error.empty(),
+            "Native helpers were accepted as untranslated SM 5.1 input");
+  }
+  std::string error = "previous error";
+  Require(!ShaderProgram::CompileNative(device, "invalid HLSL", Stage::kPixel, error) &&
+              !error.empty() && error != "previous error",
+          "Native helper compilation discarded its diagnostics");
+  Require(
+      !ShaderProgram::CompileNative(device, sources[0].text, Stage(999), error) && !error.empty(),
+      "Native helper compilation accepted an invalid stage");
+}
+
 struct Result {
   uint64_t pixels = 0, exact_integer_components = 0;
   uint64_t encoded_words = 0, preserved_encoding_words = 0;
   uint32_t surfaces = 0, clears = 0, transfers = 0, snapshots = 0, rejected = 0;
-  uint32_t encodes = 0, stencil_reference_transfers = 0;
+  uint32_t encodes = 0, stencil_reference_transfers = 0, mixed_resolution_cases = 0;
 };
 void CheckDebugMessages(D3D11Device& owner);
 struct Fixture {
@@ -234,7 +283,8 @@ struct Fixture {
 
   const ShaderProgram* Program(uint32_t format, bool depth, MsaaSamples destination,
                                MsaaSamples source, bool native_2x, uint32_t scale,
-                               bool stencil = false, bool stencil_reference = false) {
+                               bool stencil = false, bool stencil_reference = false,
+                               bool destination_original = false, bool source_original = false) {
     using Generator = DxbcRenderTargetTransferShader;
     Generator::TransferShaderKey key;
     key.mode = depth ? (stencil ? Generator::TransferMode::kDepthToStencilBit
@@ -243,6 +293,8 @@ struct Fixture {
     key.dest_resource_format = key.source_resource_format = format;
     key.dest_msaa_samples = destination;
     key.source_msaa_samples = source;
+    key.dest_original_resolution = destination_original;
+    key.source_original_resolution = source_original;
     Generator::Options options;
     options.resolution_scale_x = options.resolution_scale_y = scale;
     options.msaa_2x_supported = native_2x;
@@ -428,29 +480,51 @@ struct Fixture {
   // shader in one pass, as the game does where the device supports it.
   void Case(uint32_t format, bool depth, MsaaSamples source_samples,
             MsaaSamples destination_samples, bool native_2x, uint32_t scale,
-            bool stencil_reference = false) {
+            bool stencil_reference = false, bool destination_original = false,
+            bool source_original = false) {
     constexpr uint32_t destination_pitch = 2, source_pitch = 3;
-    auto source = Surface(format, depth, source_samples, native_2x, 240 * scale, 64 * scale);
-    auto destination =
-        Surface(format, depth, destination_samples, native_2x, 160 * scale, 32 * scale);
-    D3D11_RECT source_full = {0, 0, LONG(240 * scale), LONG(64 * scale)};
-    D3D11_RECT full = {0, 0, LONG(160 * scale), LONG(32 * scale)};
+    const uint32_t source_scale = source_original ? 1 : scale;
+    const uint32_t destination_scale = destination_original ? 1 : scale;
+    const bool mixed_resolution = destination_original || source_original;
+    result.mixed_resolution_cases += mixed_resolution;
+    auto source =
+        Surface(format, depth, source_samples, native_2x, 240 * source_scale, 64 * source_scale);
+    auto destination = Surface(format, depth, destination_samples, native_2x,
+                               160 * destination_scale, 32 * destination_scale);
+    D3D11_RECT source_full = {0, 0, LONG(240 * source_scale), LONG(64 * source_scale)};
+    D3D11_RECT full = {0, 0, LONG(160 * destination_scale), LONG(32 * destination_scale)};
     Clear(*source, 0, {&source_full, 1});
     Clear(*destination, 3, {&full, 1});
     // A different value in every source quadrant catches stale bindings, base
     // changes, pitch changes and source coordinates rather than just copies.
     for (uint32_t y = 0; y < 2; ++y)
       for (uint32_t x = 0; x < 2; ++x) {
-        D3D11_RECT rect = {LONG(x * 120 * scale), LONG(y * 32 * scale), LONG((x + 1) * 120 * scale),
-                           LONG((y + 1) * 32 * scale)};
+        D3D11_RECT rect = {LONG(x * 120 * source_scale), LONG(y * 32 * source_scale),
+                           LONG((x + 1) * 120 * source_scale), LONG((y + 1) * 32 * source_scale)};
         Clear(*source, x + y * 2, {&rect, 1});
       }
+    // Unaligned host pixels distinguish the selected subpixel from a uniform
+    // guest pixel. Quadrants alone cannot catch a wrong up/downsampling phase.
+    constexpr std::array<std::array<uint32_t, 2>, 8> markers = {
+        {{13, 9}, {27, 10}, {79, 15}, {81, 16}, {119, 31}, {121, 32}, {159, 45}, {161, 46}}};
+    if (mixed_resolution) {
+      for (uint32_t i = 0; i < markers.size(); ++i) {
+        D3D11_RECT rect = {LONG(markers[i][0]), LONG(markers[i][1]), LONG(markers[i][0] + 1),
+                           LONG(markers[i][1] + 1)};
+        Clear(*source, (i + 1) & 3, {&rect, 1});
+      }
+    }
     auto source_pixels = Read(*source);
     std::vector<Pixel> source_reference(source_pixels.size());
     for (uint32_t y = 0; y < source->description().height; ++y)
       for (uint32_t x = 0; x < source->description().width; ++x)
         for (uint32_t s = 0; s < source->sample_count(); ++s) {
-          uint32_t pattern = (x / (120 * scale)) + (y / (32 * scale)) * 2;
+          uint32_t pattern = (x / (120 * source_scale)) + (y / (32 * source_scale)) * 2;
+          if (mixed_resolution) {
+            for (uint32_t i = 0; i < markers.size(); ++i)
+              if (x == markers[i][0] && y == markers[i][1])
+                pattern = (i + 1) & 3;
+          }
           bool unused_sample = source_samples == MsaaSamples::k2X && !native_2x && s != 0 && s != 3;
           // Initialize unused samples explicitly; the guest never addresses them.
           if (unused_sample)
@@ -469,11 +543,12 @@ struct Fixture {
     ++result.snapshots;
     Clear(*source, 3, {&source_full, 1});
     Compare(*snapshot, Read(*snapshot), source_pixels, "Retained source");
-    if (destination_samples == MsaaSamples::k1X)
-      EncodeSource(*snapshot, scale, native_2x);
+    if (destination_samples == MsaaSamples::k1X && !mixed_resolution)
+      EncodeSource(*snapshot, source_scale, native_2x);
 
     auto expected = Read(*destination);
-    D3D11_RECT rect = {LONG(7 * scale), LONG(3 * scale), LONG(153 * scale), LONG(29 * scale)};
+    D3D11_RECT rect = {LONG(7 * destination_scale), LONG(3 * destination_scale),
+                       LONG(153 * destination_scale), LONG(29 * destination_scale)};
     DxbcRenderTargetTransferShader::TransferAddressConstant address;
     bool wide = !depth && rex::graphics::xenos::IsColorRenderTargetFormat64bpp(
                               rex::graphics::xenos::ColorRenderTargetFormat(format));
@@ -488,8 +563,9 @@ struct Fixture {
     if (depth && !stencil_reference)
       Require(transfer.ClearDepthStencil(*destination, false, 0, true, 0, {&rect, 1}, error),
               error);
-    const auto* program = Program(format, depth, destination_samples, source_samples, native_2x,
-                                  scale, false, stencil_reference);
+    const auto* program =
+        Program(format, depth, destination_samples, source_samples, native_2x, scale, false,
+                stencil_reference, destination_original, source_original);
     Require(
         transfer.Transfer(*destination, *snapshot, nullptr, *program, constants, {&rect, 1}, error),
         error);
@@ -517,7 +593,8 @@ struct Fixture {
       Require(actual_address == address.constant, "Transfer address buffer differs from the draw");
     }
     if (depth && !stencil_reference) {
-      program = Program(format, true, destination_samples, source_samples, native_2x, scale, true);
+      program = Program(format, true, destination_samples, source_samples, native_2x, scale, true,
+                        false, destination_original, source_original);
       constants.output = RenderTargetTransfer::Output::kStencilBit;
       for (uint32_t bit = 1; bit < 256; bit <<= 1) {
         constants.stencil_bit = uint8_t(bit);
@@ -532,16 +609,19 @@ struct Fixture {
     uint32_t source_x_samples = source_samples == MsaaSamples::k4X ? 2 : 1;
     uint32_t source_y_samples = source_samples == MsaaSamples::k1X ? 1 : 2;
     uint32_t words_per_sample = wide ? 2 : 1;
-    uint32_t tile_width = 80 * scale, tile_height = 16 * scale;
+    uint32_t address_scale = mixed_resolution ? 1 : scale;
+    uint32_t tile_width = 80 * address_scale, tile_height = 16 * address_scale;
     for (uint32_t y = rect.top; y < uint32_t(rect.bottom); ++y)
       for (uint32_t x = rect.left; x < uint32_t(rect.right); ++x)
         for (uint32_t s = 0; s < destination->sample_count(); ++s) {
           if (destination_samples == MsaaSamples::k2X && !native_2x && s != 0 && s != 3)
             continue;
           uint32_t word_x =
-              (x * destination_x_samples + (destination_samples == MsaaSamples::k4X ? s & 1 : 0)) *
+              ((mixed_resolution ? x / destination_scale : x) * destination_x_samples +
+               (destination_samples == MsaaSamples::k4X ? s & 1 : 0)) *
               words_per_sample;
-          uint32_t word_y = y * destination_y_samples + SampleY(destination_samples, native_2x, s);
+          uint32_t word_y = (mixed_resolution ? y / destination_scale : y) * destination_y_samples +
+                            SampleY(destination_samples, native_2x, s);
           uint32_t tile = (word_y / tile_height) * address.dest_pitch + word_x / tile_width +
                           address.source_to_dest;
           uint32_t source_word_x = (tile % address.source_pitch) * tile_width + word_x % tile_width;
@@ -552,6 +632,12 @@ struct Fixture {
           uint32_t ss = NativeSample(source_samples, native_2x,
                                      (source_word_x / words_per_sample) % source_x_samples,
                                      source_word_y % source_y_samples);
+          if (mixed_resolution && source_scale != 1) {
+            sx = sx * source_scale +
+                 (destination_original ? source_scale / 2 : x % destination_scale);
+            sy = sy * source_scale +
+                 (destination_original ? source_scale / 2 : y % destination_scale);
+          }
           Require(sx < snapshot->description().width && sy < snapshot->description().height,
                   "Independent transfer address outside the source");
           expected[(y * destination->description().width + x) * destination->sample_count() + s] =
@@ -562,10 +648,11 @@ struct Fixture {
     // A later invalid rectangle must reject the whole batch before its first,
     // valid rectangle changes any pixels.
     std::array<D3D11_RECT, 2> invalid = {full, D3D11_RECT{-1, 0, 2, 2}};
-    Require(!transfer.Transfer(*destination, *snapshot, nullptr,
-                               *Program(format, depth, destination_samples, source_samples,
-                                        native_2x, scale, false, stencil_reference),
-                               constants, invalid, error),
+    Require(!transfer.Transfer(
+                *destination, *snapshot, nullptr,
+                *Program(format, depth, destination_samples, source_samples, native_2x, scale,
+                         false, stencil_reference, destination_original, source_original),
+                constants, invalid, error),
             "Out-of-range transfer rectangle accepted");
     ++result.rejected;
     Compare(*destination, Read(*destination), expected, "Rejected batch preservation");
@@ -604,33 +691,56 @@ int main(int argc, char** argv) {
     D3D11Device::Options options;
     options.debug = true;
     options.maximum_feature_level = D3D_FEATURE_LEVEL_11_0;
+    bool mixed_only = false;
     for (int i = 1; i < argc; ++i) {
       std::string arg(argv[i]);
       if (arg == "--warp")
         options.warp = true;
       else if (arg == "--fl11-1")
         options.maximum_feature_level = D3D_FEATURE_LEVEL_11_1;
+      else if (arg == "--mixed-only")
+        mixed_only = true;
       else if (arg == "--output" && i + 1 < argc)
         output = argv[++i];
       else
         throw std::runtime_error(
-            "usage: d3d11_render_target_check [--warp] [--fl11-1] [--output report.json]");
+            "usage: d3d11_render_target_check [--warp] [--fl11-1] [--mixed-only] [--output "
+            "report.json]");
     }
     std::string error;
     auto device = D3D11Device::Create(options, error);
     Require(bool(device), error);
+    CheckNativeHelpers(*device);
     Fixture fixture(*device);
     constexpr std::array<uint32_t, 12> colors = {0, 1, 2, 3, 4, 5, 6, 7, 10, 12, 14, 15};
-    for (uint32_t scale : {1u, 2u})
+    if (!mixed_only) {
+      for (uint32_t scale : {1u, 2u})
+        for (bool native_2x : {true, false})
+          for (MsaaSamples source : {MsaaSamples::k1X, MsaaSamples::k2X, MsaaSamples::k4X})
+            for (MsaaSamples destination : {MsaaSamples::k1X, MsaaSamples::k2X, MsaaSamples::k4X}) {
+              for (uint32_t format : colors)
+                fixture.Case(format, false, source, destination, native_2x, scale);
+              for (uint32_t format : {0u, 1u}) {
+                fixture.Case(format, true, source, destination, native_2x, scale);
+                if (device->features().pixel_shader_stencil_reference)
+                  fixture.Case(format, true, source, destination, native_2x, scale, true);
+              }
+            }
+    }
+    for (const auto& original :
+         {std::array{false, true}, std::array{true, false}, std::array{true, true}})
       for (bool native_2x : {true, false})
         for (MsaaSamples source : {MsaaSamples::k1X, MsaaSamples::k2X, MsaaSamples::k4X})
           for (MsaaSamples destination : {MsaaSamples::k1X, MsaaSamples::k2X, MsaaSamples::k4X}) {
-            for (uint32_t format : colors)
-              fixture.Case(format, false, source, destination, native_2x, scale);
+            for (uint32_t format : {0u, 2u, 4u, 5u, 7u, 14u, 15u})
+              fixture.Case(format, false, source, destination, native_2x, 2, false, original[0],
+                           original[1]);
             for (uint32_t format : {0u, 1u}) {
-              fixture.Case(format, true, source, destination, native_2x, scale);
+              fixture.Case(format, true, source, destination, native_2x, 2, false, original[0],
+                           original[1]);
               if (device->features().pixel_shader_stencil_reference)
-                fixture.Case(format, true, source, destination, native_2x, scale, true);
+                fixture.Case(format, true, source, destination, native_2x, 2, true, original[0],
+                             original[1]);
             }
           }
     fixture.draws.Invalidate();
@@ -641,6 +751,7 @@ int main(int argc, char** argv) {
         "{\n  \"passed\":true,\n  \"scope\":\"native image ownership transfers and partial "
         "clears\",\n";
     report += "  \"feature_level\":" + std::to_string(device->features().level) + ",\n";
+    report += "  \"native_helper_shader_model\":\"5.0\",\n";
     report +=
         "  \"software\":" + std::string(device->features().software ? "true" : "false") + ",\n";
     report += "  \"pixels\":" + std::to_string(result.pixels) + ",\n";
@@ -653,6 +764,8 @@ int main(int argc, char** argv) {
     report += "  \"surfaces\":" + std::to_string(result.surfaces) + ",\n";
     report += "  \"partial_clears\":" + std::to_string(result.clears) + ",\n";
     report += "  \"ownership_transfers\":" + std::to_string(result.transfers) + ",\n";
+    report +=
+        "  \"mixed_resolution_cases\":" + std::to_string(result.mixed_resolution_cases) + ",\n";
     report += "  \"retained_snapshots\":" + std::to_string(result.snapshots) + ",\n";
     report += "  \"pixel_shader_stencil_reference\":" +
               std::string(device->features().pixel_shader_stencil_reference ? "true" : "false") +

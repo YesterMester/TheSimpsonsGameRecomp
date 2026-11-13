@@ -20,6 +20,8 @@
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/native_gpu_calls.h>
+#include <rex/graphics/native_gpu_presentation.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/graphics/xenos.h>
@@ -528,30 +530,18 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   // use this method.
   buffer_ptr.Zero(64 * 4);
 
-  uint32_t offset = 0;
+  namespace native_present = rex::graphics::native_gpu_presentation;
+  const bool native =
+      (rex::graphics::native_gpu_calls::Capabilities() & native_present::kCapability) &&
+      REXCVAR_QUERY(bool, native_gpu_calls) &&
+      native_present::DimensionsIndependent(buffer_ptr.host_address(), width.host_address(),
+                                             height.host_address());
   auto dwords = buffer_ptr.as_array<uint32_t>();
-
-  // Write in the GPU texture fetch.
-  dwords[offset++] =
-      xenos::MakePacketType0(rex::graphics::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 6);
-  dwords[offset++] = gpu_fetch.dword_0;
-  dwords[offset++] = gpu_fetch.dword_1;
-  dwords[offset++] = gpu_fetch.dword_2;
-  dwords[offset++] = gpu_fetch.dword_3;
-  dwords[offset++] = gpu_fetch.dword_4;
-  dwords[offset++] = gpu_fetch.dword_5;
-
-  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
-  dwords[offset++] = rex::graphics::xenos::kSwapSignature;
-  dwords[offset++] = frontbuffer_physical_address;
-
-  dwords[offset++] = *width;
-  dwords[offset++] = *height;
-
-  // Fill the rest of the buffer with NOP packets.
-  for (uint32_t i = offset; i < 64; i++) {
-    dwords[i] = xenos::MakePacketType2();
-  }
+  const std::array<uint32_t, 6> fetch = {gpu_fetch.dword_0, gpu_fetch.dword_1, gpu_fetch.dword_2,
+                                        gpu_fetch.dword_3, gpu_fetch.dword_4, gpu_fetch.dword_5};
+  native_present::WriteBuffer(dwords, fetch, frontbuffer_physical_address,
+                              [&] { return uint32_t(*width); }, [&] { return uint32_t(*height); },
+                              uint32_t(xenos::kSwapSignature), native);
 }
 
 void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,

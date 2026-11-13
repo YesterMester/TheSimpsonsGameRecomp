@@ -88,6 +88,7 @@
 #pragma once
 
 #include <charconv>
+#include <map>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -109,6 +110,10 @@ void ApplyEnvironment();
 void FinalizeInit();
 bool IsFinalized();
 void SaveConfig(const std::filesystem::path& config_path);
+// Update only the supplied settings, retaining unknown keys and overrides.
+// This also saves startup-only choices without changing the running device.
+bool SaveConfigPatch(const std::filesystem::path& config_path,
+                      const std::map<std::string, std::string>& values);
 
 //=============================================================================
 // Flag Registry

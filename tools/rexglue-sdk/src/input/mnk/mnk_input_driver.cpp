@@ -129,6 +129,11 @@ uint32_t MnkInputDriver::UserIndex() const {
   return static_cast<uint32_t>(REXCVAR_GET(mnk_user_index));
 }
 
+std::vector<InputDevice> MnkInputDriver::GetDevices() {
+  return {{"keyboard", "Keyboard & mouse", DeviceKind::kKeyboard,
+           PromptStyle::kKeyboard, UserIndex()}};
+}
+
 bool MnkInputDriver::IsEnabled() const {
   return REXCVAR_GET(mnk_mode);
 }
@@ -417,12 +422,26 @@ int32_t MnkInputDriver::MouseVelocityToStick(double velocity) const {
   return int32_t(velocity < 0.0 ? -value : value);
 }
 
+void MnkInputDriver::SetMenuPointerActive(bool active) {
+  if (menu_pointer_active_.exchange(active) == active)
+    return;
+  {
+    std::lock_guard lock(state_mutex_);
+    mouse_dx_ = mouse_dy_ = 0;
+    stick_rx_ = stick_ry_ = 0;
+    prev_velocity_x_ = prev_velocity_y_ = 0;
+    stick_update_time_ = {};
+  }
+  UpdateMouseCapture();
+}
+
 void MnkInputDriver::UpdateMouseCapture() {
   if (!attached_window_)
     return;
 
   bool should_capture =
-      IsEnabled() && has_focus_ && is_active() && !rex::ui::IsOverlayInputActive();
+      IsEnabled() && has_focus_ && is_active() && !menu_pointer_active_ &&
+      !rex::ui::IsOverlayInputActive();
   if (should_capture != capture_requested_) {
     capture_requested_ = should_capture;
     // Window mouse capture and cursor changes belong to the UI thread (GTK
@@ -487,8 +506,6 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
 }
 
 void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
-  if (!IsEnabled())
-    return;
   std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
   SetKeyState(vk, false);
@@ -520,8 +537,6 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
 }
 
 void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
-  if (!IsEnabled())
-    return;
   std::lock_guard lock(state_mutex_);
   switch (e.button()) {
     case rex::ui::MouseEvent::Button::kLeft:

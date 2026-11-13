@@ -70,6 +70,12 @@ class D3D11TextureCache final : public TextureCache {
   std::unique_ptr<Texture> CreateTexture(TextureKey key) override;
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
+  bool CanLoadTextureDataFromCpu(const Texture& texture, bool load_base,
+                                 bool load_mips) const override;
+  bool LoadTextureDataFromCpuImpl(Texture& texture, bool load_base, bool load_mips) override;
+  bool CanLoadTextureDataFromNativeGpu(const Texture& texture, bool load_base,
+                                       bool load_mips) const override;
+  bool LoadTextureDataFromNativeGpuImpl(Texture& texture, bool load_base, bool load_mips) override;
 
  private:
   // Kept in guest format order, including formats currently unsupported by the
@@ -115,6 +121,11 @@ class D3D11TextureCache final : public TextureCache {
   static bool HasScaledLoadProgram(LoadShaderIndex index);
   ID3D11ShaderResourceView* GetOrCreateView(D3D11Texture& texture,
                                             const DxbcShader::TextureBinding& binding);
+  bool LoadTextureDataImpl(Texture& texture, bool load_base, bool load_mips, bool from_cpu,
+                           bool from_native_gpu = false);
+  bool EnsureDecodeBuffer(uint32_t size);
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> CaptureCpuTextureSource(
+      uint32_t address, uint32_t length, uint32_t element_size_log2);
   bool Failed(HRESULT result, const char* operation);
 
   D3D11SharedMemory& native_memory_;
@@ -126,6 +137,12 @@ class D3D11TextureCache final : public TextureCache {
   std::array<std::array<const ShaderProgram*, kLoadShaderCount>, 2> load_programs_ = {};
   std::array<std::array<bool, kLoadShaderCount>, 2> load_attempted_ = {};
   std::array<std::array<std::string, kLoadShaderCount>, 2> load_errors_;
+  Microsoft::WRL::ComPtr<ID3D11Buffer> decode_buffer_, decode_constants_;
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> decode_source_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>, 3> decode_destinations_;
+  uint32_t decode_buffer_capacity_ = 0;
+  std::vector<uint8_t> cpu_upload_snapshot_;
+  uint64_t cpu_texture_uploads_ = 0, cpu_texture_upload_bytes_ = 0;
   std::string last_error_;
 };
 

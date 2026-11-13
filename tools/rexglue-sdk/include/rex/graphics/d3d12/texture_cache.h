@@ -13,6 +13,8 @@
 
 #include <array>
 #include <functional>
+#include <deque>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -90,6 +92,19 @@ class D3D12TextureCache final : public TextureCache {
   void BeginFrame() override;
   void EndFrame();
 
+  struct NativeResolveTarget {
+    Texture* texture;
+    ID3D12Resource* resource;
+    uint32_t width;
+    uint32_t height;
+  };
+  static constexpr uint32_t kMaxNativeResolveTargets = 4;
+  uint32_t FindNativeResolveTargets(uint32_t dest_base, uint32_t dest_pitch_texels,
+                                    xenos::TextureFormat format, xenos::Endian endian, bool scaled,
+                                    NativeResolveTarget* targets_out);
+  void BeginNativeResolveWrite(const NativeResolveTarget& target);
+  void EndNativeResolveWrite(const NativeResolveTarget& target, bool red_blue_swapped);
+
   // Must be called within a submission - creates and untiles textures needed by
   // shaders and puts them in the SRV state. This may bind compute pipelines
   // (notifying the command processor about that), so this must be called before
@@ -145,8 +160,9 @@ class D3D12TextureCache final : public TextureCache {
   ID3D12Resource* GetCurrentScaledResolveBufferResource() {
     return GetCurrentScaledResolveBuffer().resource();
   }
-  size_t GetCurrentScaledResolveBufferIndexPublic() const {
-    return GetCurrentScaledResolveBufferIndex();
+  uint64_t GetCurrentScaledResolveBufferOriginScaled() const {
+    return native_scaled_resolves_ ? native_scaled_resolve_current_base_
+                                   : uint64_t(GetCurrentScaledResolveBufferIndex()) << 30;
   }
   void MarkCurrentScaledResolveRangeUAVWritesCommitNeeded() {
     assert_true(IsDrawResolutionScaled());
@@ -171,6 +187,13 @@ class D3D12TextureCache final : public TextureCache {
   uint32_t GetMaxHostTextureDepthOrArraySize(xenos::DataDimension dimension) const override;
 
   std::unique_ptr<Texture> CreateTexture(TextureKey key) override;
+
+  bool CanLoadTextureDataFromCpu(const Texture& texture, bool load_base,
+                                 bool load_mips) const override;
+  bool LoadTextureDataFromCpuImpl(Texture& texture, bool load_base, bool load_mips) override;
+  bool CanLoadTextureDataFromNativeGpu(const Texture& texture, bool load_base,
+                                       bool load_mips) const override;
+  bool LoadTextureDataFromNativeGpuImpl(Texture& texture, bool load_base, bool load_mips) override;
 
   // This binds pipelines, allocates descriptors, and copies!
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
@@ -253,6 +276,9 @@ class D3D12TextureCache final : public TextureCache {
 
     ID3D12Resource* resource() const { return resource_.Get(); }
 
+    bool content_red_blue_swapped() const { return content_red_blue_swapped_; }
+    void SetContentRedBlueSwapped(bool swapped) { content_red_blue_swapped_ = swapped; }
+
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
       D3D12_RESOURCE_STATES old_state = resource_state_;
       resource_state_ = new_state;
@@ -271,6 +297,7 @@ class D3D12TextureCache final : public TextureCache {
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
+    bool content_red_blue_swapped_ = false;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
 
     // For bindful - indices in the non-shader-visible descriptor cache for
@@ -342,6 +369,7 @@ class D3D12TextureCache final : public TextureCache {
     }
     // After an aliasing barrier (which is even stronger than an UAV barrier).
     void ClearUAVBarrierPending() { uav_barrier_pending_ = false; }
+    bool uav_barrier_pending() const { return uav_barrier_pending_; }
 
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
@@ -355,6 +383,16 @@ class D3D12TextureCache final : public TextureCache {
                              bool bindless_resources_used);
 
   bool Initialize();
+
+  bool LoadTextureDataImpl(Texture& texture, bool load_base, bool load_mips, bool from_cpu,
+                           bool from_native = false);
+  bool UploadCpuTextureRange(uint32_t address, uint32_t length, uint32_t element_size_log2,
+                             D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
+  static uint32_t SwapRedBlueSwizzle(uint32_t swizzle);
+  uint32_t GetBindingHostSwizzle(const TextureBinding& binding) const;
+  void SetTextureContentRedBlueSwapped(D3D12Texture& texture, bool swapped);
+  std::unordered_map<size_t, std::unique_ptr<ui::d3d12::D3D12UploadBufferPool>>
+      native_texture_upload_pools_;
 
   // Whether decompression is needed on the host (Direct3D only allows creation
   // of block-compressed textures with 4x4-aligned dimensions on PC).
@@ -444,6 +482,10 @@ class D3D12TextureCache final : public TextureCache {
     return scaled_resolve_1gb_buffer_indices_[scaled_resolve_current_range_start_scaled_ >> 30];
   }
   ScaledResolveVirtualBuffer& GetCurrentScaledResolveBuffer() {
+    if (native_scaled_resolves_) {
+      assert_not_null(native_scaled_resolve_current_);
+      return *native_scaled_resolve_current_;
+    }
     ScaledResolveVirtualBuffer* scaled_resolve_buffer =
         scaled_resolve_2gb_buffers_[GetCurrentScaledResolveBufferIndex()].get();
     assert_not_null(scaled_resolve_buffer);
@@ -539,6 +581,16 @@ class D3D12TextureCache final : public TextureCache {
   // Range used in the last successful MakeScaledResolveRangeCurrent call.
   uint64_t scaled_resolve_current_range_start_scaled_;
   uint64_t scaled_resolve_current_range_length_scaled_;
+  bool EnsureNativeScaledResolveRange(uint32_t start, uint32_t length, uint32_t alignment_log2);
+  // Independent allocations keep resolved texels local to their resources.
+  // Replacing an overlapping range copies its contents and retires its old
+  // allocation only after all commands referring to it have completed.
+  bool native_scaled_resolves_ = false;
+  std::map<uint64_t, std::unique_ptr<ScaledResolveVirtualBuffer>> native_scaled_resolve_buffers_;
+  std::deque<std::pair<uint64_t, std::unique_ptr<ScaledResolveVirtualBuffer>>>
+      native_scaled_resolve_retired_;
+  ScaledResolveVirtualBuffer* native_scaled_resolve_current_ = nullptr;
+  uint64_t native_scaled_resolve_current_base_ = 0;
 };
 
 }  // namespace rex::graphics::d3d12

@@ -12,6 +12,28 @@ on:
       - 'tools/bench/jump_context_check.cpp'
       - 'tools/bench/bytes_equal_check.cpp'
       - 'tools/bench/clock_ratio_check.cpp'
+      - 'tools/bench/graphics_resource_check.cpp'
+      - 'tools/rexglue-sdk/include/rex/ui/graphics_backend.h'
+      - 'tools/rexglue-sdk/src/ui/rex_app.cpp'
+      - 'tools/rexglue-sdk/src/ui/d3d12/d3d12_provider.cpp'
+      - 'tools/rexglue-sdk/src/ui/vulkan/vulkan_provider.cpp'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/gpu_page_mask.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/shared_memory.h'
+      - 'tools/rexglue-sdk/src/graphics/shared_memory.cpp'
+      - 'tools/bench/vertex_fetch_bounds_check.cpp'
+      - 'tools/bench/register_write_check.cpp'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/vertex_fetch_bounds.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/native_vertex_fetch.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/draw_extent_estimator.h'
+      - 'tools/rexglue-sdk/src/graphics/util/draw_extent_estimator.cpp'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/vertex_index_bounds.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/register_write.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/buffer_content.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/native_color_resolve.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/native_depth_resolve.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/util/native_resolve_source.h'
+      - 'tools/rexglue-sdk/include/rex/graphics/pipeline/render_target/cache.h'
+      - 'tools/rexglue-sdk/src/graphics/pipeline/render_target/cache.cpp'
       - 'tools/rexglue-sdk/include/rex/chrono/clock_ratio.h'
       - 'tools/rexglue-sdk/include/rex/graphics/util/bytes_equal.h'
       - 'simpsons/generated/default/simpsons_init.h'
@@ -53,10 +75,22 @@ jobs:
           cmake --build tools/bench/d3d11/out --config Release --parallel 4
       - name: Check Windows software device
         run: tools/bench/d3d11/out/Release/d3d11_check.exe --warp --output d3d11-warp.json
+      - name: Present and reconnect native Windows swap chains
+        run: tools/bench/d3d11/out/Release/d3d11_check.exe --warp --present --output d3d11-swap-chain-warp.json
+      - name: Present with sequential flip compatibility
+        run: tools/bench/d3d11/out/Release/d3d11_check.exe --warp --present-mode flip-sequential --output d3d11-swap-chain-sequential-warp.json
+      - name: Present with discard compatibility
+        run: tools/bench/d3d11/out/Release/d3d11_check.exe --warp --present-mode discard --output d3d11-swap-chain-discard-warp.json
       - name: Check native Windows jump context alignment and round trips
         run: tools/bench/d3d11/out/Release/jump_context_check.exe --output jump-context-windows.json
       - name: Compare native clock ratios with independent integer division
         run: tools/bench/d3d11/out/Release/clock_ratio_check.exe --output clock-ratios-windows.json
+      - name: Check graphics fallbacks and batched GPU page ownership
+        run: tools/bench/d3d11/out/Release/graphics_resource_check.exe --output graphics-resource-windows.json
+      - name: Prove native vertex ranges against executed float index expressions
+        run: tools/bench/d3d11/out/Release/vertex_fetch_bounds_check.exe --output vertex-fetch-bounds-windows.json
+      - name: Check constant register writes and native buffer validation
+        run: tools/bench/d3d11/out/Release/register_write_check.exe --output register-write-windows.json
       - name: Check native buffer byte comparisons and protected boundaries
         run: tools/bench/d3d11/out/Release/bytes_equal_check.exe --output bytes-equal-windows.json
       - name: Check AVX2 native buffer byte comparisons and protected boundaries
@@ -95,8 +129,14 @@ jobs:
           name: d3d11-device-check
           path: |
             d3d11-warp.json
+            d3d11-swap-chain-warp.json
+            d3d11-swap-chain-sequential-warp.json
+            d3d11-swap-chain-discard-warp.json
             jump-context-windows.json
             clock-ratios-windows.json
+            graphics-resource-windows.json
+            vertex-fetch-bounds-windows.json
+            register-write-windows.json
             bytes-equal-windows.json
             bytes-equal-avx2-windows.json
             d3d11-shaders-warp.json
@@ -113,6 +153,8 @@ jobs:
             d3d11-texture-swizzle-fl11-0.json
             tools/bench/d3d11/out/Release/d3d11_check.exe
             tools/bench/d3d11/out/Release/jump_context_check.exe
+            tools/bench/d3d11/out/Release/register_write_check.exe
+            tools/bench/d3d11/out/Release/graphics_resource_check.exe
             tools/bench/d3d11/out/Release/d3d11_shader_check.exe
             tools/bench/d3d11/out/Release/d3d11_kernel_check.exe
             tools/bench/d3d11/out/Release/dxbc_geometry.exe

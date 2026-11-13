@@ -58,6 +58,11 @@ std::filesystem::path GetExecutablePath() {
 }
 
 std::filesystem::path GetExecutableFolder() {
+#if REX_PLATFORM_ANDROID
+  if (const char* data_dir = std::getenv("REX_ANDROID_DATA_DIR")) {
+    return data_dir;
+  }
+#endif
   return GetExecutablePath().parent_path();
 }
 

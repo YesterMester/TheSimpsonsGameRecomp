@@ -24,6 +24,12 @@ tools/runtime-staging/
 #   pip install --target=launcher/vendor PySide6
 # then trim per the removal lists in this session's commit message.
 launcher/vendor/
+# Built locally or by the release workflow, from tools/launcher/.
+/launcher/simpsons-launcher
+/launcher/simpsons-modkit
+/launcher/.game-launch.lock
+/launcher/modkit-icon.svg
+/launcher/licenses/
 
 # Build outputs
 simpsons/out/
@@ -43,6 +49,10 @@ launcher/backups/
 launcher/mods/
 launcher/icon.png
 launcher/launcher.json
+launcher/launcher-env.json
+launcher/modkit-runtime.json
+launcher/modkit_streams
+launcher/modkit_streams.exe
 launcher/__pycache__/
 __pycache__/
 
@@ -95,6 +105,20 @@ launcher/diagnostics/
 
 # codegraph: rebuildable index (tools/codegraph/recomp_index.py build), not source
 tools/codegraph/*.sqlite
+tools/codegraph/.*.partial*
 
 # Native renderer offline tool outputs (binaries, SPIR-V sets, frame dumps)
 tools/native-renderer/out/
+
+# Local copies of build output, dumps and old drafts kept beside the sources
+/simpsons/simpsons
+/librexruntimerd.so
+/libTracyClientrd.so
+/extract-xiso
+/shaderdump/
+/native_shaders/
+/tools/runtime-*/
+/tools/FidelityFX-SDK/
+/docs/MODDING.md
+/docs/MODDING_ADVANCED.md
+tools/bench/shots/

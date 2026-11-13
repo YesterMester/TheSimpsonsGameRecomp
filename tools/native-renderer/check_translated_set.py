@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SDK = ROOT / "tools" / "rexglue-sdk"
 # The configuration format VulkanPipelineCache::GetTranslatorConfiguration
 # writes; change both together.
-SET_FORMAT = "set_format=2"
+SET_FORMAT = "set_format=3"
 
 
 def translator_hash():
@@ -30,7 +30,8 @@ def translator_hash():
         [str(p) for p in (SDK / "include/rex/graphics/pipeline/shader").glob("*.h")] +
         [str(SDK / "src/graphics/format/ucode.cpp"),
          str(SDK / "include/rex/graphics/format/ucode.h"),
-         str(SDK / "include/rex/graphics/xenos.h")])
+         str(SDK / "include/rex/graphics/xenos.h"),
+         str(SDK / "include/rex/graphics/util/native_vertex_fetch.h")])
     # Separate host tessellation stages do not change translated guest shaders.
     inputs = [p for p in inputs if Path(p).stem != "smooth_tessellation"]
     lines = "".join(f"{Path(p).name}:{hashlib.sha256(Path(p).read_bytes()).hexdigest()}\n"

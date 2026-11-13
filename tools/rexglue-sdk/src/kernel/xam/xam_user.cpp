@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include <rex/cvar.h>
+#include <rex/kernel/xam/achievements.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -636,7 +637,16 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
         db.GetExistingLanguage(static_cast<XLanguage>(REXCVAR_GET(user_language)));
     const std::vector<util::XdbfAchievementTableEntry> achievement_list = db.GetAchievements();
 
+    const auto& host = GetAchievementHost();
     for (const util::XdbfAchievementTableEntry& entry : achievement_list) {
+      uint64_t unlock_time = 0;
+      uint32_t flags = entry.flags;
+      // XACHIEVEMENT_DETAILS_ACHIEVED, with the unlock time as a FILETIME.
+      if (host.unlocked && host.unlocked(user_index, entry.id, &unlock_time)) {
+        flags |= 0x20000;
+      } else {
+        unlock_time = 0;
+      }
       auto item = XStaticAchievementEnumerator::AchievementDetails{
           entry.id,
           rex::string::to_utf16(db.GetStringTableEntry(language, entry.label_id)),
@@ -644,8 +654,8 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
           rex::string::to_utf16(db.GetStringTableEntry(language, entry.unachieved_id)),
           entry.image_id,
           entry.gamerscore,
-          {0, 0},
-          entry.flags};
+          {uint32_t(unlock_time >> 32), uint32_t(unlock_time)},
+          flags};
 
       e->AppendItem(item);
     }

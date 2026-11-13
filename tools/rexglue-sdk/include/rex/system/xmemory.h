@@ -218,6 +218,11 @@ class BaseHeap {
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 
+  // The page table itself, for saving and restoring whole heaps under a
+  // paused title (exact game saves).
+  std::vector<PageEntry>& page_table() { return page_table_; }
+  uint32_t page_size_shift() const { return page_size_shift_; }
+
   void Reset();
 
  protected:

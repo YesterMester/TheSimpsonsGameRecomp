@@ -14,7 +14,7 @@
 # runtime DLL staging is the host's job (see rexglue_configure_target).
 #==========================================================
 function(rexglue_apply_target_settings target_name)
-    if(UNIX AND NOT APPLE)
+    if(UNIX AND NOT APPLE AND NOT ANDROID)
         find_package(PkgConfig REQUIRED)
         pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
         target_include_directories(${target_name} PRIVATE ${GTK3_INCLUDE_DIRS})
@@ -27,6 +27,9 @@ function(rexglue_apply_target_settings target_name)
                 target_link_options(${target_name} PRIVATE -Wl,--no-relax)
                 target_compile_options(${target_name} PRIVATE -mcmodel=large)
             endif()
+            # Code 2 MB aligned in the file as in memory, so Linux can map it
+            # with huge pages (see MapCodeWithHugePages).
+            target_link_options(${target_name} PRIVATE -Wl,-z,max-page-size=0x200000)
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
             target_compile_options(${target_name} PRIVATE -march=armv8-a)
         endif()
@@ -69,7 +72,11 @@ endfunction()
 #     so this single copy handles them transitively.
 #==========================================================
 function(rexglue_configure_target target_name)
-    if(WIN32)
+    if(ANDROID)
+        target_sources(${target_name} PRIVATE
+            ${REXGLUE_SHARE_DIR}/windowed_app_main_android.cpp)
+        target_link_libraries(${target_name} PRIVATE SDL3::SDL3 android log)
+    elseif(WIN32)
         target_sources(${target_name} PRIVATE
             ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
     else()

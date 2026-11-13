@@ -6,23 +6,59 @@ Target: native Direct3D 11 rendering on Windows 10/11, including feature-level
 
 The backend is built with `REXGLUE_USE_D3D11=ON`, which the Windows release
 builds use from 0.0.6.4, and selected with `gpu = "d3d11"` (the launcher's
-experimental Direct3D 11 choice). Automatic selection still uses Vulkan with the
-Direct3D 12 fallback. Guest draw, copy and swap submission, render target
+experimental Direct3D 11 choice). Automatic selection tries Vulkan, then Direct3D
+12 and Direct3D 11 when the earlier backend cannot initialize. Explicit choices
+stay explicit. Guest draw, copy and swap submission, render target
 ownership, scaled resolves, a native presenter with FXAA, CAS and FSR1, and the
 UI drawer are implemented. It is experimental: it has run the game through
 Proton/DXVK on a Steam Deck, but not yet on native Windows drivers, and it is
 slower than Vulkan at higher render scales (see Performance).
 
+The October 16 performance work batches native resolve page publication under
+one ownership lock and avoids an extra temporary allocation and copy for aligned
+immutable uploads. See [renderer performance](renderer_performance.md) for the
+shared Vulkan/DX12 changes, Windows startup fixes and qualification limits.
+
+The October 16 native work adds bounded fractional/reversed inputs, larger
+immutable GPU index snapshots, retained owners across cache clearing, sparse and
+wrapped resolve aliases, and colour/depth packing across the supported format
+families. Original-resolution depth and scaled colour targets transfer in both
+directions. DX11 and DX12 now use the same transfer shader generator. Its
+patterned mixed-resolution fixture passes 594 cases through Proton, including
+MSAA, stencil and individual host-pixel markers. Fresh attack, overlapping-resolve,
+Eighty Bites and menu frames match at 1x/2x with zero compatibility dependencies
+or allocations. See [the shared native state](native_renderer_plan.md) for the
+scope and remaining limits; this does not qualify native Windows drivers.
+
+The input proof also removes the earlier 22-bit index cutoff. Six large-index
+frame comparisons pass at 1x/2x, including indices near the 24-bit limit. Shared
+draw-extent estimation preserves valid reads beyond the declared stream length
+and avoids stale CPU data when vertices or DMA indices have GPU owners. Five
+focused extent/ownership checks pass alongside the 39-transition native-memory
+fixture; CPU rewrites restore accurate estimation without allocating a mirror.
+
 ## Implemented components
 
 - Native hardware device creation at feature level 11.0 or 11.1, queried optional
   features, explicit WARP selection for qualification, and completion queries.
-- A flip-discard swapchain with frame latency control, optional tearing and
-  resize handling that releases the old backbuffer references first.
+- Presentation negotiates flip-discard, flip-sequential and discard swap chains
+  when an older driver rejects a newer mode or flag combination. Waitable
+  frame latency and tearing are used where accepted; older paths retain a
+  bounded queue with synchronized presentation. Resize/reconnect release bound
+  backbuffer references and finish deferred destruction before recreating the
+  chain. Failure logs retain attempted modes and HRESULTs, and device logs
+  include the selected GPU and feature level. The window check passes 32
+  presentations, six reconnects and 491,520 exact backbuffer pixels for each
+  forced mode through Proton; the reported Windows PC still needs a retest.
 - Conversion of the existing DXBC compiler's bindful SM 5.1 programs to native
   SM 5.0 bindings. Constant layouts, shader signatures, ALU and fetch instructions
   are preserved. Resource declarations, register references and reflection are
   rebuilt together. Unsupported resource ranges and features fail explicitly.
+- Native render-target helper HLSL compiles directly to SM 5.0 through the
+  shared DX11 compiler entry point. Transfer vertices and partial colour,
+  depth and stencil clears no longer require a compiler that accepts `vs_5_1`
+  or `ps_5_1`. Translated guest/shared bytecode keeps its separate conversion
+  path; already-native helpers do not pass through that converter.
 - Immutable native shader objects with exact source comparisons before reuse.
   Failed compilation and creation are retained so they cannot repeat every draw.
 - Immutable native vertex/index snapshots, with exact source comparison and an
@@ -92,6 +128,131 @@ slower than Vulkan at higher render scales (see Performance).
   bilinear, CAS and FSR1 (EASU and RCAS), with or without dithering, run in
   presentation using the stock shaders.
 
+## Native resource work for 0.0.7.0
+
+Proven vertex streams now use retained, resource-local raw buffers.
+The draw's index bounds, fetch expressions and stream lengths prove the exact
+range before uploaded vertex fetch constants are rebased into those buffers.
+GPU-written streams can compose retained native owners and CPU gaps. Proven
+memory exports also write native buffers and retain their written pages for
+later consumers. Unproved streams, unretained writers, shared texture-fetch
+constants and modified export addresses keep the compatibility path.
+Vertex and pixel fetch constants use
+separate buffers so rebasing one stage cannot change the other stage's state.
+
+Retained GPU-produced indices use compact staging snapshots instead of stale
+physical memory for topology conversion and bounds checks. The immutable copy
+is cached by exact range, invalidated by CPU and GPU writes, and shared with
+the native vertex and export proofs. The 42-case geometry check passes with
+GPU rewrites followed by CPU ownership changes, comparing 88,080,384 bytes
+exactly with zero compatibility dependencies or allocations through Proton.
+
+CPU-owned texture data is captured directly into resource-local decode inputs,
+without first uploading it into the guest-address buffer. Scaled GPU textures
+can decode from the existing compact resolve buffers. One growing decode
+workspace and dynamic constants replace repeated intermediate resource
+creation; retained destination textures remain independent.
+
+Compatible single-sampled RGBA8/RGB10A2 native attachments now pack directly
+into tiled resolve buffers. This bypasses EDRAM encoding and the subsequent
+scaled downsample when format, owner, origin and scale are proven compatible.
+The original-resolution copy samples the same native attachment.
+Depth and stencil also pack directly from native views for D24S8 and D24FS8.
+The float24 conversion, rounding and stencil byte follow the general path.
+Native transfers readdress colour/depth samples when an MSAA layout changes,
+and preserve depth/stencil bits when the game aliases them as RGB10A2.
+`d3d11_native_depth_resolves` is enabled by default.
+The host packing shaders are shared with Direct3D 12; translated guest shaders
+and their hashes are unchanged.
+
+`d3d11_native_resolve_memory` retains original-resolution results in compact GPU
+buffers and is enabled by default. CPU-owned initial padding enters those
+buffers directly, and repeated resolves reuse their live padding without a
+mirror copy. Larger or overlapping resolves compose their padding from the
+latest native owner of each page and unchanged CPU gaps. Unscaled texture inputs
+can read a matching buffer or assemble those sources into a compact input.
+Neither composition publishes a new owner until a resolve actually writes it.
+CPU readback consumers can materialize the requested native pages directly;
+unretained owners keep their compatibility handling. Trace downloads
+and cache clearing preserve all remaining GPU data. CPU writes invalidate pages
+independently. A CPU write during publication leaves a correct compatibility
+source for the common tracker instead of losing the pending GPU version.
+Native storage is bounded to 128 MiB; reclamation first preserves its live pages.
+GPU-written pages without a retained native owner still use the compatibility
+path. Only those pages are copied through it; adjacent native and CPU pages
+stay resource-local.
+
+The guest-address mirror and EDRAM storage are allocated only when a real
+compatibility consumer needs them. `native_gpu_diagnostics` records the native
+operations and remaining dependencies; actual original-resolution mirror
+materialization still counts as a dependency. These changes do not establish
+full native coverage or a measured game performance improvement.
+
+The focused native-color fixture passed on the Steam Deck GPU through
+Proton/DXVK: 240 dispatches and 62,914,560 exactly compared destination bytes,
+including untouched padding. RGBA8/RGB10A2, all four endian modes, red/blue
+swaps, original-resolution samples, 1x/2x/3x and anisotropic scales, and offset
+views and compact original-resolution origins are included; 320 unsupported
+rectangle/origin combinations are rejected. The full-runtime memory check passes
+21 ownership transitions and 327,680 exact bytes, including real guest CPU write
+faults, overlapping GPU/CPU changes, deferred mirror allocation, partial
+materialization, publication races, trace download and cache clearing. Three
+disjoint native owners and two CPU gaps supply a larger resolve and a texture
+input without allocating the mirror. A CPU overwrite refreshes only its page;
+an unretained GPU write is rejected as a native input. Temporary inputs watch
+their CPU gaps without marking the mirror current; a later compatibility read
+still uploads those bytes. The
+production DX11 objects compile with warnings treated as errors, and the full
+Windows runtime and current game link. A private 2x game run through Proton
+booted, played the intro, navigated saves, loaded Springfield, accepted movement
+and attack input, and paused and resumed. Menu and gameplay captures were
+checked, and the runtime logged no rendering errors. Native diagnostics recorded
+3,146,124 native vertex stream draws, 1,348 CPU texture uploads, 9,815 GPU texture
+uploads and 13,758 direct native resolves in that run. Compatibility dependencies
+also remained, as listed below; this is a bounded rendering check, not campaign
+coverage or a native Windows driver test.
+
+The compact original-resolution path, including mixed-source inputs, also passed
+a new 1x Springfield run with movement, attack inputs and pause/resume, plus a
+2x title run. Both closed cleanly with no renderer errors; their logs record at
+least 5,632 and 768 compact-buffer resolve writes respectively. Springfield also
+records native GPU and CPU parts combined without compatibility parts. These
+runs qualify the enabled path through Proton/DXVK, not native Windows drivers
+or every campaign effect.
+
+The new depth packing check passes 136 GPU dispatches and 35,651,584 exact
+bytes, including stencil, float24 rounding, endian variants, scaled/original
+outputs and padding; 212 unproved cases are rejected. The shared vertex address
+proof passes 1,440 cases and 495,840 float operations on Linux and Windows through
+Proton. Four native depth-to-colour alias comparisons match the general path
+at 1x/2x with zero compatibility dependencies and allocations, including
+multisampled source images and quadrant patterns.
+
+Captured-frame playback now restores snapshot sample words into a native R32
+image, preserving their bits and replicating them at higher render scales.
+Ordinary ownership transfers recover the formats used by later draws. This
+replaces the previous explicit snapshot-restoration failure and makes frame
+comparisons available for Direct3D 11 too.
+
+Base and mip inputs may now have different owners. CPU levels use immutable
+snapshots with physical write callbacks, and GPU levels keep their native
+resolve sources. Later CPU writes reload only the affected levels. The production
+texture cache check passes 32 cases and 96 decoded images, comparing 2,097,024
+bytes exactly across both ownership directions, tiled/linear storage, packed and
+unpacked mips and all endian modes. CPU rewrites and subsequent GPU rewrites are
+checked separately; no compatibility buffer is allocated.
+
+Native scaled inputs can extend their allocation to cover a sampled layout's
+untouched padding, provided every GPU-written page already has a retained
+scaled source. This removes a 512 MiB compatibility allocation for a 64x64
+Springfield texture at 2x. The menu and Springfield captures match the general
+resolve path at 1x/2x with zero compatibility dependencies or allocations. Four
+more comparisons cover Eighty Bites and the original attack-flash capture at
+both scales, also matching exactly with zero dependencies and allocations.
+Five successive submissions of the attack capture also match the same repeated
+sequence through the general path, with zero native compatibility dependencies
+or allocations throughout.
+
 ## Performance (2026-10-07)
 
 Steam Deck, Proton 10 with DXVK, Springfield bus stop at the start of a saved
@@ -142,6 +303,13 @@ separate.
   24,576 computed words and 122,880 rendered pixels match exactly, including
   actual point, rectangle and quad draws. Seven malformed/unsupported shader
   cases are rejected; repeated failures are cached.
+- The render-target fixture also compiles native vertex, pixel and compute
+  helpers through the production compiler, reflects their SM 5.0 version and
+  stage, and checks compiler diagnostics and rejection of already-native input
+  by the SM 5.1 converter. The October 30 helper fix passes the full fixture
+  through Proton at feature levels 11.0 and 11.1: 1,980/2,340 surfaces and
+  10,818/12,942 partial clears, including depth and stencil. These are local
+  DXVK results, not native Windows driver qualification.
 - The production shader preparation and shared geometry code cross-compile for
   Windows with warnings treated as errors. The installed Vulkan runtime and
   current game executable are unchanged by this work.
@@ -201,18 +369,34 @@ separate.
   saves and plays Springfield at 1x and 2x, including movement, camera and pause.
   Normal and extreme FXAA, CAS, and FSR1 upscaling were checked in window
   captures of live play.
+- The latest native resource run through startup, saves, Springfield, movement,
+  attack inputs and pause/resume at 1x records zero compatibility dependencies
+  and zero EDRAM or mirror allocations. A 2x title run records zero too. These
+  checks ran through Proton and do not qualify the rest of the campaign.
+
+The shared primitive work also passes 42 command-processor geometry cases on
+Direct3D 11: point, rectangle, quad, fan, strip and loop paths with auto, 16-bit
+and 32-bit indices, with and without vertex fetches. Each case uses two distinct
+writes and accurate readback before presentation. All 88,080,384 output bytes
+match the independent CPU reference, with zero compatibility dependencies or
+allocations. Converted index buffers retain CPU shadows with their cache entries;
+native vertex bounds no longer scan GPU upload mappings.
 
 ## Remaining work
 
 1. Run the full game on native Windows hardware drivers, and qualify
    in-engine cutscenes and more of the campaign.
-2. Resolve directly into native textures and buffers, as the Vulkan path does,
-   to remove the EDRAM encode/decode round trip that limits 2x.
+2. Expand strict game coverage of retained writers, sparse/multiple owners,
+   wrapped origins, format conversion and sample averaging. The generated
+   checks cover these native paths; unseen game sequences still need coverage.
 3. Qualify decoded guest textures more widely: dirty CPU inputs, signedness,
    tiling, endian, mip tails and cube/array/volume addressing.
-4. Check CPU-visible GPU writes, resource aliases, memexport and tessellated
-   draws with game workloads; complete EDRAM snapshot restoration for trace
-   playback (it currently stops with an explicit error).
+4. Cover unproved vertex fetches, unretained GPU-written indices and other writers, and
+   modified memory-export destinations with exact resource ownership proofs.
+   Check CPU-visible GPU writes, resource aliases, memexport and tessellated
+   draws with game workloads. Native snapshot restoration now allows captured
+   frame checks without allocating the EDRAM buffer; extend those checks to
+   more game workloads.
 5. Check resizing, fullscreen changes and device loss with a live window.
 
 ## Tools

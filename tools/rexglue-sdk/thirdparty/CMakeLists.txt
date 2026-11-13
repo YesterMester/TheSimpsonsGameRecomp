@@ -238,11 +238,19 @@ target_compile_options(imgui PRIVATE -w)
 set(SDL_INSTALL ON CACHE BOOL "" FORCE)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
+if(ANDROID)
+    # SDLActivity loads SDL's JNI library before the game library.
+    set(SDL_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+endif()
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
 set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
 
 # Disable unused subsystems
 set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+if(ANDROID)
+    set(SDL_VIDEO ON CACHE BOOL "" FORCE)
+endif()
 set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
@@ -259,15 +267,20 @@ set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
 set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
 set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+if(ANDROID)
+    set(SDL_VULKAN ON CACHE BOOL "" FORCE)
+endif()
 set(SDL_METAL OFF CACHE BOOL "" FORCE)
 
-# Disable dummy drivers
+# Disable dummy drivers, except the dummy audio driver, which the SDL audio
+# driver falls back to when there is no output device to open (the game would
+# hang without one).
 set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
-set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
+set(SDL_DUMMYAUDIO ON CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 # Linux audio backends
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT ANDROID)
     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA_SHARED       ON  CACHE BOOL "" FORCE)
     set(SDL_PULSEAUDIO        ON  CACHE BOOL "" FORCE)
@@ -392,7 +405,9 @@ set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
 # committed as config_<os>_<arch>.h) into a build dir as config.h, and emit the
 # small avconfig.h that `configure` would normally generate. Both are added to
 # the FFmpeg targets' include paths below (BEFORE the FFmpeg source dir).
-if(WIN32)
+if(ANDROID)
+    set(_ff_os android)
+elseif(WIN32)
     set(_ff_os windows)
 elseif(APPLE)
     set(_ff_os macos)
@@ -410,10 +425,12 @@ configure_file(
     "${FFMPEG_CONFIG_DIR}/config.h"
     COPYONLY
 )
-file(WRITE "${FFMPEG_CONFIG_DIR}/libavutil/avconfig.h"
-"#ifndef AVUTIL_AVCONFIG_H\n#define AVUTIL_AVCONFIG_H\n#define AV_HAVE_BIGENDIAN 0\n#define AV_HAVE_FAST_UNALIGNED 1\n#endif /* AVUTIL_AVCONFIG_H */\n")
-file(WRITE "${FFMPEG_CONFIG_DIR}/libavutil/ffversion.h"
-"#ifndef AVUTIL_FFVERSION_H\n#define AVUTIL_FFVERSION_H\n#define FFMPEG_VERSION \"4.4\"\n#endif /* AVUTIL_FFVERSION_H */\n")
+# Keep timestamps when the content is unchanged. Reconfiguring a mod or
+# launcher target must not rebuild every FFmpeg source file.
+file(CONFIGURE OUTPUT "${FFMPEG_CONFIG_DIR}/libavutil/avconfig.h" CONTENT
+"#ifndef AVUTIL_AVCONFIG_H\n#define AVUTIL_AVCONFIG_H\n#define AV_HAVE_BIGENDIAN 0\n#define AV_HAVE_FAST_UNALIGNED 1\n#endif /* AVUTIL_AVCONFIG_H */\n" @ONLY)
+file(CONFIGURE OUTPUT "${FFMPEG_CONFIG_DIR}/libavutil/ffversion.h" CONTENT
+"#ifndef AVUTIL_FFVERSION_H\n#define AVUTIL_FFVERSION_H\n#define FFMPEG_VERSION \"4.4\"\n#endif /* AVUTIL_FFVERSION_H */\n" @ONLY)
 
 # Overlay generated FFmpeg list files
 set(FFMPEG_OVERLAY_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-overlay")

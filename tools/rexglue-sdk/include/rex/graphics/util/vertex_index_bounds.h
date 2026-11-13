@@ -22,6 +22,21 @@ struct VertexIndexBounds {
   uint32_t last = 0;
 };
 
+// Built-in primitive adapters only repeat or reorder the original auto indices.
+// Include the entire guest range, including unsigned wrap before the clamp.
+inline VertexIndexBounds GetAutoVertexIndexBounds(uint32_t count, uint32_t base, uint32_t clamp_min,
+                                                  uint32_t clamp_max) {
+  if (!count || clamp_min > clamp_max)
+    return {};
+  uint32_t first = base & xenos::kVertexIndexMask;
+  uint64_t last = uint64_t(first) + count - 1;
+  if (last > xenos::kVertexIndexMask)
+    return {std::clamp(0u, clamp_min, clamp_max),
+            std::clamp(xenos::kVertexIndexMask, clamp_min, clamp_max)};
+  return {std::clamp(first, clamp_min, clamp_max),
+          std::clamp(uint32_t(last), clamp_min, clamp_max)};
+}
+
 // Scan the CPU copy of the uploaded indices. Restart is tested on the raw
 // index, before the DMA endian conversion. Match the vertex shader's unsigned
 // add, 24-bit mask and unsigned clamp, including wrap at UINT32_MAX.

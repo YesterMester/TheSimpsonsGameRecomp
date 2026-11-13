@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <type_traits>
 
 #include <rex/chrono/clock.h>
 
@@ -114,10 +115,15 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
 }  // namespace chrono
 }  // namespace rex
 
-namespace std::chrono {
+namespace rex::chrono {
+
+// libc++ on Android does not yet provide clock_cast. Keep the runtime clock
+// conversion available independently of the standard library implementation.
+template <typename To, typename From>
+struct ClockTimeConversion;
 
 template <>
-struct clock_time_conversion<::rex::chrono::WinSystemClock, ::rex::chrono::XSystemClock> {
+struct ClockTimeConversion<::rex::chrono::WinSystemClock, ::rex::chrono::XSystemClock> {
   using WClock_ = ::rex::chrono::WinSystemClock;
   using XClock_ = ::rex::chrono::XSystemClock;
 
@@ -140,7 +146,7 @@ struct clock_time_conversion<::rex::chrono::WinSystemClock, ::rex::chrono::XSyst
 };
 
 template <>
-struct clock_time_conversion<::rex::chrono::XSystemClock, ::rex::chrono::WinSystemClock> {
+struct ClockTimeConversion<::rex::chrono::XSystemClock, ::rex::chrono::WinSystemClock> {
   using WClock_ = ::rex::chrono::WinSystemClock;
   using XClock_ = ::rex::chrono::XSystemClock;
 
@@ -162,4 +168,26 @@ struct clock_time_conversion<::rex::chrono::XSystemClock, ::rex::chrono::WinSyst
   }
 };
 
+template <typename To, typename From, typename Duration>
+auto clock_cast(const std::chrono::time_point<From, Duration>& time) {
+  if constexpr (std::is_same_v<To, From>) {
+    return time;
+  } else {
+    return ClockTimeConversion<To, From>{}(time);
+  }
+}
+
+}  // namespace rex::chrono
+
+#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
+namespace std::chrono {
+template <>
+struct clock_time_conversion<::rex::chrono::WinSystemClock, ::rex::chrono::XSystemClock>
+    : ::rex::chrono::ClockTimeConversion<::rex::chrono::WinSystemClock,
+                                         ::rex::chrono::XSystemClock> {};
+template <>
+struct clock_time_conversion<::rex::chrono::XSystemClock, ::rex::chrono::WinSystemClock>
+    : ::rex::chrono::ClockTimeConversion<::rex::chrono::XSystemClock,
+                                         ::rex::chrono::WinSystemClock> {};
 }  // namespace std::chrono
+#endif

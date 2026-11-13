@@ -92,7 +92,8 @@ class PipelineCache {
                    uint32_t bound_depth_and_color_mask, DrawCommand& command,
                    draw_util::ViewportInfo& viewport, PreparedShaders& shaders, std::string& error,
                    std::span<const TextureSwizzle> vertex_texture_swizzles = {},
-                   std::span<const TextureSwizzle> pixel_texture_swizzles = {});
+                   std::span<const TextureSwizzle> pixel_texture_swizzles = {},
+                   bool original_resolution = false);
   // Drop active shader and prepared pipeline references before clearing.
   void Clear();
   bool PrepareTessellation(Shader::HostVertexShaderType type, xenos::TessellationMode mode,

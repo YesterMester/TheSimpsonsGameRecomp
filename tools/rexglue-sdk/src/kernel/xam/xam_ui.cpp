@@ -20,6 +20,7 @@
 
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
+#include <rex/kernel/xam/achievements.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -539,6 +540,17 @@ void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
   exit(1);
 }
 
+// The host shows its own achievements screen, when it has one.
+u32 XamShowAchievementsUI_entry(u32 user_index, u32 unk_mask) {
+  const auto& host = GetAchievementHost();
+  if (!host.show) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  REXKRNL_INFO("XamShowAchievementsUI({}, {:08X})", uint32_t(user_index), uint32_t(unk_mask));
+  host.show(user_index);
+  return X_ERROR_SUCCESS;
+}
+
 u32 XamShowPartyUI_entry(u32 r3, u32 r4) {
   return X_ERROR_FUNCTION_FAILED;
 }
@@ -566,6 +578,7 @@ REX_EXPORT(__imp__XamShowMessageBoxUI, rex::kernel::xam::XamShowMessageBoxUI_ent
 REX_EXPORT(__imp__XamShowKeyboardUI, rex::kernel::xam::XamShowKeyboardUI_entry)
 REX_EXPORT(__imp__XamShowDeviceSelectorUI, rex::kernel::xam::XamShowDeviceSelectorUI_entry)
 REX_EXPORT(__imp__XamShowDirtyDiscErrorUI, rex::kernel::xam::XamShowDirtyDiscErrorUI_entry)
+REX_EXPORT(__imp__XamShowAchievementsUI, rex::kernel::xam::XamShowAchievementsUI_entry)
 REX_EXPORT(__imp__XamShowPartyUI, rex::kernel::xam::XamShowPartyUI_entry)
 REX_EXPORT(__imp__XamShowCommunitySessionsUI, rex::kernel::xam::XamShowCommunitySessionsUI_entry)
 REX_EXPORT(__imp__XamShowMessageBoxUIEx, rex::kernel::xam::XamShowMessageBoxUIEx_entry)
@@ -580,7 +593,6 @@ REX_EXPORT_STUB(__imp__XamNavigate);
 REX_EXPORT_STUB(__imp__XamNavigateBack);
 REX_EXPORT_STUB(__imp__XamOverrideHudOpenType);
 REX_EXPORT_STUB(__imp__XamShowAchievementDetailsUI);
-REX_EXPORT_STUB(__imp__XamShowAchievementsUI);
 REX_EXPORT_STUB(__imp__XamShowAchievementsUIEx);
 REX_EXPORT_STUB(__imp__XamShowAndWaitForMessageBoxEx);
 REX_EXPORT_STUB(__imp__XamShowAvatarAwardGamesUI);

@@ -1,0 +1,1822 @@
+{
+  "api": 1,
+  "name": "Simpsons Modkit",
+  "operations": [
+    {
+      "name": "scenes.document",
+      "description": "Read this mod package's validated scene and frozen source fingerprint without filesystem access. An absent scene returns an empty authoring document. Scene objects use original definition GUIDs, stream paths, stable per-owner tags and world poses, never temporary handles.",
+      "parameters": [],
+      "returns": "scene project",
+      "mutates": false,
+      "lua_returns": "SimpsonsSceneProject"
+    },
+    {
+      "name": "scenes.validate",
+      "description": "Validate and canonicalize a portable scene document. Enforces unique tags, an unambiguous episode root, original GUID/class/source identities, bounded nonsingular float32 poses, radius limits and at most 64 objects. Does not spawn or change storage.",
+      "parameters": [
+        {
+          "name": "document",
+          "type": "object"
+        }
+      ],
+      "returns": "validated scene document",
+      "mutates": false,
+      "lua_returns": "SimpsonsSceneDocument"
+    },
+    {
+      "name": "scenes.save",
+      "description": "Queue this mod's validated scene draft in persistent storage, with its frozen source fingerprint. Check storage.status for completion. The launcher's Apply scene draft action copies a matching creator-Test draft into the editable package before export. This does not write code or replace game files.",
+      "parameters": [
+        {
+          "name": "document",
+          "type": "object"
+        }
+      ],
+      "returns": "validated scene document",
+      "mutates": true,
+      "lua_returns": "SimpsonsSceneDocument"
+    },
+    {
+      "name": "world.tagged",
+      "description": "Find this generation's live owned object by its stable tag. Returns a fresh entity handle or nil; pending removals are excluded. Tags survive supported code reload and exact restore. This capability identifies builds that support tagged world.spawn.",
+      "parameters": [
+        {
+          "name": "tag",
+          "type": "string"
+        }
+      ],
+      "returns": "entity handle or null",
+      "mutates": false,
+      "lua_returns": "string?"
+    },
+    {
+      "name": "timers.schedule",
+      "description": "Schedule or replace this mod's simulation timer. Pauses and menu redraws do not advance it. A timer event carries id, data and skipped intervals; repeats coalesce after a slow frame instead of catching up in a loop. Timers are saved with mod state.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        },
+        {
+          "name": "seconds",
+          "type": "number"
+        },
+        {
+          "name": "interval",
+          "type": "number",
+          "optional": true
+        },
+        {
+          "name": "data",
+          "type": "any",
+          "optional": true
+        }
+      ],
+      "returns": "timer id",
+      "mutates": false
+    },
+    {
+      "name": "timers.cancel",
+      "description": "Cancel a timer owned by this mod. Returns whether it was pending.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        }
+      ],
+      "returns": "boolean",
+      "mutates": false
+    },
+    {
+      "name": "timers.list",
+      "description": "List this mod's pending timers, remaining simulation seconds, repeat intervals and event data.",
+      "parameters": [],
+      "returns": "array of timers",
+      "mutates": false
+    },
+    {
+      "name": "text.lookup",
+      "description": "Read a loaded game text ID as UTF-8, including active native language packs. IDs are listed by the translation exporter; unloaded entries report found=false.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        }
+      ],
+      "returns": "found and text",
+      "mutates": false
+    },
+    {
+      "name": "assets.search",
+      "description": "Search the game-wide resource library by category, name or a 32-digit native resource_id. Locations include native resource GUIDs when the named header provides one. Indexing is asynchronous; asset identities are not loaded entity templates.",
+      "parameters": [
+        {
+          "name": "category",
+          "type": "string",
+          "optional": true
+        },
+        {
+          "name": "text",
+          "type": "string",
+          "optional": true
+        },
+        {
+          "name": "offset",
+          "type": "number",
+          "optional": true
+        },
+        {
+          "name": "limit",
+          "type": "number",
+          "optional": true
+        },
+        {
+          "name": "resource_id",
+          "type": "string",
+          "optional": true
+        }
+      ],
+      "returns": "index progress, categories and a bounded page of named resources",
+      "mutates": false
+    },
+    {
+      "name": "assets.templates",
+      "description": "List original object definitions using an indexed asset, including native model/character references and source stream paths. Friendly names are available before loading. A supported definition becomes a resident_template after its source is ready; pass that current handle to world.spawn. Geometry references can have several original object variants.",
+      "parameters": [
+        {
+          "name": "asset",
+          "type": "string"
+        },
+        {
+          "name": "offset",
+          "type": "number",
+          "optional": true
+        },
+        {
+          "name": "limit",
+          "type": "number",
+          "optional": true
+        }
+      ],
+      "returns": "ready, total and paged source object records",
+      "mutates": false,
+      "lua_returns": "SimpsonsAssetTemplates"
+    },
+    {
+      "name": "assets.load_source",
+      "description": "Asynchronously add a source archive and its original native dependencies to a shared retained session. Up to eight archives can coexist; additions are serialized and a failed addition rolls back without removing earlier objects or resources. Each generation leases the whole session, with its latest requested root reported by source_status. Poll readiness, then reacquire a resident handle from assets.templates or world.catalog. Source actors stay inactive. Require assets.source_streams for multi-source capability on older builds.",
+      "parameters": [
+        {
+          "name": "stream",
+          "type": "string"
+        }
+      ],
+      "returns": "boolean",
+      "mutates": true,
+      "lua_returns": "boolean"
+    },
+    {
+      "name": "assets.source_status",
+      "description": "Report this generation's selected source, readiness and request errors. Existing sources stay ready while another owner adds an archive. streams lists every committed archive; pending_stream names the current addition. Native progress counts the shared session. A failed addition restores preceding leases and reports failure only to its waiting owners.",
+      "parameters": [],
+      "returns": "source claim and progress",
+      "mutates": false,
+      "lua_returns": "SimpsonsSourceStatus"
+    },
+    {
+      "name": "assets.source_streams",
+      "description": "List committed archive paths in the shared native source session. This capability identifies builds that support combining sources. Shared dependencies remain resident until the last session owner releases; individual archives are not independently unloaded.",
+      "parameters": [],
+      "returns": "string array",
+      "mutates": false,
+      "lua_returns": "string[]"
+    },
+    {
+      "name": "assets.cancel_source",
+      "description": "Withdraw only this generation's pending addition and restore its preceding lease, including one acquired by a successful spawn from an old source. Existing objects and archives stay loaded. Native rollback starts when every waiting owner withdraws. Does not release a committed session; use release_source for that.",
+      "parameters": [],
+      "returns": "boolean",
+      "mutates": true,
+      "lua_returns": "boolean"
+    },
+    {
+      "name": "assets.release_source",
+      "description": "Release this generation's whole source-session lease. Original native retirement runs after the last owner releases, removing the session's objects and archives together. Other owners keep all retained resources. Failed additions expire only their own temporary data. Reload and exact saves retain committed roots and claims; checkpoint/world changes discard them.",
+      "parameters": [],
+      "returns": "boolean",
+      "mutates": true,
+      "lua_returns": "boolean"
+    },
+    {
+      "name": "locale.current",
+      "description": "Return the active mod language code, such as en or pt-br.",
+      "parameters": [],
+      "returns": "string",
+      "mutates": false
+    },
+    {
+      "name": "locale.text",
+      "description": "Look up this mod's localized text with regional and source-language fallback; substitute named {values}. Button tags remain dynamic.",
+      "parameters": [
+        {
+          "name": "key",
+          "type": "string"
+        },
+        {
+          "name": "values",
+          "type": "object",
+          "optional": true
+        }
+      ],
+      "returns": "string",
+      "mutates": false
+    },
+    {
+      "name": "system.describe",
+      "description": "Describe every implemented operation and its arguments.",
+      "parameters": [],
+      "returns": "API catalog",
+      "mutates": false
+    },
+    {
+      "name": "mods.status",
+      "description": "List loaded mods, creator credits, errors and callback costs.",
+      "parameters": [],
+      "returns": "array of mod records",
+      "mutates": false
+    },
+    {
+      "name": "system.try_call",
+      "description": "Invoke one named host API with a named-argument object and return {ok=true,value=...} or {ok=false,code=...,error=...} for an expected host failure. Target validation, ownership, save read-only and preflight restrictions still apply. Cannot wrap itself or run a Lua function; interpreter errors and callback limits remain fatal. Use this for expected spawn or transform rejection, rather than pcall (which the sandbox disables).",
+      "parameters": [
+        {
+          "name": "method",
+          "type": "string"
+        },
+        {
+          "name": "arguments",
+          "type": "object"
+        }
+      ],
+      "returns": "host call result",
+      "mutates": false,
+      "lua_returns": "SimpsonsCallResult"
+    },
+    {
+      "name": "log.info",
+      "description": "Write a message attributed to this mod in the game log.",
+      "parameters": [
+        {
+          "name": "message",
+          "type": "string"
+        }
+      ],
+      "returns": "nil",
+      "mutates": false
+    },
+    {
+      "name": "storage.read",
+      "description": "Read this mod's cached persistent JSON; missing files return nil. Storage is loaded before callbacks start.",
+      "parameters": [
+        {
+          "name": "path",
+          "type": "string"
+        }
+      ],
+      "returns": "saved value or nil",
+      "mutates": false
+    },
+    {
+      "name": "storage.write",
+      "description": "Queue an atomic JSON write to this mod's persistent storage without blocking the game thread. Reads see the queued value immediately; use storage.status to check completion and errors.",
+      "parameters": [
+        {
+          "name": "path",
+          "type": "string"
+        },
+        {
+          "name": "value",
+          "type": "any"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "storage.status",
+      "description": "Report this mod's pending persistent writes and disk errors. Pending zero with no errors means all writes have reached the filesystem.",
+      "parameters": [],
+      "returns": "{pending, errors}",
+      "mutates": false
+    },
+    {
+      "name": "world.status",
+      "description": "Get the current level readiness, location and world epoch. level_root is the unique loaded episode catalog excluding retained foreign sources; empty means it cannot be proven, so portable scenes must wait. streaming reports unfinished native file/manager work; scene autoload waits for it before requesting additional sources.",
+      "parameters": [],
+      "returns": "world record",
+      "mutates": false
+    },
+    {
+      "name": "players.list",
+      "description": "List the loaded family, including AI actors, with temporary handles, character names, positions, health and input_player. A slot is a family-list index; input_player is logical port 0/1 or null for AI, unbound or ambiguous ownership.",
+      "parameters": [],
+      "returns": "array of player records",
+      "mutates": false,
+      "lua_returns": "SimpsonsPlayer[]"
+    },
+    {
+      "name": "players.controlled",
+      "description": "Get the family character currently bound to logical input player 0 or 1, or nil when no level/actor is ready or ownership is ambiguous. Requery during simulation after character switches, co-op joins, dropouts and restores; a previous actor handle may still identify a live AI character. This reads the game binding without polling devices. Paused or temporarily blocked controls do not change the binding.",
+      "parameters": [
+        {
+          "name": "player",
+          "type": "number"
+        }
+      ],
+      "returns": "player record or nil",
+      "lua_returns": "SimpsonsPlayer|nil",
+      "mutates": false
+    },
+    {
+      "name": "players.teleport",
+      "description": "Move one loaded player using the game's two world transforms.",
+      "parameters": [
+        {
+          "name": "player",
+          "type": "handle"
+        },
+        {
+          "name": "position",
+          "type": "vec3"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "players.refill_health",
+      "description": "Refill a living family member through the original healing message and recovery callbacks, up to its normal healing limit. Does not resurrect a dead actor.",
+      "parameters": [
+        {
+          "name": "player",
+          "type": "handle"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "players.god_mode",
+      "description": "Request family damage protection for this mod. The latest active request wins; retirement restores the previous owner or manual value. Manual controls supersede older requests.",
+      "parameters": [
+        {
+          "name": "enabled",
+          "type": "boolean"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "scores.get",
+      "description": "Read a named ScoreKeeper score. A missing score currently follows the game's zero result.",
+      "parameters": [
+        {
+          "name": "name",
+          "type": "string"
+        }
+      ],
+      "returns": "number",
+      "mutates": false
+    },
+    {
+      "name": "scores.set",
+      "description": "Set a named score through ScoreKeeper, including its original watchers.",
+      "parameters": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "value",
+          "type": "number"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "scores.issue",
+      "description": "Issue a named ScoreKeeper event through the original game logic.",
+      "parameters": [
+        {
+          "name": "name",
+          "type": "string"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "camera.free",
+      "description": "Request the native development camera in a running level. This mod owns its request; retirement reveals the preceding request or manual state.",
+      "parameters": [
+        {
+          "name": "enabled",
+          "type": "boolean"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "camera.photo",
+      "description": "Request photo mode with its pause and HUD handling. Camera requests are retired with this mod; checkpoints discard old-world camera requests.",
+      "parameters": [
+        {
+          "name": "enabled",
+          "type": "boolean"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "camera.status",
+      "description": "Read the current free-camera and photo-mode state.",
+      "parameters": [],
+      "returns": "camera record",
+      "mutates": false
+    },
+    {
+      "name": "camera.pose",
+      "description": "Read viewport 0's last applied native camera pose, or nil when no supported level camera is running. Coordinates use Y up; rotation and vertical fov_degrees are in degrees. A set_pose request appears here after the next native camera update.",
+      "parameters": [],
+      "returns": "ModCameraPose or nil",
+      "lua_returns": "ModCameraPose|nil",
+      "mutates": false
+    },
+    {
+      "name": "camera.set_pose",
+      "description": "Request an owned viewport 0 camera pose through the original native camera writer and enable the free camera. Position axes are finite and within +/-1000000, pitch is -90..90 degrees, yaw/roll are finite within +/-360000 degrees and normalize to one turn, and vertical fov_degrees is 1..120. Photo mode keeps its current value. Manual camera input takes control; release/retirement restores the preceding explicit request or captured manual baseline. Checkpoints discard old-world requests.",
+      "parameters": [
+        {
+          "name": "pose",
+          "type": "object",
+          "lua_type": "ModCameraPose"
+        }
+      ],
+      "returns": "canonical requested ModCameraPose",
+      "lua_returns": "ModCameraPose",
+      "mutates": true
+    },
+    {
+      "name": "camera.release",
+      "description": "Release only this mod generation's camera request, revealing the preceding owner or captured manual baseline. Other owned services remain active. Repeating release is safe.",
+      "parameters": [],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "characters.list",
+      "description": "List the character templates the existing character selector supports.",
+      "parameters": [],
+      "returns": "array of character records",
+      "mutates": false
+    },
+    {
+      "name": "characters.apply",
+      "description": "Apply character templates to both players using the existing checkpoint restart.",
+      "parameters": [
+        {
+          "name": "player1",
+          "type": "string"
+        },
+        {
+          "name": "player2",
+          "type": "string"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "world.catalog",
+      "description": "List live and retained native entity templates from fully loaded source streams. Distinct definition records stay separate even when class, model and display names match. Each record includes class, seen (live source count, possibly zero) and model_resource (a native GUID or an empty string for unsupported layouts). The native registry supplies additional observed placeable classes. Plain catalog queries do not start disk scans. Retained handles expire with their source load or world, rather than requiring a live source instance. source_stream names the exact loaded native file that owns the original definition; an empty path cannot be exported as a portable scene source.",
+      "parameters": [],
+      "returns": "array of spawnable records",
+      "mutates": false,
+      "lua_returns": "SimpsonsSpawnTemplate[]"
+    },
+    {
+      "name": "world.spawn",
+      "description": "Clone a validated resident template with the original factory, unique world registration, post-spawn initialization and class position setter. Position is in world coordinates. Unsupported transforms fail without scanning object memory. The calling mod owns the object; reload transfers ownership and retirement queues safe game-thread cleanup. Reacquire handles with world.owned after reload or exact restore. Optional tags are unique per mod generation, including pending removal, and survive reload/exact restore. Require world.tagged when using tags.",
+      "parameters": [
+        {
+          "name": "template",
+          "type": "handle"
+        },
+        {
+          "name": "position",
+          "type": "vec3"
+        },
+        {
+          "name": "radius",
+          "type": "number",
+          "optional": true
+        },
+        {
+          "name": "tag",
+          "type": "string",
+          "optional": true
+        }
+      ],
+      "returns": "temporary entity handle",
+      "mutates": true
+    },
+    {
+      "name": "world.owned",
+      "description": "List this mod generation's live spawned objects as id/class records. Excludes pending removals. Requery after reload or exact restore; checkpoints start a new world and mods recreate their objects. Each record also includes tag (empty for untagged objects).",
+      "parameters": [],
+      "returns": "array of owned entity records",
+      "mutates": false,
+      "lua_returns": "SimpsonsOwnedEntity[]"
+    },
+    {
+      "name": "world.destroy",
+      "description": "Queue removal of an object spawned by this mod. Runs the original class/subscriber destructor after callbacks, including collision and world unregister. Returns true once, false if already queued; foreign or expired handles fail.",
+      "parameters": [
+        {
+          "name": "entity",
+          "type": "handle"
+        }
+      ],
+      "returns": "boolean",
+      "mutates": true,
+      "lua_returns": "boolean"
+    },
+    {
+      "name": "entities.transform",
+      "description": "Read a live object owned by this mod as a world-space position and right/up/forward basis. Resolves pending frame and parent updates through the original getter. Basis vectors retain scale; they are not Euler angles. Pending removals, foreign owners and expired handles fail.",
+      "parameters": [
+        {
+          "name": "entity",
+          "type": "handle"
+        }
+      ],
+      "returns": "entity transform",
+      "mutates": false,
+      "lua_returns": "SimpsonsEntityTransform"
+    },
+    {
+      "name": "entities.move",
+      "description": "Move this mod's live object to a finite world position while preserving its basis. Uses the class's original position setter and its controller/model notifications. Rotated, scaled and sheared parents are converted to local coordinates; singular or invalid parents fail before the setter. Does not sweep for collision clearance or stop an authored controller from moving it afterward.",
+      "parameters": [
+        {
+          "name": "entity",
+          "type": "handle"
+        },
+        {
+          "name": "position",
+          "type": "vec3"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "entities.set_transform",
+      "description": "Set this mod's live object's complete world-space position and right/up/forward basis through the class's original matrix setter. Includes orientation, scale, cached native scale and model/controller notifications. Converts the whole matrix through rotated, scaled or sheared parents. Nonfinite, singular or native-length overflow/underflow bases reject before dispatch; invalid frames or unavailable setters fail without a raw-write fallback. Does not sweep for collision clearance or stop authored movement.",
+      "parameters": [
+        {
+          "name": "entity",
+          "type": "handle"
+        },
+        {
+          "name": "transform",
+          "type": "entity transform",
+          "lua_type": "SimpsonsEntityTransform"
+        }
+      ],
+      "returns": "nil",
+      "mutates": true
+    },
+    {
+      "name": "ui.register_page",
+      "description": "Register or replace this mod's native Options page. Supports action, toggle, slider, select and text rows; actions arrive as ui.action events.",
+      "parameters": [
+        {
+          "name": "page",
+          "type": "object"
+        }
+      ],
+      "returns": "namespaced page id",
+      "mutates": false
+    },
+    {
+      "name": "ui.remove_page",
+      "description": "Remove a native Options page owned by this mod.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        }
+      ],
+      "returns": "nil",
+      "mutates": false
+    },
+    {
+      "name": "input.players",
+      "description": "Read physical assignments, device identities and resolved prompt families for logical players 0 and 1. prompts retains the configured override (including auto); prompt_family is its resolved family. This does not poll devices or map family-list entities to controllers.",
+      "parameters": [],
+      "returns": "array of input records",
+      "mutates": false,
+      "lua_returns": "SimpsonsInputPlayer[]"
+    },
+    {
+      "name": "input.state",
+      "description": "Read the last routed game input for logical player 0 or 1. Buttons, pressed/released edges, normalized sticks and triggers are frozen for this modkit frame; reads do not poll or consume input. sampled says a poll has been observed; updated says it arrived this frame; available is the last poll's success, not a physical-connection query. First samples and reconnects establish a baseline without synthetic presses. Unpolled channels retain their last values without repeating edges. Read during simulation for gameplay actions; use ui.action for native menus.",
+      "parameters": [
+        {
+          "name": "player",
+          "type": "number"
+        }
+      ],
+      "returns": "input snapshot with buttons, pressed, released, left_stick, right_stick, left_trigger, right_trigger and sampling metadata",
+      "mutates": false,
+      "lua_returns": "SimpsonsInputSnapshot"
+    },
+    {
+      "name": "settings.get",
+      "description": "Read an existing runtime setting with its current value and restart metadata.",
+      "parameters": [
+        {
+          "name": "name",
+          "type": "string"
+        }
+      ],
+      "returns": "setting record",
+      "mutates": false
+    },
+    {
+      "name": "missions.register",
+      "description": "Register or refresh this mod's authored mission definition during initialize or state.loaded. Objectives have stable ids, positive goals, prerequisites and optional flags. Live goal changes need a state migration or a project restart.",
+      "parameters": [
+        {
+          "name": "definition",
+          "type": "object"
+        }
+      ],
+      "returns": "mission definition and current objective state",
+      "mutates": false
+    },
+    {
+      "name": "missions.list",
+      "description": "List this mod's authored missions and objective progress. Other mods' missions remain isolated.",
+      "parameters": [],
+      "returns": "array of missions",
+      "mutates": false
+    },
+    {
+      "name": "missions.get",
+      "description": "Read an authored mission by its local id, including active/locked/completed objectives and retry-point availability.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        }
+      ],
+      "returns": "mission state",
+      "mutates": false
+    },
+    {
+      "name": "missions.start",
+      "description": "Start an idle authored mission while a level is loaded. Progress and notifications are saved with this mod. This does not replace the base campaign.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        }
+      ],
+      "returns": "active mission state",
+      "mutates": true
+    },
+    {
+      "name": "missions.advance",
+      "description": "Add nonnegative progress to an active, unlocked objective. Progress clamps to its goal; completing every required objective completes the mission. Changes coalesce into an owned mission.changed event.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        },
+        {
+          "name": "objective",
+          "type": "string"
+        },
+        {
+          "name": "amount",
+          "type": "number"
+        }
+      ],
+      "returns": "updated mission state",
+      "mutates": true
+    },
+    {
+      "name": "missions.fail",
+      "description": "Fail an active authored mission with a reason. It may then be retried from its recorded objective checkpoint or restarted from the beginning.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "returns": "failed mission state",
+      "mutates": true
+    },
+    {
+      "name": "missions.checkpoint",
+      "description": "Record the active mission's current objective progress as a retry point. This records authored mission state; it does not save or reset the game world.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        }
+      ],
+      "returns": "mission state with a retry point",
+      "mutates": true
+    },
+    {
+      "name": "missions.restart",
+      "description": "Retry an authored mission. from_checkpoint defaults to true; false replays it from the beginning. Scripts must restore any associated world changes through their own supported APIs.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        },
+        {
+          "name": "from_checkpoint",
+          "type": "boolean",
+          "optional": true
+        }
+      ],
+      "returns": "active mission state",
+      "mutates": true
+    },
+    {
+      "name": "missions.restore",
+      "description": "During state.loaded only, validate and migrate this mod's saved mission service state from the event's missions field. Unhandled state is restored automatically after the callback. Invalid migrations reject the replacement before commit.",
+      "parameters": [
+        {
+          "name": "state",
+          "type": "object"
+        }
+      ],
+      "returns": "restored authored missions",
+      "mutates": false
+    },
+    {
+      "name": "players.health",
+      "description": "Read the original health component, or nil when it is absent or unsupported. maximum is the component's normal healing limit; dead follows its native death policy. Query players.controlled or players.list for a current family handle.",
+      "parameters": [
+        {
+          "name": "player",
+          "type": "handle"
+        }
+      ],
+      "returns": "ModHealth or nil",
+      "lua_returns": "ModHealth|nil",
+      "mutates": false
+    },
+    {
+      "name": "players.damage",
+      "description": "Apply scripted damage through the original eligibility, hit, event and death callbacks. Damage protection remains active; a rejected or absorbed hit can leave health unchanged. Amount is finite and between 0 and 1000000. The result includes before/after snapshots; after can be nil if native logic removes the health component or target. Query players.controlled or players.list for a current family handle.",
+      "parameters": [
+        {
+          "name": "player",
+          "type": "handle"
+        },
+        {
+          "name": "amount",
+          "type": "number"
+        }
+      ],
+      "returns": "ModHealthChange",
+      "lua_returns": "ModHealthChange",
+      "mutates": true
+    },
+    {
+      "name": "players.heal",
+      "description": "Heal through the original eligibility and recovery callbacks, capped at the normal healing limit. Dead actors are not resurrected. Amount is finite and between 0 and 1000000. The result includes before/after snapshots; after can be nil if native logic removes the health component or target. Query players.controlled or players.list for a current family handle.",
+      "parameters": [
+        {
+          "name": "player",
+          "type": "handle"
+        },
+        {
+          "name": "amount",
+          "type": "number"
+        }
+      ],
+      "returns": "ModHealthChange",
+      "lua_returns": "ModHealthChange",
+      "mutates": true
+    },
+    {
+      "name": "entities.render_state",
+      "description": "Read this mod's object's native hide count, model availability and scene membership. Null means its visibility layout is unsupported. Scene membership is not proof of camera visibility or finished NPC behavior.",
+      "parameters": [
+        {
+          "name": "entity",
+          "type": "handle"
+        }
+      ],
+      "returns": "native render state or null",
+      "mutates": false,
+      "lua_returns": "SimpsonsEntityRenderState|nil"
+    },
+    {
+      "name": "entities.set_visible",
+      "description": "Hide or reveal this mod's object through the original visibility methods. The host balances one hide request; repeated calls are idempotent and reveal preserves the game's other requests. Reload transfers the request without applying it twice. A native force-show cancels it. Does not suspend AI, collision, audio or damage. Unsupported layouts fail before mutation; null means a class callback removed the object.",
+      "parameters": [
+        {
+          "name": "entity",
+          "type": "handle"
+        },
+        {
+          "name": "visible",
+          "type": "boolean"
+        }
+      ],
+      "returns": "native render state or null if removed",
+      "mutates": true,
+      "lua_returns": "SimpsonsEntityRenderState|nil"
+    },
+    {
+      "name": "entities.health",
+      "description": "Read the original health component, or nil when it is absent or unsupported. maximum is the component's normal healing limit; dead follows its native death policy. Only this mod's active owned objects are accessible.",
+      "parameters": [
+        {
+          "name": "entity",
+          "type": "handle"
+        }
+      ],
+      "returns": "ModHealth or nil",
+      "lua_returns": "ModHealth|nil",
+      "mutates": false
+    },
+    {
+      "name": "entities.damage",
+      "description": "Apply scripted damage through the original eligibility, hit, event and death callbacks. Damage protection remains active; a rejected or absorbed hit can leave health unchanged. Amount is finite and between 0 and 1000000. The result includes before/after snapshots; after can be nil if native logic removes the health component or target. Only this mod's active owned objects are accessible.",
+      "parameters": [
+        {
+          "name": "entity",
+          "type": "handle"
+        },
+        {
+          "name": "amount",
+          "type": "number"
+        }
+      ],
+      "returns": "ModHealthChange",
+      "lua_returns": "ModHealthChange",
+      "mutates": true
+    },
+    {
+      "name": "entities.heal",
+      "description": "Heal through the original eligibility and recovery callbacks, capped at the normal healing limit. Dead actors are not resurrected. Amount is finite and between 0 and 1000000. The result includes before/after snapshots; after can be nil if native logic removes the health component or target. Only this mod's active owned objects are accessible.",
+      "parameters": [
+        {
+          "name": "entity",
+          "type": "handle"
+        },
+        {
+          "name": "amount",
+          "type": "number"
+        }
+      ],
+      "returns": "ModHealthChange",
+      "lua_returns": "ModHealthChange",
+      "mutates": true
+    },
+    {
+      "name": "projects.document",
+      "description": "Read this package's frozen scene or mission document and source fingerprint. This uses prepared metadata without reading source files in a callback. Missing documents return an empty authoring document.",
+      "parameters": [
+        {
+          "name": "kind",
+          "type": "string"
+        }
+      ],
+      "returns": "project document and fingerprint",
+      "mutates": false,
+      "lua_returns": "SimpsonsProjectDocument"
+    },
+    {
+      "name": "projects.validate",
+      "description": "Validate and canonicalize a portable scene or mission document. Mission graph rules use the native mission service without registering a live mission. Rejects unknown fields, temporary handles, invalid episode roots, cycles and out-of-bounds points or durations.",
+      "parameters": [
+        {
+          "name": "kind",
+          "type": "string"
+        },
+        {
+          "name": "document",
+          "type": "object"
+        }
+      ],
+      "returns": "validated project document",
+      "mutates": false
+    },
+    {
+      "name": "projects.save",
+      "description": "Queue a validated scene or mission draft in namespaced persistent storage, tied to this frozen source revision. Check storage.status for completion. Apply saved drafts in the launcher merges matching scene and mission drafts atomically before exporting the project.",
+      "parameters": [
+        {
+          "name": "kind",
+          "type": "string"
+        },
+        {
+          "name": "document",
+          "type": "object"
+        }
+      ],
+      "returns": "validated project document",
+      "mutates": true
+    },
+    {
+      "name": "missions.remove",
+      "description": "Remove this mod's mission definition, progress, retry point and pending change notification. Returns false if absent. This lets an editor stop a preview before changing its contract; it does not reset the game world. Allowed during private initialization/restore preflight; save callbacks remain read only.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        }
+      ],
+      "returns": "whether a mission was removed",
+      "mutates": false,
+      "lua_returns": "boolean"
+    },
+    {
+      "name": "missions.advance_batch",
+      "description": "Atomically advance up to 32 distinct objectives that were already unlocked before the batch. Every id and amount validates before progress changes. Returns one mission snapshot and coalesces one notification, avoiding repeated full-state copies for simultaneous goals.",
+      "parameters": [
+        {
+          "name": "id",
+          "type": "string"
+        },
+        {
+          "name": "updates",
+          "type": "any",
+          "lua_type": "SimpsonsMissionAdvance[]"
+        }
+      ],
+      "returns": "updated mission state",
+      "mutates": true
+    },
+    {
+      "name": "projects.save_all",
+      "description": "Validate a scene and/or mission document before queuing one atomic project-drafts.json replacement. Both documents share the frozen source fingerprint. Use this for a project containing both editors, then wait for storage.status before applying saved drafts in the launcher.",
+      "parameters": [
+        {
+          "name": "documents",
+          "type": "object"
+        }
+      ],
+      "returns": "validated documents keyed by kind",
+      "mutates": true
+    },
+    {
+      "name": "physics.knockdowns",
+      "description": "Lease experimental whole-character knockdown settings for this mod. Requires all switches enabled, run_impact, punch_impact, push_downed, player_enabled and force_scale (0.25 to 4). Pauses stop the effect; disabling, unloading or failing a mod releases its request. This is a root-motion prototype, not a jointed ragdoll or terrain collision solver.",
+      "parameters": [
+        {
+          "name": "options",
+          "type": "object"
+        }
+      ],
+      "returns": "null",
+      "mutates": true
+    },
+    {
+      "name": "physics.release_knockdowns",
+      "description": "Release this mod's knockdown request, revealing the preceding owner or manual baseline. Call from normal game-thread callbacks, not initialization or restore preflight. Restoration of surviving character poses occurs on the game thread.",
+      "parameters": [],
+      "returns": "null",
+      "mutates": true
+    }
+  ],
+  "events": {
+    "initialize": "Register menus and services; gameplay mutations wait until a running level.",
+    "frame": "Every host update; display redraws do not advance simulation timers.",
+    "simulation": "The original simulation advanced; seconds is its delta.",
+    "level.ready": "A level has begun; reacquire temporary game handles.",
+    "level.unloading": "The current world is retiring; discard temporary handles.",
+    "ui.action": "A mod-owned menu row was activated with its logical player.",
+    "save.restored": "Host state was restored; kind is exact or checkpoint.",
+    "state.loaded": "Validate or migrate game.state and refresh staged menus before commit; kind is exact, checkpoint or reload. Gameplay and persistent storage mutations are blocked. An error rejects the prepared replacement.",
+    "code.reloaded": "Verified code replaced the prior instances. JSON state and timer delays are retained; reacquire temporary game handles. level_ready reports whether a level is running.",
+    "timer": "A simulation timer belonging to this mod elapsed; id, data, skipped and frame identify it.",
+    "mission.changed": "This mod's authored mission changed. Data contains mission, change and revision. Changes coalesce per mission, rotate through a shared frame budget, and are delivered after the calling callback; pending notifications survive saves and reloads.",
+    "entity.removed": "An owned object was removed by the game or through world.destroy. Contains entity (now stale) and reason (game or removed). Delivered to its owning runtime generation after cleanup; use level.unloading for world teardown. Requery world.owned rather than saving handles.",
+    "entity.died": "The original health death handler ran for an owned object. Contains entity (possibly already stale). Delivered once per object lifetime to its owning runtime generation, before removal notices and after native callbacks return. This is a native death signal, not an inference from disappearance. world.destroy does not count as a kill. Reacquire owned handles after reload; use level.unloading for world teardown."
+  },
+  "types": {
+    "SimpsonsCallResult": {
+      "description": "A single host API result. Only typed host failures are recoverable; this does not protect a Lua callback.",
+      "fields": [
+        {
+          "name": "ok",
+          "type": "boolean"
+        },
+        {
+          "name": "value",
+          "type": "any",
+          "description": "The target's return value on success, including nil."
+        },
+        {
+          "name": "code",
+          "type": "string?",
+          "description": "Stable failure code when ok is false."
+        },
+        {
+          "name": "error",
+          "type": "string?",
+          "description": "Readable failure description when ok is false."
+        }
+      ]
+    },
+    "SimpsonsVec3": {
+      "description": "A three-dimensional vector in the game's coordinates: X/Z ground plane, Y height.",
+      "fields": [
+        {
+          "name": "x",
+          "type": "number"
+        },
+        {
+          "name": "y",
+          "type": "number"
+        },
+        {
+          "name": "z",
+          "type": "number"
+        }
+      ]
+    },
+    "SimpsonsPlayer": {
+      "description": "A loaded family character. Handles are transient; family order and controller assignment are independent.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "description": "Temporary actor handle; reacquire after unloading, deletion or restore."
+        },
+        {
+          "name": "slot",
+          "type": "integer",
+          "description": "Index in the loaded family list, not an input assignment."
+        },
+        {
+          "name": "input_player",
+          "type": "integer|nil",
+          "description": "Logical port 0/1, or nil for AI, unbound or ambiguous ownership."
+        },
+        {
+          "name": "character",
+          "type": "string"
+        },
+        {
+          "name": "health",
+          "type": "number"
+        },
+        {
+          "name": "max_health",
+          "type": "number"
+        },
+        {
+          "name": "position",
+          "type": "SimpsonsVec3"
+        }
+      ]
+    },
+    "SimpsonsInputButtons": {
+      "description": "Logical game controls. These names stay the same when controller glyphs change. Trigger buttons become held above 30/255; not every device exposes guide.",
+      "fields": [
+        {
+          "name": "a",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "b",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "x",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "y",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "dpad_up",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "dpad_down",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "dpad_left",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "dpad_right",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "start",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "back",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "left_stick",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "right_stick",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "left_shoulder",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "right_shoulder",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "guide",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "left_trigger",
+          "type": "boolean",
+          "description": ""
+        },
+        {
+          "name": "right_trigger",
+          "type": "boolean",
+          "description": ""
+        }
+      ]
+    },
+    "SimpsonsInputStick": {
+      "description": "Normalized routed stick values, without an extra modkit dead zone.",
+      "fields": [
+        {
+          "name": "x",
+          "type": "number",
+          "description": "Left -1, centered 0, right 1."
+        },
+        {
+          "name": "y",
+          "type": "number",
+          "description": "Down -1, centered 0, up 1."
+        }
+      ]
+    },
+    "SimpsonsInputSnapshot": {
+      "description": "One logical player in the current modkit frame. Do not store physical input in saved game.state.",
+      "fields": [
+        {
+          "name": "player",
+          "type": "integer",
+          "description": "Logical player 0 or 1; not a family-list index."
+        },
+        {
+          "name": "frame",
+          "type": "integer",
+          "description": "Monotonic snapshot frame; both players share it."
+        },
+        {
+          "name": "sampled",
+          "type": "boolean",
+          "description": "An original game poll has been observed since the last reset."
+        },
+        {
+          "name": "updated",
+          "type": "boolean",
+          "description": "An original game poll completed for this player during this frame."
+        },
+        {
+          "name": "available",
+          "type": "boolean",
+          "description": "The last observed poll succeeded. This is not a hotplug query; an unpolled port may retain its last sample."
+        },
+        {
+          "name": "buttons",
+          "type": "SimpsonsInputButtons",
+          "description": "Controls held in the latest sample."
+        },
+        {
+          "name": "pressed",
+          "type": "SimpsonsInputButtons",
+          "description": "Transitions to held since the previous snapshot. Initial/reconnected samples do not create presses."
+        },
+        {
+          "name": "released",
+          "type": "SimpsonsInputButtons",
+          "description": "Transitions to released, including disconnects. A quick tap may appear in both pressed and released."
+        },
+        {
+          "name": "left_stick",
+          "type": "SimpsonsInputStick",
+          "description": ""
+        },
+        {
+          "name": "right_stick",
+          "type": "SimpsonsInputStick",
+          "description": ""
+        },
+        {
+          "name": "left_trigger",
+          "type": "number",
+          "description": "Analog pressure from 0 to 1."
+        },
+        {
+          "name": "right_trigger",
+          "type": "number",
+          "description": "Analog pressure from 0 to 1."
+        }
+      ]
+    },
+    "SimpsonsInputPlayer": {
+      "description": "A logical input assignment. Device metadata is read without polling controls; a configured device can differ from the last completed sample.",
+      "fields": [
+        {
+          "name": "player",
+          "type": "integer",
+          "description": "Logical player 0 or 1."
+        },
+        {
+          "name": "assignment",
+          "type": "string",
+          "description": "Configured physical-device id, auto or none."
+        },
+        {
+          "name": "prompts",
+          "type": "string",
+          "description": "Configured prompt override, including auto."
+        },
+        {
+          "name": "prompt_family",
+          "type": "'xbox'|'playstation'|'nintendo'|'steamdeck'|'keyboard'",
+          "description": "Resolved prompt style."
+        },
+        {
+          "name": "device",
+          "type": "string",
+          "description": "Active or selected physical-device id; empty if none is known."
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "description": "Device display name."
+        },
+        {
+          "name": "kind",
+          "type": "'gamepad'|'keyboard'|'touch'|'none'",
+          "description": "Device category."
+        }
+      ]
+    },
+    "SimpsonsOwnedEntity": {
+      "description": "A currently live object owned by the calling mod. Handles are transient.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "description": "Use with entities.transform, entities.move and world.destroy; reacquire after reload or restore."
+        },
+        {
+          "name": "class",
+          "type": "string",
+          "description": "Loaded factory class name."
+        },
+        {
+          "name": "tag",
+          "type": "string",
+          "description": "Stable owner tag, or empty for an untagged object."
+        }
+      ]
+    },
+    "SimpsonsEntityTransform": {
+      "description": "World-space transform resolved through the original RenderWare frame getter. Basis vectors include scale and can be sheared.",
+      "fields": [
+        {
+          "name": "position",
+          "type": "SimpsonsVec3",
+          "description": "World position."
+        },
+        {
+          "name": "right",
+          "type": "SimpsonsVec3",
+          "description": "World X basis, including scale."
+        },
+        {
+          "name": "up",
+          "type": "SimpsonsVec3",
+          "description": "World Y basis, including scale."
+        },
+        {
+          "name": "forward",
+          "type": "SimpsonsVec3",
+          "description": "World Z basis, including scale."
+        }
+      ]
+    },
+    "ModHealth": {
+      "description": "A snapshot of a verified native health component. Healing, filtering and death behavior remain owned by the game.",
+      "fields": [
+        {
+          "name": "current",
+          "type": "number",
+          "description": "Current hit points."
+        },
+        {
+          "name": "maximum",
+          "type": "number",
+          "description": "Normal healing limit, not the separate low-health reference value."
+        },
+        {
+          "name": "dead",
+          "type": "boolean",
+          "description": "The component's native death predicate; some classes remain alive at zero hit points."
+        },
+        {
+          "name": "enabled",
+          "type": "boolean",
+          "description": "The component's native enabled flag. Other hit filters can still reject damage."
+        }
+      ]
+    },
+    "ModHealthChange": {
+      "description": "A completed native damage or healing request. An unchanged value can indicate an ignored hit; removal does not by itself establish a kill.",
+      "fields": [
+        {
+          "name": "before",
+          "type": "ModHealth"
+        },
+        {
+          "name": "after",
+          "type": "ModHealth|nil",
+          "description": "Requeried after callbacks only while the same target lifetime is alive."
+        },
+        {
+          "name": "removed",
+          "type": "boolean",
+          "description": "The target lifetime ended during the native request."
+        }
+      ]
+    },
+    "SimpsonsEntityRenderState": {
+      "description": "Native visibility requests for a mod-owned object. Scene membership does not establish whether a camera sees it.",
+      "fields": [
+        {
+          "name": "hidden_by_mod",
+          "type": "boolean",
+          "description": "This owner currently contributes one native hide request."
+        },
+        {
+          "name": "hide_count",
+          "type": "integer",
+          "description": "Total native hide requests, including authored scripts; 0 through 255."
+        },
+        {
+          "name": "has_model",
+          "type": "boolean",
+          "description": "The entity has a readable native model."
+        },
+        {
+          "name": "scene_attached",
+          "type": "boolean",
+          "description": "The native spatial node is attached to the scene. Camera culling and occlusion are independent."
+        }
+      ]
+    },
+    "SimpsonsSpawnTemplate": {
+      "description": "A resident native entity definition or live template, not a cross-level asset-loading request. Display labels may change when the resource library finishes; use the current handle for spawning. seen may be zero for retained definitions.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "description": "Temporary template handle."
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "description": "Display label; ambiguous variants include a source suffix until metadata resolves them."
+        },
+        {
+          "name": "category",
+          "type": "string"
+        },
+        {
+          "name": "class",
+          "type": "string",
+          "description": "Original readable entity class; it does not prove natural combat behavior."
+        },
+        {
+          "name": "model_resource",
+          "type": "string",
+          "description": "Native model resource GUID (32 hexadecimal digits), or an empty string when unsupported. Query assets.search to find matching source metadata."
+        },
+        {
+          "name": "seen",
+          "type": "integer",
+          "description": "Observed live source instances for this native definition; zero for a retained definition without a live source object."
+        },
+        {
+          "name": "source_guid",
+          "type": "string",
+          "description": "Original definition GUID, matching assets.templates. It is a source identity, not a live guest pointer or persistent template handle."
+        },
+        {
+          "name": "source_stream",
+          "type": "string",
+          "description": "Loaded native file owning this definition, or empty if unproven."
+        }
+      ]
+    },
+    "ModCameraRotation": {
+      "description": "Angles in degrees. Positive yaw turns toward +X from +Z; positive pitch looks down.",
+      "fields": [
+        {
+          "name": "pitch",
+          "type": "number",
+          "description": "-90..90 degrees."
+        },
+        {
+          "name": "yaw",
+          "type": "number",
+          "description": "Normalized to -180..180 degrees."
+        },
+        {
+          "name": "roll",
+          "type": "number",
+          "description": "Normalized to -180..180 degrees."
+        }
+      ]
+    },
+    "ModCameraPose": {
+      "description": "A native viewport 0 view. Y is up; positions are world coordinates. This record contains no guest pointers or handles.",
+      "fields": [
+        {
+          "name": "position",
+          "type": "SimpsonsVec3",
+          "description": "World position."
+        },
+        {
+          "name": "rotation",
+          "type": "ModCameraRotation",
+          "description": "Pitch, yaw and roll in degrees."
+        },
+        {
+          "name": "fov_degrees",
+          "type": "number",
+          "description": "Vertical field of view, 1..120 degrees."
+        }
+      ]
+    },
+    "SimpsonsAssetObject": {
+      "description": "An original compiled object definition linked to an indexed model, character bank or mesh part. A metadata GUID is never a guest address or spawn handle.",
+      "fields": [
+        {
+          "name": "source_guid",
+          "type": "string",
+          "description": "Exact original definition GUID, independent of live instances."
+        },
+        {
+          "name": "stream",
+          "type": "string",
+          "description": "Relative native source archive; pass to assets.load_source."
+        },
+        {
+          "name": "class_hash",
+          "type": "integer",
+          "description": "Original registered native class hash."
+        },
+        {
+          "name": "class",
+          "type": "string",
+          "description": "Reviewed placeable class name, or empty when unsupported."
+        },
+        {
+          "name": "supported",
+          "type": "boolean",
+          "description": "Whether this class has a native spawn adapter in the current runtime."
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "description": "Readable model label, available before source loading."
+        },
+        {
+          "name": "model_resource",
+          "type": "string",
+          "description": "Native MetaModel GUID when known."
+        },
+        {
+          "name": "resident_template",
+          "type": "string",
+          "description": "Current world.spawn handle once fully resident, otherwise empty. Reacquire after source loading, teardown or restore."
+        }
+      ]
+    },
+    "SimpsonsAssetTemplates": {
+      "description": "A bounded page of original object definitions for one asset.",
+      "fields": [
+        {
+          "name": "ready",
+          "type": "boolean",
+          "description": "The asynchronous game-wide index is ready."
+        },
+        {
+          "name": "total",
+          "type": "integer",
+          "description": "Number of linked original definitions before paging."
+        },
+        {
+          "name": "items",
+          "type": "SimpsonsAssetObject[]",
+          "description": "Definitions in this page, including unsupported classes for inspection."
+        }
+      ]
+    },
+    "SimpsonsSourceStatus": {
+      "description": "A source group and the calling mod generation's ownership. Several owners may retain the same additional group.",
+      "fields": [
+        {
+          "name": "phase",
+          "type": "string",
+          "description": "idle, preparing, loading, ready, releasing or failed."
+        },
+        {
+          "name": "stream",
+          "type": "string",
+          "description": "This generation's claimed relative path, otherwise empty."
+        },
+        {
+          "name": "owned",
+          "type": "boolean",
+          "description": "This generation currently retains a claim."
+        },
+        {
+          "name": "ready",
+          "type": "boolean",
+          "description": "This generation owns the matching fully loaded group."
+        },
+        {
+          "name": "message",
+          "type": "string",
+          "description": "Current preparation, native load, retirement or failure detail."
+        },
+        {
+          "name": "files",
+          "type": "integer",
+          "description": "Additional native streams in the group."
+        },
+        {
+          "name": "loaded",
+          "type": "integer",
+          "description": "Streams whose native loads have completed."
+        },
+        {
+          "name": "definitions",
+          "type": "integer",
+          "description": "Retained original object definitions."
+        },
+        {
+          "name": "streams",
+          "type": "string[]",
+          "description": "Every committed archive in the shared session."
+        },
+        {
+          "name": "pending_stream",
+          "type": "string",
+          "description": "The current addition, otherwise empty. Existing owners can remain ready while it loads."
+        }
+      ]
+    },
+    "SimpsonsSceneSource": {
+      "description": "An original compiled definition, rather than a live object address.",
+      "fields": [
+        {
+          "name": "guid",
+          "type": "string"
+        },
+        {
+          "name": "class",
+          "type": "string"
+        },
+        {
+          "name": "stream",
+          "type": "string"
+        }
+      ]
+    },
+    "SimpsonsSceneObject": {
+      "description": "A portable scene object with a stable owner tag.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "source",
+          "type": "SimpsonsSceneSource"
+        },
+        {
+          "name": "transform",
+          "type": "SimpsonsEntityTransform"
+        },
+        {
+          "name": "radius",
+          "type": "number"
+        }
+      ]
+    },
+    "SimpsonsSceneDocument": {
+      "description": "A validated scene of up to 64 original native objects in one episode.",
+      "fields": [
+        {
+          "name": "schema",
+          "type": "integer"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "level_root",
+          "type": "string"
+        },
+        {
+          "name": "autoload",
+          "type": "boolean"
+        },
+        {
+          "name": "objects",
+          "type": "SimpsonsSceneObject[]"
+        }
+      ]
+    },
+    "SimpsonsSceneProject": {
+      "description": "A frozen package scene and source revision for saving creator drafts.",
+      "fields": [
+        {
+          "name": "document",
+          "type": "SimpsonsSceneDocument"
+        },
+        {
+          "name": "fingerprint",
+          "type": "string"
+        }
+      ]
+    },
+    "SimpsonsProjectDocument": {
+      "description": "Frozen creator metadata. kind selects a scene or mission document; handles never appear in authored documents.",
+      "fields": [
+        {
+          "name": "document",
+          "type": "table"
+        },
+        {
+          "name": "fingerprint",
+          "type": "string"
+        }
+      ]
+    },
+    "SimpsonsMissionDocument": {
+      "description": "Portable mission authoring data for one episode, with up to 32 reach/stay/wait objectives. Progress is saved separately by the mission service.",
+      "fields": [
+        {
+          "name": "schema",
+          "type": "integer"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        },
+        {
+          "name": "level_root",
+          "type": "string"
+        },
+        {
+          "name": "revision",
+          "type": "integer"
+        },
+        {
+          "name": "time_limit",
+          "type": "number"
+        },
+        {
+          "name": "fail_on_defeat",
+          "type": "boolean"
+        },
+        {
+          "name": "auto_start",
+          "type": "boolean"
+        },
+        {
+          "name": "objectives",
+          "type": "SimpsonsMissionPoint[]"
+        }
+      ]
+    },
+    "SimpsonsMissionPoint": {
+      "description": "Original-world point and stable objective identity. requires lists prerequisite objective ids; stay requires the same controlled player to remain nearby continuously.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string"
+        },
+        {
+          "name": "title",
+          "type": "string"
+        },
+        {
+          "name": "kind",
+          "type": "string"
+        },
+        {
+          "name": "position",
+          "type": "SimpsonsVec3"
+        },
+        {
+          "name": "radius",
+          "type": "number"
+        },
+        {
+          "name": "seconds",
+          "type": "number"
+        },
+        {
+          "name": "requires",
+          "type": "string[]"
+        },
+        {
+          "name": "optional",
+          "type": "boolean"
+        },
+        {
+          "name": "checkpoint",
+          "type": "boolean"
+        }
+      ]
+    },
+    "SimpsonsMissionAdvance": {
+      "description": "One objective progress increment in an atomic authored-mission update.",
+      "fields": [
+        {
+          "name": "objective",
+          "type": "string"
+        },
+        {
+          "name": "amount",
+          "type": "number"
+        }
+      ]
+    }
+  }
+}

@@ -27,6 +27,7 @@
 #include <rex/string.h>
 
 #if REX_PLATFORM_ANDROID
+#include <android/api-level.h>
 #include <string.h>
 
 #include <dlfcn.h>
@@ -61,7 +62,7 @@ static void* libandroid_;
 static int (*android_ASharedMemory_create_)(const char* name, size_t size);
 
 void AndroidInitialize() {
-  if (rex::GetAndroidApiLevel() >= 26) {
+  if (android_get_device_api_level() >= 26) {
     libandroid_ = dlopen("libandroid.so", RTLD_NOW);
     assert_not_null(libandroid_);
     if (libandroid_) {

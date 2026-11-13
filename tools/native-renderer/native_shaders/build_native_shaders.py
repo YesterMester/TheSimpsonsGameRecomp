@@ -24,11 +24,15 @@ are next to the sources unless bind_source_dir says otherwise.
 
 <modification> is for shaders that don't name theirs (// xe_modification <hex>).
 """
+import argparse
 import os
+from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 
 OP_CAPABILITY = 17
 OP_EXECUTION_MODE = 16
@@ -78,17 +82,26 @@ def add_float_controls(words):
     return header + [w for inst in out for w in inst]
 
 
-# Draw resolution scales to build sets for. Only powers of two: the modules
-# must compute 1/scale exactly like the translator's float constant.
-RESOLUTION_SCALES = (1, 2)
+# Draw resolution scales to build sets for (every scale the launcher offers).
+# The modules must compute 1/scale exactly like the translator's float
+# constant (1.0f / float(scale)): glslang folds 1.0 / float(scale) to the same
+# nearest float, and the coordinate nudge 0.00146484375 / scale is exact for
+# 1, 2 and 3 (3/2048 * float(1/3) rounds to 1/2048), so 3x matches too.
+RESOLUTION_SCALES = (1, 2, 3)
 
 
 def build_set(set_dir, modification, bind_dir, scale):
     os.makedirs(set_dir, exist_ok=True)
+    translator = (Path(__file__).resolve().parents[2] / "rexglue-sdk/include/rex/graphics/pipeline/shader/spirv_translator.h").read_text()
+    version = re.search(r"kTranslatedModuleVersion\s*=\s*(\d+)", translator)
+    if not version:
+        raise ValueError("Could not read the translated module version")
     with open(os.path.join(set_dir, "translator_version.txt"), "w") as f:
-        f.write("1\n")
+        f.write(version.group(1) + "\n")
     with open(os.path.join(set_dir, "render_target_path.txt"), "w") as f:
         f.write("host\n")
+    with open(os.path.join(set_dir, "spirv_version.txt"), "w") as f:
+        f.write("00010500\n")
     here = os.path.dirname(os.path.abspath(__file__))
     for name in sorted(os.listdir(here)):
         base, ext = os.path.splitext(name)
@@ -127,14 +140,51 @@ def build_set(set_dir, modification, bind_dir, scale):
             shutil.copy(os.path.join(bind_dir, f"{shader_hash}_{stage}.bind"), set_dir)
 
 
+def write_warmup_metadata(out_dir, request_archive=None):
+    # Ship the same first-run recipes on desktop and Android. These identities
+    # request a translation for the current GPU; they never bless an old module
+    # with another translator's version or source hash.
+    output = Path(out_dir)
+    modifications = set()
+    if request_archive:
+        # Mobile needs the variant identities, not another GPU's compiled
+        # translations. Read names only, then rebuild from the owner's code
+        # with the device's current translator and capabilities on first run.
+        with tarfile.open(request_archive) as archive:
+            for member in archive:
+                match = re.fullmatch(r"([0-9A-Fa-f]{16})_(vs|ps)_([0-9A-Fa-f]{16})\.spv", Path(member.name).name)
+                if member.isfile() and match:
+                    modifications.add(f"{match[1].upper()} {match[2]} {match[3].upper()}")
+        if not modifications:
+            raise ValueError("The requested archive has no shader warmup identities")
+    for file in output.rglob("*.spv"):
+        match = re.fullmatch(r"([0-9A-Fa-f]{16})_(vs|ps)_([0-9A-Fa-f]{16})\.spv", file.name)
+        if match:
+            modifications.add(f"{match[1].upper()} {match[2]} {match[3].upper()}")
+    if not modifications:
+        raise ValueError("The shader set has no warmup variants")
+    (output / "warmup-modifications.txt").write_text(
+        "# Shader hash, stage and modification; rebuilt for the current GPU.\n" +
+        "\n".join(sorted(modifications)) + "\n", encoding="utf-8")
+    recipes = Path(__file__).resolve().parents[1]
+    for name in ("warmup-pipelines.txt", "warmup-vertex-patches.txt"):
+        if (recipes / name).resolve() != (output / name).resolve():
+            shutil.copy2(recipes / name, output / name)
+    return len(modifications)
+
+
 def main():
-    out_dir, modification = sys.argv[1], sys.argv[2]
-    bind_dir = (sys.argv[3] if len(sys.argv) > 3 else
-                os.path.dirname(os.path.abspath(__file__)))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("out_dir")
+    parser.add_argument("modification")
+    parser.add_argument("bind_dir", nargs="?", default=os.path.dirname(os.path.abspath(__file__)))
+    parser.add_argument("--warmup-archive", help="Read variant identities without copying compiled translations")
+    args = parser.parse_args()
+    out_dir, modification, bind_dir = args.out_dir, args.modification, args.bind_dir
     for scale in RESOLUTION_SCALES:
-        assert scale & (scale - 1) == 0
         set_dir = out_dir if scale == 1 else os.path.join(out_dir, f"scale{scale}x{scale}")
         build_set(set_dir, modification, bind_dir, scale)
+    print("staged", write_warmup_metadata(out_dir, args.warmup_archive), "shader warmup variants")
 
 
 if __name__ == "__main__":

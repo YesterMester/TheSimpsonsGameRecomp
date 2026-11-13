@@ -1,0 +1,15 @@
+{
+  "id": "examples.timed-events",
+  "name": "Timed events",
+  "author": "",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "state",
+  "default_locale": "en",
+  "locales": {
+    "en": "locales/en.json"
+  },
+  "description": "Simulation timers with pause-safe scheduling, cancellation and saved progress."
+}

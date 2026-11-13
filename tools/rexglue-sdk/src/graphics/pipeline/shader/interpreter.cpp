@@ -930,10 +930,15 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
 
   if (!instr.is_mini_fetch()) {
     // Get the part of the address that depends on vfetch_full data.
-    uint32_t vertex_index = uint32_t(
-        std::floor(GetTempRegister(instr.src(), instr.is_src_relative())[instr.src_swizzle()] +
-                   (instr.is_index_rounded() ? 0.5f : 0.0f)));
-    state_.vfetch_address_dwords = instr.stride() * vertex_index + fetch_constant.address;
+    int32_t vertex_index = 0;
+    if (instr.stride()) {
+      float index =
+          std::floor(GetTempRegister(instr.src(), instr.is_src_relative())[instr.src_swizzle()] +
+                     (instr.is_index_rounded() ? 0.5f : 0.0f));
+      if (std::isfinite(index) && double(index) >= double(INT32_MIN) && double(index) < 0x1p31)
+        vertex_index = int32_t(index);
+    }
+    state_.vfetch_address_dwords = instr.stride() * uint32_t(vertex_index) + fetch_constant.address;
   }
 
   // TODO(Triang3l): Find the default values for unused components.
@@ -951,17 +956,16 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
   if (needed_dwords) {
     uint32_t data[4] = {};
     const uint32_t* memory_dwords = reinterpret_cast<const uint32_t*>(memory_.physical_membase());
-    uint32_t buffer_end_dwords = fetch_constant.address + fetch_constant.size;
-    uint32_t dword_0_address_dwords =
-        uint32_t(int32_t(state_.vfetch_address_dwords) + instr.offset());
+    uint32_t dword_0_address_dwords = state_.vfetch_address_dwords + uint32_t(instr.offset());
     for (uint32_t i = 0; i < 4; ++i) {
       if (!(needed_dwords & (UINT32_C(1) << i))) {
         continue;
       }
       uint32_t dword_value = 0;
       uint32_t dword_address_dwords = dword_0_address_dwords + i;
-      if (dword_address_dwords >= fetch_constant.address &&
-          dword_address_dwords < buffer_end_dwords) {
+      // Match both GPU translators: size zero is a null stream, while other
+      // fetches may read valid physical words before or beyond its declaration.
+      if (fetch_constant.size && dword_address_dwords < (512u * 1024 * 1024) / sizeof(uint32_t)) {
         if (trace_writer_) {
           trace_writer_->WriteMemoryRead(sizeof(uint32_t) * dword_address_dwords, sizeof(uint32_t));
         }

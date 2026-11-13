@@ -28,6 +28,12 @@ inline uint32_t LoadGuestU32(const uint8_t* base, uint32_t address) {
   return std::byteswap(value);
 }
 
+inline uint16_t LoadGuestU16(const uint8_t* base, uint32_t address) {
+  uint16_t value;
+  std::memcpy(&value, GuestToHost(base, address), sizeof(value));
+  return std::byteswap(value);
+}
+
 inline void StoreGuestU32(uint8_t* base, uint32_t address, uint32_t value) {
   value = std::byteswap(value);
   std::memcpy(GuestToHost(base, address), &value, sizeof(value));

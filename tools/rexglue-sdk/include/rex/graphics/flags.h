@@ -34,6 +34,7 @@ REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
 REXCVAR_DECLARE(bool, readback_memexport);
 REXCVAR_DECLARE(bool, readback_memexport_fast);
 REXCVAR_DECLARE(bool, occlusion_query_enable);
+REXCVAR_DECLARE(int32_t, native_resolve_buffer_mb);
 REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 
 // GPU Depth / Render Target Behavior

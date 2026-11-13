@@ -111,7 +111,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260226;
+    static constexpr uint32_t kVersion = 0x20261012;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -318,7 +318,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
     uint32_t alpha_to_mask;
     uint32_t edram_32bpp_tile_pitch_dwords_scaled;
     uint32_t edram_depth_base_dwords_scaled;
-    uint32_t padding_edram_depth_base_dwords_scaled;
+    // Physical origin of a resource-local shader memory-export destination.
+    // Zero keeps the physical-address compatibility binding unchanged.
+    uint32_t native_memexport_base;
 
     float color_exp_bias[4];
 
@@ -420,6 +422,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kAlphaToMask,
       kEdram32bppTilePitchDwordsScaled,
       kEdramDepthBaseDwordsScaled,
+      kNativeMemexportBase,
 
       kColorExpBias,
 

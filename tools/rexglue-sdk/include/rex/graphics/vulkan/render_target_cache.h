@@ -16,6 +16,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -100,18 +101,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool Initialize(uint32_t shared_memory_binding_count);
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
-
-  // The render targets bound by the last Update are original resolution ones
-  // (IsOriginalResolutionRenderTarget), drawn at the guest resolution.
-  bool IsLastUpdateOriginalResolution() const {
-    RenderTarget* const* render_targets = last_update_accumulated_render_targets();
-    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-      if (render_targets[i] && render_targets[i]->key().original_resolution) {
-        return true;
-      }
-    }
-    return false;
-  }
+  // The GPU is idle. Invalidate derived shared-memory consumers while keeping
+  // resource-local GPU owners and their write watches.
+  void ClearSharedMemoryCache(VulkanSharedMemory& shared_memory);
 
   void CompletedSubmissionUpdated();
   void EndSubmission();
@@ -131,6 +123,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                     SharedMemory& shared_memory);
   bool ComposeNativeResolveRange(uint32_t address, uint32_t length, bool scaled,
                                  SharedMemory& shared_memory, VkDescriptorBufferInfo& buffer_info);
+  struct NativeVertexRange {
+    uint32_t address, size, offset;
+  };
+  bool SnapshotNativeVertexStreams(std::span<const NativeVertexRange> ranges, uint32_t size,
+                                   SharedMemory& shared_memory, VkDescriptorBufferInfo& buffer_info,
+                                   std::span<const uint8_t> index_snapshot = {});
+  // The caller holds the memory critical region from preparation through
+  // publication, so CPU padding cannot change between capture and the draw.
+  bool PrepareNativeMemExport(uint32_t address, uint32_t length, VulkanSharedMemory& shared_memory,
+                              VulkanTextureCache& texture_cache,
+                              VkDescriptorBufferInfo& buffer_info,
+                              uint32_t index_snapshot_address = 0,
+                              std::span<const uint8_t> index_snapshot = {});
+  bool PublishNativeMemExport(VkBuffer buffer, std::span<const draw_util::MemExportRange> ranges);
   // Diagnostics: the native resolve buffers overlapping the range.
   std::string DescribeNativeResolveBuffers(uint32_t address, uint32_t length, bool scaled);
   bool FlushNativeResolveMemory(uint32_t address, uint32_t length, bool scaled);
@@ -538,6 +544,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     UniformStencil uniform_stencil_;
   };
 
+  VulkanRenderTarget* SnapshotNativeHostDepth(VulkanRenderTarget& source);
+  std::deque<std::pair<uint64_t, std::unique_ptr<VulkanRenderTarget>>> native_depth_snapshots_;
+  uint64_t native_depth_snapshot_count_ = 0;
+
   struct FramebufferKey {
     RenderPassKey render_pass_key;
 
@@ -683,6 +693,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // as it doesn't matter in this case.
       xenos::MsaaSamples host_depth_source_msaa_samples : xenos::kMsaaSamplesBits;
       uint32_t source_resource_format : xenos::kRenderTargetFormatBits;
+
+      uint32_t dest_original_resolution : 1;
+      uint32_t source_original_resolution : 1;
+      uint32_t host_depth_source_original_resolution : 1;
 
       // Last bits because this affects the pipeline layout - after sorting,
       // only change it as fewer times as possible. Depth buffers have an
@@ -979,9 +993,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     kColorUnorm,
     // kDepth writing through a float view of the destination's own format.
     kDepthFloat,
+    kColorFloatMS,
+    kColorUintMS,
+    kDepthMS,
+    kColorUnormMS,
+    kDepthFloatMS,
     kCount,
   };
+  static NativeResolveShader GetSingleSampleNativeResolveShader(NativeResolveShader shader) {
+    return NativeResolveShader(uint32_t(shader) % uint32_t(NativeResolveShader::kColorFloatMS));
+  }
   static bool IsNativeResolveDepthShader(NativeResolveShader shader) {
+    shader = GetSingleSampleNativeResolveShader(shader);
     return shader == NativeResolveShader::kDepth || shader == NativeResolveShader::kDepthFloat;
   }
   enum NativeResolveFlags : uint32_t {
@@ -1004,7 +1027,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // Keep a texture's existing channel order when a draw follows an image
     // copy. This affects the attachment only, never the resolved memory.
     kNativeResolveFlagTextureSwapRedBlue = 1u << 9,
+    kNativeResolveFlagMemoryEndianHigh = 1u << 10,
+    kNativeResolveFlagMemoryArray = 1u << 11,
+    kNativeResolveFlagExpBias = 1u << 12,
+    kNativeResolveFlagSource64bpp = 1u << 13,
+    kNativeResolveFlagConvertColor = 1u << 14,
+    kNativeResolveFlagMemorySizeShift = 15,
+    kNativeResolveFlagMemorySizeValid = 1u << 18,
   };
+  static uint32_t GetNativeResolveMemorySizeLog2(uint32_t flags) {
+    return flags & kNativeResolveFlagMemorySizeValid
+               ? (flags >> kNativeResolveFlagMemorySizeShift) & 7u
+           : flags & kNativeResolveFlagMemory64bpp ? 3u
+                                                   : 2u;
+  }
   // How a source texel is packed into the texel bits, the same way as when
   // dumping the render target to the EDRAM.
   enum class NativeResolvePacking : uint32_t {
@@ -1014,6 +1050,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     kFloat32,
     kUint16,
     kUint32,
+    kGamma8888,
+    kFloat7e3,
+    kSint16,
   };
   struct NativeResolveConstants {
     int32_t source_offset_x;
@@ -1032,6 +1071,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t stencil_capture_pitch_quads;
     // Physical dword represented by the start of a compact output buffer.
     uint32_t memory_base_dwords;
+    uint32_t dest_height_texels;
+    uint32_t dest_slice;
+    float exp_bias;
+    uint32_t sample_select;
+    uint32_t sample_map;
+    uint32_t source_layout;
+    uint32_t destination_packing;
   };
   struct NativeResolvePlan {
     VulkanRenderTarget* source = nullptr;
@@ -1041,6 +1087,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     uint32_t dest_base = 0;
     uint32_t dest_pitch_texels = 0;
+    uint32_t dest_height_texels = 0;
+    uint32_t dest_slice = 0;
+    float exp_bias = 1.0f;
+    uint32_t sample_select = 0;
+    uint32_t sample_map = 0;
+    uint32_t source_layout = 0;
+    uint32_t destination_packing = 0;
     uint32_t memory_flags = 0;
     // Whether the first target contains the whole resolve rectangle, so
     // drawing it can also write all of the resolved memory.
@@ -1093,9 +1146,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool EnsureNativeResolvePipelineLayouts();
   void ShutdownNativeResolve();
   VkPipeline GetNativeResolvePipeline(NativeResolveShader shader, VkFormat dest_format);
-  bool PrepareNativeResolveAliasSurface(const draw_util::ResolveInfo& resolve_info,
-                                       uint32_t dump_base, uint32_t dump_row_length_used,
-                                       uint32_t dump_rows, uint32_t dump_pitch);
+  RenderTarget* PrepareNativeResolveAliasSurface(const draw_util::ResolveInfo& resolve_info,
+                                                 uint32_t dump_base, uint32_t dump_row_length_used,
+                                                 uint32_t dump_rows, uint32_t dump_pitch);
   // Finds the host render target owning the whole resolve area and the textures
   // to write. Must be called before the memory range is marked as resolved.
   // memory_only plans a resolve of only the memory, without any textures.
@@ -1140,6 +1193,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                         VkDeviceSize destination_offset);
   NativeResolveBuffer* AcquireNativeResolveBuffer(VkDeviceSize size);
   NativeResolveBuffer* FindNativeResolveBufferRange(uint32_t address, uint32_t length, bool scaled);
+  bool IsNativeResolveBufferRangeValid(const NativeResolveBuffer& buffer, uint32_t address,
+                                       uint32_t length) const;
   // Whether a resolve of the range to the base can write into the valid native
   // buffer of a larger resolve (or of several) holding the range (see
   // TryNativeResolveBuffer).
@@ -1148,26 +1203,39 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // still holding data (valid or with memory pending) of another extent, or one
   // shared by resolves of several extents.
   bool OverlapsLiveNativeResolveBuffer(uint32_t address, uint32_t length, bool scaled);
-  // Before a resolve writes the range: earlier native resolve results that
-  // only partly overlap it are copied to the mirror first, except those of
-  // the buffer the resolve writes into, which keeps them itself.
+  // Before a resolve writes the range: preserve earlier results outside it,
+  // unless the new buffer already contains that preserved range.
   bool PrepareNativeResolveMemoryForWrite(uint32_t address, uint32_t length,
-                                          const NativeResolveBuffer* writing_into = nullptr);
+                                          const NativeResolveBuffer* writing_into = nullptr,
+                                          uint32_t preserved_address = 0,
+                                          uint32_t preserved_length = 0);
   bool WriteBackNativeResolveBuffer(NativeResolveBuffer& buffer);
+  void WatchNativeResolveBuffer(NativeResolveBuffer& buffer);
+  // A new version owns its whole extent: older versions' pages there are
+  // superseded (their bytes were taken into it), so they no longer pin memory.
+  void RetireNativeResolveVersionsUnder(const NativeResolveBuffer& owner);
+  bool EnsureNativeResolvePageWatch(VulkanSharedMemory& shared_memory);
+  bool IsNativeResolveBufferLive(const NativeResolveBuffer& buffer) const;
   // Records copying guest memory bytes into the buffer (in the current
   // submission, barriers are the caller's).
   bool UploadGuestMemoryToBuffer(uint32_t address, uint32_t length, VkBuffer buffer,
-                                 VkDeviceSize offset);
+                                 VkDeviceSize offset, const uint8_t* snapshot = nullptr);
   void ClearNativeResolveBuffers();
+  void CompactNativeResolveBuffers(uint64_t target_bytes);
   // Uses the same global critical region as the shared-memory write watches.
   rex::thread::global_critical_region native_resolve_buffers_critical_region_;
-  std::vector<std::unique_ptr<NativeResolveBuffer>> native_resolve_buffers_;
+  std::vector<std::shared_ptr<NativeResolveBuffer>> native_resolve_buffers_;
+  SharedMemory::GlobalWatchHandle native_resolve_page_watch_ = nullptr;
+  VulkanSharedMemory* native_resolve_page_shared_memory_ = nullptr;
   // Resolve destinations (bases) that resolves of several extents write - such
   // as a bloom chain downsampling into the same memory. Their results always
   // stay in native buffers, which the others build on.
   std::unordered_set<uint32_t> multi_extent_resolve_bases_;
   uint64_t native_resolve_buffer_bytes_ = 0;
+  uint64_t native_resolve_compactions_ = 0;
   bool native_resolve_memory_flushing_ = false;
+  bool native_resolve_clearing_cache_ = false;
+  const NativeResolveBuffer* native_memexport_publishing_ = nullptr;
 
   bool gamma_render_target_as_unorm16_ = false;
 
@@ -1291,6 +1359,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // the memory would hold; for depth, as the converted depth the texture
   // samples, with the stencil the memory would also hold captured separately.
   struct PendingScaledResolveMemory {
+    VulkanSharedMemory* shared_memory = nullptr;
+    // The immutable version containing the padding before this image resolve,
+    // or proof that the scaled padding had no GPU-written data.
+    std::shared_ptr<NativeResolveBuffer> padding_source;
+    bool padding_fresh = false;
     void* texture = nullptr;
     uint32_t dest_base = 0;
     uint32_t extent_start = 0;
@@ -1372,7 +1445,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void WriteBackPendingScaledResolveMemory(const PendingScaledResolveMemory& pending);
   // Before a resolve writes [start, start + length): pending resolves it fully
   // covers are dropped (superseded), partially overlapped ones written back.
-  void PrepareScaledResolveMemoryForResolve(uint32_t start, uint32_t length);
+  void PrepareScaledResolveMemoryForResolve(uint32_t start, uint32_t length,
+                                            const NativeResolvePlan* new_plan,
+                                            std::shared_ptr<NativeResolveBuffer>& padding_source,
+                                            bool& padding_fresh);
   VkShaderModule native_resolve_vertex_shader_ = VK_NULL_HANDLE;
   VkShaderModule native_resolve_fragment_shaders_[size_t(NativeResolveShader::kCount)] = {};
   VkPipelineLayout native_resolve_pipeline_layout_color_ = VK_NULL_HANDLE;

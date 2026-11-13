@@ -25,6 +25,7 @@
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/graphics/util/bytes_equal.h>
+#include <rex/graphics/util/gpu_page_mask.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
@@ -129,6 +130,8 @@ void SharedMemory::ShutdownCommon() {
   streamed_page_shadows_.clear();
 
   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, false);
+  native_index_snapshots_.clear();
+  native_index_snapshot_bytes_ = 0;
   assert_true(global_watches_.empty());
   // No watches now, so no references to the pools accessible by guest threads -
   // safe not to enter the global critical region.
@@ -269,8 +272,8 @@ void SharedMemory::InvalidateAllPages() {
   auto global_lock = global_critical_region_.Acquire();
 
   if (num_system_page_flags_) {
-    std::memset(system_page_flags_valid_.data(), 0,
-                num_system_page_flags_ * sizeof(uint64_t));
+    for (auto& word : system_page_flags_valid_)
+      draw_util::StoreGpuPageValidity(word, 0);
     std::memset(system_page_flags_valid_and_gpu_written_.data(), 0,
                 num_system_page_flags_ * sizeof(uint64_t));
   }
@@ -287,7 +290,8 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   auto global_lock = global_critical_region_.Acquire();
 
   for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
-    system_page_flags_valid_[i] = system_page_flags_valid_and_gpu_written_[i];
+    draw_util::StoreGpuPageValidity(system_page_flags_valid_[i],
+                                    system_page_flags_valid_and_gpu_written_[i]);
   }
 }
 
@@ -295,6 +299,8 @@ void SharedMemory::ClearCache() {
   streamed_page_shadows_.clear();
   // Keeping GPU-written data, so "invalidated by GPU".
   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, true);
+  native_index_snapshots_.clear();
+  native_index_snapshot_bytes_ = 0;
   // No watches now, so no references to the pools accessible by guest threads -
   // safe not to enter the global critical region.
   watch_node_first_free_ = nullptr;
@@ -310,6 +316,86 @@ void SharedMemory::ClearCache() {
   }
   watch_range_pools_.clear();
   SetSystemPageBlocksValidWithGpuDataWritten();
+}
+
+std::shared_ptr<const std::vector<uint8_t>> SharedMemory::SnapshotNativeGpuIndices(
+    uint32_t start, uint32_t length, bool& newly_downloaded) {
+  newly_downloaded = false;
+  if (!length || ((start | length) & 3) || start >= kBufferSize || length > kBufferSize - start)
+    return {};
+  auto lock = global_critical_region_.Acquire();
+  auto containing = native_index_snapshots_.end();
+  for (auto it = native_index_snapshots_.end(); it != native_index_snapshots_.begin();) {
+    --it;
+    const auto& snapshot = *it;
+    if (!snapshot->valid || snapshot->start > start ||
+        uint64_t(start) + length > uint64_t(snapshot->start) + snapshot->bytes->size())
+      continue;
+    if (snapshot->start == start && snapshot->bytes->size() == length) {
+      auto bytes = snapshot->bytes;
+      std::rotate(it, it + 1, native_index_snapshots_.end());
+      return bytes;
+    }
+    if (containing == native_index_snapshots_.end() ||
+        snapshot->bytes->size() < (*containing)->bytes->size())
+      containing = it;
+  }
+  if (!WatchCpuMemoryRange(start, length))
+    return {};
+  auto snapshot = std::make_unique<NativeIndexSnapshot>();
+  snapshot->start = start;
+  if (containing != native_index_snapshots_.end()) {
+    // The common lock keeps writes from invalidating this immutable version
+    // while a smaller draw takes its own bytes. Avoid another GPU completion
+    // wait for data already downloaded from the same still-current owner.
+    const auto& source = *containing;
+    auto first = source->bytes->begin() + (start - source->start);
+    snapshot->bytes = std::make_shared<std::vector<uint8_t>>(first, first + length);
+    std::rotate(containing, containing + 1, native_index_snapshots_.end());
+  } else {
+    snapshot->bytes = std::make_shared<std::vector<uint8_t>>(length);
+    if (!DownloadNativeGpuIndices(start, *snapshot->bytes))
+      return {};
+    newly_downloaded = true;
+    ++native_index_download_count_;
+  }
+  // The cache budget limits retention, not which valid native streams can be
+  // converted. An oversized immutable version lives with its current consumer.
+  if (length > (8u << 20))
+    return snapshot->bytes;
+  // Invalid versions cannot serve another draw. Retained callers still own
+  // their bytes independently, so reclaim these before evicting a live entry.
+  std::erase_if(native_index_snapshots_, [&](const auto& old) {
+    if (old->valid)
+      return false;
+    if (old->watch)
+      UnwatchMemoryRange(old->watch);
+    native_index_snapshot_bytes_ -= old->bytes->size();
+    return true;
+  });
+  // Keep the downloaded bytes immutable. Writes cancel only the cache entry;
+  // a caller may still be converting the preceding version's indices.
+  while (!native_index_snapshots_.empty() && (native_index_snapshots_.size() >= 64 ||
+                                              native_index_snapshot_bytes_ + length > (8u << 20))) {
+    auto& old = native_index_snapshots_.front();
+    if (old->watch)
+      UnwatchMemoryRange(old->watch);
+    native_index_snapshot_bytes_ -= old->bytes->size();
+    native_index_snapshots_.pop_front();
+  }
+  snapshot->valid = true;
+  snapshot->watch = WatchMemoryRange(
+      start, length,
+      [](const std::unique_lock<std::recursive_mutex>&, void*, void* data, uint64_t, bool) {
+        auto* entry = static_cast<NativeIndexSnapshot*>(data);
+        entry->valid = false;
+        entry->watch = nullptr;
+      },
+      nullptr, snapshot.get(), 0);
+  auto bytes = snapshot->bytes;
+  native_index_snapshot_bytes_ += length;
+  native_index_snapshots_.push_back(std::move(snapshot));
+  return bytes;
 }
 
 SharedMemory::GlobalWatchHandle SharedMemory::RegisterGlobalWatch(GlobalWatchCallback callback,
@@ -486,6 +572,28 @@ bool SharedMemory::IsRangeGpuWritten(uint32_t start, uint32_t length) {
   return false;
 }
 
+bool SharedMemory::GetGpuWrittenPages(uint32_t start, std::span<uint8_t> pages) {
+  if (pages.empty())
+    return true;
+  if (start >= kBufferSize || (start & ((1u << page_size_log2_) - 1)) ||
+      pages.size() > ((kBufferSize - start) >> page_size_log2_))
+    return false;
+  auto global_lock = global_critical_region_.Acquire();
+  return draw_util::CopyGpuWrittenPages(system_page_flags_valid_and_gpu_written_,
+                                        start >> page_size_log2_, pages);
+}
+
+bool SharedMemory::IsAnyGpuWrittenPage(uint32_t start, std::span<const uint8_t> valid_pages) {
+  if (valid_pages.empty())
+    return false;
+  if (start >= kBufferSize || (start & ((1u << page_size_log2_) - 1)) ||
+      valid_pages.size() > ((kBufferSize - start) >> page_size_log2_))
+    return draw_util::AnyPageFlagSet(valid_pages);
+  auto global_lock = global_critical_region_.Acquire();
+  return draw_util::AnyGpuWrittenPage(system_page_flags_valid_and_gpu_written_,
+                                      start >> page_size_log2_, valid_pages);
+}
+
 void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   if (length == 0 || start >= kBufferSize) {
     return;
@@ -574,7 +682,10 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
                                             std::memory_order_relaxed);
         }
       }
-      system_page_flags_valid_[i] |= valid_bits;
+      auto& validity = system_page_flags_valid_[i];
+      draw_util::StoreGpuPageValidity(
+          validity,
+          draw_util::LoadGpuPageValidity(validity, std::memory_order_relaxed) | valid_bits);
       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~range_bits);
     }
@@ -858,10 +969,9 @@ bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* m
                                           bool allow_streamed) {
   // Fast path: if everything requested is already valid, nothing has to be
   // uploaded and the global lock can be skipped entirely. Reading the flags
-  // without the lock is safe because the storage never moves and every writer
-  // holds the lock -- the worst case is racing an invalidation that is being
-  // applied right now, which the locked re-check below (taken whenever any
-  // page reads invalid) resolves.
+  // without the lock uses atomic words in stable storage. Writers serialize
+  // updates under the common lock and publish them with release stores. If
+  // any page reads invalid, the locked scan below finds the upload ranges.
   uint64_t* valid_flags = valid_flags_.load(std::memory_order_acquire);
   if (valid_flags) {
     bool all_valid = true;
@@ -875,7 +985,7 @@ bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* m
       uint32_t block_first = page_first >> 6;
       uint32_t block_last = page_last >> 6;
       for (uint32_t i = block_first; i <= block_last; ++i) {
-        uint64_t block_valid = valid_flags[i];
+        uint64_t block_valid = draw_util::LoadGpuPageValidity(valid_flags[i]);
         if (i == block_first) {
           uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
           block_valid |= block_before;
@@ -927,7 +1037,8 @@ bool SharedMemory::RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* m
       uint32_t block_last = page_last >> 6;
       uint32_t range_start = UINT32_MAX;
       for (uint32_t i = block_first; i <= block_last; ++i) {
-        uint64_t block_valid = system_page_flags_valid_[i];
+        uint64_t block_valid =
+            draw_util::LoadGpuPageValidity(system_page_flags_valid_[i], std::memory_order_relaxed);
         // Consider pages in the block outside the requested range valid.
         if (i == block_first) {
           uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
@@ -1192,7 +1303,10 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     if (i == block_last && (page_last & 63) != 63) {
       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
-    system_page_flags_valid_[i] &= ~invalidate_bits;
+    auto& validity = system_page_flags_valid_[i];
+    draw_util::StoreGpuPageValidity(
+        validity,
+        draw_util::LoadGpuPageValidity(validity, std::memory_order_relaxed) & ~invalidate_bits);
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
   }
 
@@ -1222,9 +1336,10 @@ void SharedMemory::PrepareForTraceDownload() {
   uint32_t gpu_written_range_start = UINT32_MAX;
   auto global_lock = global_critical_region_.Acquire();
   for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
-    uint64_t previously_valid_block = system_page_flags_valid_[i];
+    uint64_t previously_valid_block =
+        draw_util::LoadGpuPageValidity(system_page_flags_valid_[i], std::memory_order_relaxed);
     uint64_t gpu_written_block = system_page_flags_valid_and_gpu_written_[i];
-    system_page_flags_valid_[i] = gpu_written_block;
+    draw_util::StoreGpuPageValidity(system_page_flags_valid_[i], gpu_written_block);
 
     // Fire watches on the invalidated pages.
     uint64_t fire_watches_block = previously_valid_block & ~gpu_written_block;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -22,6 +23,8 @@
 #include <nlohmann/json.hpp>
 #include <xxhash.h>
 
+#include <rex/graphics/pipeline/shader/shader.h>
+#include <rex/string/buffer.h>
 #include <rex/kernel/init.h>
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
@@ -100,6 +103,72 @@ void MergeStorage(const std::filesystem::path &path, Programs &programs) {
   }
 }
 
+// These are shader prerequisites, not a resource-ownership proof. Register
+// values, GPU writers and render-target aliases still need draw-level checks.
+nlohmann::json AnalyzePrograms(const Programs &programs,
+                               const std::set<uint64_t> &cached_hashes,
+                               const std::set<uint64_t> &executable_hashes) {
+  namespace gfx = rex::graphics;
+  nlohmann::json records = nlohmann::json::array();
+  size_t static_vertex = 0, unproved_vertex = 0, pixel_fetches = 0;
+  size_t exports = 0, dynamic_registers = 0;
+  for (const auto &[hash, program] : programs) {
+    std::vector<uint32_t> words(program.bytes.size() / 4);
+    std::memcpy(words.data(), program.bytes.data(), program.bytes.size());
+    const bool vertex = program.type == 0;
+    gfx::Shader shader(vertex ? gfx::xenos::ShaderType::kVertex
+                              : gfx::xenos::ShaderType::kPixel,
+                       hash, words.data(), words.size(), std::endian::big);
+    rex::string::StringBuffer disassembly;
+    shader.AnalyzeUcode(disassembly);
+    const bool static_addresses = shader.has_static_vertex_addresses();
+    const bool pixel_vertex_fetch = !vertex && !shader.vertex_bindings().empty();
+    const bool memory_export = shader.memexport_eM_written() != 0;
+    static_vertex += vertex && static_addresses;
+    unproved_vertex += vertex && !static_addresses;
+    pixel_fetches += pixel_vertex_fetch;
+    exports += memory_export;
+    dynamic_registers += shader.uses_register_dynamic_addressing();
+    nlohmann::json bindings = nlohmann::json::array();
+    for (const auto &binding : shader.vertex_bindings()) {
+      nlohmann::json attributes = nlohmann::json::array();
+      for (const auto &attribute : binding.attributes) {
+        const auto &expression = attribute.index_expression;
+        nlohmann::json item = {
+            {"static_index_expression", expression.valid},
+            {"format", uint32_t(attribute.fetch_instr.attributes.data_format)},
+            {"rounded_index", attribute.fetch_instr.attributes.is_index_rounded}};
+        if (expression.offset_constant != UINT32_MAX)
+          item["offset_float_component"] = expression.offset_constant;
+        if (expression.scale_constant != UINT32_MAX)
+          item["scale_float_component"] = expression.scale_constant;
+        attributes.push_back(std::move(item));
+      }
+      bindings.push_back({{"fetch_constant", binding.fetch_constant},
+                          {"stride_words", binding.stride_words},
+                          {"attributes", std::move(attributes)}});
+    }
+    records.push_back({{"hash", HashName(hash)},
+                       {"stage", vertex ? "vertex" : "pixel"},
+                       {"in_executable", executable_hashes.contains(hash)},
+                       {"in_input_cache", cached_hashes.contains(hash)},
+                       {"static_vertex_addresses", static_addresses},
+                       {"pixel_vertex_fetch", pixel_vertex_fetch},
+                       {"memory_export", memory_export},
+                       {"dynamic_register_addressing", shader.uses_register_dynamic_addressing()},
+                       {"vertex_bindings", std::move(bindings)}});
+  }
+  return {{"version", 1},
+          {"scope", "shader prerequisites; draw-level memory ownership is not established"},
+          {"full_game_native_proven", false},
+          {"programs", std::move(records)},
+          {"static_vertex_programs", static_vertex},
+          {"unproved_vertex_address_programs", unproved_vertex},
+          {"pixel_vertex_fetch_programs", pixel_fetches},
+          {"memory_export_programs", exports},
+          {"dynamic_register_programs", dynamic_registers}};
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -145,6 +214,7 @@ int main(int argc, char **argv) {
                                    xex->image_size());
     nlohmann::json containers = nlohmann::json::array();
     size_t cached_matches = 0;
+    std::set<uint64_t> executable_hashes;
     for (size_t offset = 0; offset + 36 <= image.size(); offset += 4) {
       const uint8_t *header = image.data() + offset;
       uint32_t signature = ReadBe32(header);
@@ -178,6 +248,7 @@ int main(int argc, char **argv) {
       size_t code_address = offset + metadata_size + code_offset;
       auto bytes = image.subspan(code_address, code_size);
       uint64_t hash = XXH3_64bits(bytes.data(), bytes.size());
+      executable_hashes.insert(hash);
       bool already_cached = cached_hashes.contains(hash);
       AddProgram(programs, hash, type, bytes);
       cached_matches += already_cached;
@@ -229,6 +300,11 @@ int main(int argc, char **argv) {
     manifest << report.dump(2) << '\n';
     if (!manifest)
       throw std::runtime_error("could not write inventory");
+    const auto analysis = AnalyzePrograms(programs, cached_hashes, executable_hashes);
+    std::ofstream analysis_file(output / "native-analysis.json");
+    analysis_file << analysis.dump(2) << '\n';
+    if (!analysis_file)
+      throw std::runtime_error("could not write native shader analysis");
     std::cout << containers.size() << " executable containers, "
               << cached_matches << " cache matches, " << programs.size()
               << " unique programs (" << vertex_count << " vertex, "

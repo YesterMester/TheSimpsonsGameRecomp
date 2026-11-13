@@ -1,0 +1,7 @@
+{
+  "title": "Timed events",
+  "start": "Start a five-second timer",
+  "cancel": "Cancel the timer",
+  "count": "Completed timers: {count}",
+  "finished": "The timer finished."
+}

@@ -93,7 +93,7 @@ class AudioSystem : public system::IAudioSystem {
   std::unique_ptr<rex::thread::Event> shutdown_event_;
   rex::thread::WaitHandle* wait_handles_[kMaximumClientCount + 1];
 
-  bool paused_ = false;
+  std::atomic<bool> paused_ = false;
   rex::thread::Fence pause_fence_;
   std::unique_ptr<rex::thread::Event> resume_event_;
 };

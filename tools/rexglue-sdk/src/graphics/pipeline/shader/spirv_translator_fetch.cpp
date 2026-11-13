@@ -20,6 +20,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/util/native_vertex_fetch.h>
 #include <rex/math.h>
 
 namespace rex::graphics {
@@ -44,12 +45,9 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   EnsureBuildPointAvailable();
 
   uint32_t fetch_constant_word_0_index = instr.operands[1].storage_index << 1;
-
-  spv::Id address;
-  if (instr.is_mini_fetch) {
-    // `base + index * stride` loaded by vfetch_full.
-    address = builder_->createLoad(var_main_vfetch_address_, spv::NoPrecision);
-  } else {
+  const bool native_fetch = GetSpirvShaderModification().vertex.native_vertex_streams;
+  spv::Id fetch_constant_word_0 = spv::NoResult;
+  if (!instr.is_mini_fetch || native_fetch) {
     // Get the base address in dwords from the bits 2:31 of the first fetch
     // constant word.
     id_vector_temp_.clear();
@@ -59,10 +57,16 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_0_index >> 2)));
     // Component index.
     id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_0_index & 3)));
-    spv::Id fetch_constant_word_0 =
+    fetch_constant_word_0 =
         builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
                                                          uniform_fetch_constants_, id_vector_temp_),
                              spv::NoPrecision);
+  }
+  spv::Id address;
+  if (instr.is_mini_fetch) {
+    // `base + index * stride` loaded by vfetch_full.
+    address = builder_->createLoad(var_main_vfetch_address_, spv::NoPrecision);
+  } else {
     // TODO(Triang3l): Verify the fetch constant type (that it's a vertex fetch,
     // not a texture fetch) here instead of dropping draws with invalid vertex
     // fetch constants on the CPU when proper bound checks are added - vfetch
@@ -147,11 +151,32 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   // clamp: when the size field is zero, the fetched words are zero, and
   // memory is not accessed at all - address 0 may be in a sparse shared
   // memory region that has never been backed.
-  spv::Id fetch_size = builder_->createBinOp(
-      spv::OpBitwiseAnd, type_uint_,
-      builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, fetch_constant_word_1,
-                            builder_->makeUintConstant(2)),
-      builder_->makeUintConstant((uint32_t(1) << 24) - 1));
+  spv::Id fetch_size =
+      native_fetch
+          ? builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, fetch_constant_word_0,
+                                  builder_->makeUintConstant(draw_util::kNativeVertexFetchValidBit))
+          : builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_,
+                builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, fetch_constant_word_1,
+                                      builder_->makeUintConstant(2)),
+                builder_->makeUintConstant((uint32_t(1) << 24) - 1));
+  spv::Id native_first_word = spv::NoResult;
+  if (native_fetch) {
+    spv::Id packed = builder_->createBinOp(
+        spv::OpBitwiseOr, type_uint_,
+        builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, fetch_constant_word_1,
+                              builder_->makeUintConstant(2)),
+        builder_->createBinOp(
+            spv::OpShiftLeftLogical, type_uint_,
+            builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_, fetch_constant_word_0,
+                builder_->makeUintConstant(draw_util::kNativeVertexFetchOffsetHighBit)),
+            builder_->makeUintConstant(29)));
+    native_first_word = builder_->createTriOp(
+        spv::OpBitFieldSExtract, type_int_,
+        builder_->createUnaryOp(spv::OpBitcast, type_int_, packed), const_int_0_,
+        builder_->makeIntConstant(draw_util::kNativeVertexFetchOffsetBits));
+  }
   spv::Id size_is_nonzero = builder_->createBinOp(spv::OpINotEqual, type_bool_, fetch_size,
                                                   builder_->makeUintConstant(0));
   SpirvBuilder::IfBuilder size_if(size_is_nonzero, spv::SelectionControlDontFlattenMask,
@@ -172,16 +197,11 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
         word_address = builder_->createBinOp(spv::OpIAdd, type_int_, word_address,
                                              builder_->makeIntConstant(int(word_offset)));
       }
-      if (GetSpirvShaderModification().vertex.native_vertex_streams) {
-        // Native snapshots retain the exact fetch decode. The private size
-        // field stores the first captured dword + 1 (zero still means an
-        // absent optional stream), and the private address is the compact
-        // buffer offset. Guest registers remain unchanged.
-        spv::Id first_word = builder_->createBinOp(spv::OpISub, type_uint_, fetch_size,
-                                                   builder_->makeUintConstant(1));
+      if (native_fetch) {
+        // The private signed word offset is independent of the valid flag,
+        // so large/negative ranges need no unused prefix in their snapshots.
         word_address =
-            builder_->createBinOp(spv::OpISub, type_int_, word_address,
-                                  builder_->createUnaryOp(spv::OpBitcast, type_int_, first_word));
+            builder_->createBinOp(spv::OpISub, type_int_, word_address, native_first_word);
       }
       // FIXME(Triang3l): Bound checking is not done here, but haven't
       // encountered any games relying on out-of-bounds access. On Adreno 200 on

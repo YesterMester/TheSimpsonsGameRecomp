@@ -122,6 +122,7 @@ constexpr bool kIsGauge[] = {
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
 // CSV state
+std::atomic<bool> g_csv_active{false};
 std::FILE* g_csv_file = nullptr;
 std::string g_csv_path;
 int g_csv_frame_count = 0;
@@ -171,7 +172,12 @@ void Init() {
     s.store(0, std::memory_order_relaxed);
 }
 
+bool TimedCountersEnabled() {
+  return g_csv_active.load(std::memory_order_relaxed);
+}
+
 void SetCsvLogPath(const std::string& path) {
+  g_csv_active.store(false, std::memory_order_relaxed);
   if (g_csv_file) {
     std::fflush(g_csv_file);
     std::fclose(g_csv_file);
@@ -189,6 +195,7 @@ void SetCsvLogPath(const std::string& path) {
     g_csv_path.clear();
     return;
   }
+  g_csv_active.store(true, std::memory_order_relaxed);
 
   // Write header. The two frame-identity columns come first so a row can be
   // joined against anything else recorded during the session -- guest-side
@@ -223,6 +230,7 @@ void WriteCsvFrame() {
 }
 
 void FlushCsv() {
+  g_csv_active.store(false, std::memory_order_relaxed);
   if (g_csv_file) {
     std::fflush(g_csv_file);
     std::fclose(g_csv_file);

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Simpsons Modkit · Translations</title>
+<link rel="stylesheet" href="/editor.css">
+<header><h1>Translations</h1><p id="project">Opening project…</p>
+<label for="progress">Translation progress</label><progress id="progress" max="100" value="0"></progress><p id="counts"></p></header>
+<main>
+<form id="project-search"><label>Search every text table<input id="global-search" type="search" maxlength="160" placeholder="Find dialogue, a menu label or a text ID…" required></label><button type="submit">Find text</button></form>
+<div id="search-results" role="region" aria-label="Project search results"></div>
+<div class="tools"><label>Text table<select id="catalog"></select></label>
+<label>Filter this table<input id="search" type="search" placeholder="Find a line…"></label>
+<label class="check"><input id="remaining" type="checkbox"> Untranslated only</label>
+<button id="save" disabled>Save changes</button></div>
+<p id="status" role="status" aria-live="polite"></p>
+<p>Translate the words. Keep button tags such as <code>[RDDown]</code> and placeholders such as <code>%1</code> or <code>{name}</code>. “Use original” leaves the game's text unchanged.</p>
+<div id="entries"></div><button id="more" hidden>Show more lines</button>
+</main><script src="/editor.js" defer></script>
+</html>

@@ -12,7 +12,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <cmath>
+#include <chrono>
 #include <mutex>
+#include <stdexcept>
+#include <sstream>
 #include <unordered_map>
 
 #include <CLI/CLI.hpp>
@@ -21,6 +25,10 @@
 #include <rex/logging.h>
 
 #include <toml++/toml.hpp>
+
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#endif
 
 namespace rex::cvar {
 
@@ -581,6 +589,122 @@ void SaveConfig(const std::filesystem::path& config_path) {
     REXLOG_INFO("Saved config to {}", config_path.string());
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
+  }
+}
+
+bool SaveConfigPatch(const std::filesystem::path& config_path,
+                     const std::map<std::string, std::string>& values) {
+  if (values.empty())
+    return true;
+  std::filesystem::path temporary;
+  try {
+    toml::table config;
+    std::string original;
+    if (std::filesystem::exists(config_path)) {
+      std::ifstream file(config_path, std::ios::binary);
+      original.assign(std::istreambuf_iterator<char>(file), {});
+      config = toml::parse(original);
+    }
+    struct Replacement {
+      size_t last_line;
+      std::string text;
+    };
+    std::map<size_t, Replacement> replacements;
+    std::string additions;
+    for (const auto& [name, value] : values) {
+      FlagType type;
+      {
+        // File access must not block live readers, including the audio callback.
+        std::lock_guard lock(GetRegistryMutex());
+        auto found = GetRegistryIndex().find(name);
+        if (found == GetRegistryIndex().end())
+          return false;
+        const auto& entry = GetRegistryStorage()[found->second];
+        if (!ValidateConstraints(entry, value))
+          return false;
+        type = entry.type;
+      }
+      size_t first_line = 0, last_line = 0;
+      if (const auto* existing = config.get(name)) {
+        if (existing->is_table() || existing->is_array())
+          return false;
+        first_line = existing->source().begin.line;
+        last_line = existing->source().end.line;
+      }
+      if (type == FlagType::String) {
+        config.insert_or_assign(name, value);
+      } else if (type == FlagType::Boolean) {
+        if (value != "true" && value != "false" && value != "0" && value != "1")
+          return false;
+        config.insert_or_assign(name, value == "true" || value == "1");
+      } else if (type == FlagType::Double) {
+        double number{};
+        auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+        if (error != std::errc() || end != value.data() + value.size() || !std::isfinite(number))
+          return false;
+        config.insert_or_assign(name, number);
+      } else if (type != FlagType::Command) {
+        int64_t number{};
+        auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+        if (error != std::errc() || end != value.data() + value.size())
+          return false;
+        config.insert_or_assign(name, number);
+      } else {
+        return false;
+      }
+      toml::table line;
+      line.insert(name, *config.get(name));
+      std::ostringstream formatted;
+      formatted << line << '\n';
+      if (first_line)
+        replacements[first_line] = {last_line, formatted.str()};
+      else
+        additions += formatted.str();
+    }
+    temporary = config_path;
+    temporary += ".settings-" +
+                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                 ".tmp";
+    {
+      std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+      // Retain the launcher's managed-block markers and migration version,
+      // as well as comments and settings this build doesn't know about.
+      file << additions;
+      std::istringstream input(original);
+      std::string text;
+      size_t line = 0, skip_until = 0;
+      while (std::getline(input, text)) {
+        ++line;
+        if (line <= skip_until)
+          continue;
+        const auto replacement = replacements.find(line);
+        if (replacement != replacements.end()) {
+          file << replacement->second.text;
+          skip_until = replacement->second.last_line;
+        } else {
+          file << text << '\n';
+        }
+      }
+      file.flush();
+      if (!file)
+        throw std::runtime_error("Could not write settings");
+    }
+#if REX_PLATFORM_WIN32
+    if (!MoveFileExW(temporary.c_str(), config_path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      throw std::runtime_error("Could not replace settings");
+    }
+#else
+    std::filesystem::rename(temporary, config_path);
+#endif
+    REXLOG_INFO("Saved {} in-game settings to {}", values.size(), config_path.string());
+    return true;
+  } catch (const std::exception& error) {
+    std::error_code ignored;
+    if (!temporary.empty())
+      std::filesystem::remove(temporary, ignored);
+    REXLOG_ERROR("Could not save in-game settings: {}", error.what());
+    return false;
   }
 }
 

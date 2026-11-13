@@ -1,0 +1,10 @@
+{
+  "mod.title": "Experimental Knockdowns",
+  "mod.description": "Experimental whole-character tumbling, without a jointed ragdoll solver.",
+  "title": "Experimental Knockdowns",
+  "enabled": "Enable experimental knockdowns",
+  "run_impact": "Run-into-NPC knockdowns",
+  "punch_impact": "Accepted damage reactions",
+  "push_downed": "Push downed characters",
+  "player_enabled": "Allow player knockdowns"
+}

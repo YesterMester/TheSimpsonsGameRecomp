@@ -30,6 +30,11 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <rex/graphics/native_gpu_calls.h>
+#include <rex/graphics/native_gpu_direct.h>
+#include <rex/graphics/native_gpu_program.h>
+#include <rex/graphics/native_gpu_shader_reference.h>
+#include <rex/graphics/packet_state.h>
 #include <rex/graphics/packet_disassembler.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -137,6 +142,7 @@ int main(int argc, char** argv) {
   std::vector<uint8_t> guest(kGuestSpace, 0);
   PacketDisassembler::SetMemoryBase(guest.data(), kGuestSpace);
   std::vector<uint32_t> regs(kRegisterCount, 0);
+  PacketState packet_state;
   uint64_t vs_hash = 0, ps_hash = 0;
   std::vector<DrawCall> draws;
 
@@ -148,21 +154,33 @@ int main(int argc, char** argv) {
   const uint8_t* pending_pkt = nullptr;
   uint32_t pending_count = 0;
   auto process_packet = [&](const uint8_t* pkt, uint32_t count) {
+    // A native call carries state and the draw together. Apply its actions
+    // before taking the draw snapshot, just as the runtime consumer does.
+    PacketInfo info;
+    bool decoded = PacketDisassembler::DisasmPacket(pkt, &info);
     uint32_t head = be32(pkt);
+    PacketState::Result applied;
+    if (decoded) {
+      applied = packet_state.Apply(info, head, regs);
+      if (!applied.executed)
+        return;
+    }
     if ((head >> 30) == 3) {
       uint32_t opcode = (head >> 8) & 0x7F;
-      if (opcode == 0x27 && count >= 3) {  // IM_LOAD
+      if ((opcode == 0x27 || (decoded && opcode == native_gpu_shader_reference::kOpcode)) &&
+          count >= 3) {  // IM_LOAD
         uint32_t addr_type = be32(pkt + 4);
         uint32_t size_dwords = be32(pkt + 8) & 0xFFFF;
         uint32_t addr = (addr_type & ~0x3u) & (kGuestSpace - 1);
         uint64_t h = XXH3_64bits(guest.data() + addr, size_dwords * 4);
         if ((addr_type & 3) == 0) vs_hash = h; else ps_hash = h;
-      } else if (opcode == 0x2B && count >= 4) {  // IM_LOAD_IMMEDIATE
+      } else if (count >= 4 && (opcode == 0x2B ||
+                                (decoded && native_gpu_program::IsShaderHeader(head, count - 1)))) {
         uint32_t st = be32(pkt + 4);
         uint32_t size_dwords = be32(pkt + 8) & 0xFFFF;
         uint64_t h = XXH3_64bits(pkt + 12, size_dwords * 4);
         if (st == 0) vs_hash = h; else ps_hash = h;
-      } else if (opcode == 0x22 && count >= 3) {  // DRAW_INDX
+      } else if (opcode == 0x22 && count >= 3 && (!decoded || applied.draw)) {  // DRAW_INDX
         DrawCall d;
         d.vs_hash = vs_hash; d.ps_hash = ps_hash;
         d.initiator = be32(pkt + 8);
@@ -170,22 +188,28 @@ int main(int argc, char** argv) {
         d.regs = regs;
         d.regs[reg::VGT_DRAW_INITIATOR::register_index] = d.initiator;
         draws.push_back(std::move(d));
-      } else if (opcode == 0x36 && count >= 2) {  // DRAW_INDX_2 (auto)
+      } else if (opcode == 0x36 && count >= 2 &&
+                 (!decoded || applied.draw)) {  // DRAW_INDX_2 (auto)
         DrawCall d;
         d.vs_hash = vs_hash; d.ps_hash = ps_hash;
         d.initiator = be32(pkt + 4);
         d.regs = regs;
         d.regs[reg::VGT_DRAW_INITIATOR::register_index] = d.initiator;
         draws.push_back(std::move(d));
-      }
-    }
-    PacketInfo info;
-    if (PacketDisassembler::DisasmPacket(pkt, &info)) {
-      for (const PacketAction& a : info.actions) {
-        if (a.type == PacketAction::Type::kRegisterWrite &&
-            a.register_write.index < kRegisterCount) {
-          regs[a.register_write.index] = a.register_write.value;
+      } else if (decoded && applied.draw &&
+                 (opcode == native_gpu_direct::kOpcode || opcode == native_gpu_calls::kOpcode ||
+                  opcode == native_gpu_calls::kVerticesDrawOpcode ||
+                  opcode == native_gpu_calls::kRangeDrawOpcode ||
+                  opcode == native_gpu_calls::kBareDrawOpcode)) {
+        DrawCall d;
+        d.vs_hash = vs_hash; d.ps_hash = ps_hash;
+        d.initiator = regs[reg::VGT_DRAW_INITIATOR::register_index];
+        if (((d.initiator >> 6) & 3) == 0) {
+          d.index_base = regs[XE_GPU_REG_VGT_DMA_BASE];
+          d.index_size = regs[XE_GPU_REG_VGT_DMA_SIZE];
         }
+        d.regs = regs;
+        draws.push_back(std::move(d));
       }
     }
   };

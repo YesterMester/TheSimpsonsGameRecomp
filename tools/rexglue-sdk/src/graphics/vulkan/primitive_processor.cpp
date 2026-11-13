@@ -22,7 +22,7 @@
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
 #include <rex/graphics/util/native_buffer_watch.h>
-#include <rex/hash.h>
+#include <rex/graphics/util/buffer_content.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -63,20 +63,61 @@ namespace rex::graphics::vulkan {
 
 struct VulkanPrimitiveProcessor::NativeIndexCache {
   struct Entry {
-    std::vector<uint8_t> bytes;
-    // XXH3 of the bytes: a check hashes the guest indices alone instead of
-    // comparing them against the copy.
-    uint64_t hash = 0;
+    // What every reuse reads first.
+    // The command processor's guest progress epoch when bytes last matched
+    // guest memory, so draws in the same epoch skip comparing them again.
+    uint64_t checked_epoch = 0;
     std::pair<VkBuffer, VkDeviceSize> buffer;
     std::unique_ptr<NativeBufferWatch> watch;
+    std::vector<uint8_t> bytes;
+    uint64_t hash = 0;
     std::array<uint32_t, 5> bounds_key{};
     draw_util::VertexIndexBounds bounds;
     bool bounds_valid = false;
   };
+  // At most this many entries; the cache is then retired.
+  static constexpr uint32_t kMaxEntries = 4096;
   explicit NativeIndexCache(const ui::vulkan::VulkanDevice* device)
-      : pool(device, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, size_t(2) << 20) {}
+      : pool(device, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, size_t(2) << 20) {
+    entries.reserve(kMaxEntries);
+    slots.resize(kSlotCount);
+  }
+  Entry* Find(uint64_t key) {
+    for (uint32_t i = SlotIndex(key);; i = (i + 1) & (kSlotCount - 1)) {
+      const Slot& slot = slots[i];
+      if (slot.index == kEmpty) {
+        return nullptr;
+      }
+      if (slot.key == key) {
+        return &entries[slot.index];
+      }
+    }
+  }
+  Entry& Add(uint64_t key, Entry&& entry) {
+    uint32_t i = SlotIndex(key);
+    while (slots[i].index != kEmpty) {
+      i = (i + 1) & (kSlotCount - 1);
+    }
+    slots[i] = {key, uint32_t(entries.size())};
+    return entries.emplace_back(std::move(entry));
+  }
   ui::vulkan::VulkanUploadBufferPool pool;
-  std::unordered_map<uint64_t, Entry> entries;
+  // Entries in a flat array (never reallocated, so pointers to them stay
+  // valid), found through an open-addressing table of their keys (linear
+  // probing, at most half full) like the vertex cache's: a node-based map cost
+  // two dependent cache misses and a division per draw.
+  struct Slot {
+    uint64_t key = 0;
+    uint32_t index = kEmpty;
+  };
+  static constexpr uint32_t kEmpty = UINT32_MAX;
+  static constexpr uint32_t kSlotCount = kMaxEntries * 2;
+  // The low half of a key is the length, so mix in the address.
+  static uint32_t SlotIndex(uint64_t key) {
+    return uint32_t((key * UINT64_C(0x9E3779B97F4A7C15)) >> 32) & (kSlotCount - 1);
+  }
+  std::vector<Entry> entries;
+  std::vector<Slot> slots;
   uint64_t bytes = 0;
 };
 
@@ -312,12 +353,11 @@ draw_util::VertexIndexBounds VulkanPrimitiveProcessor::GetNativeVertexIndexBound
     uint64_t length = uint64_t(primitives.host_draw_vertex_count) * (index_16 ? 2 : 4);
     if (length <= UINT32_MAX) {
       uint64_t buffer_key = (uint64_t(primitives.guest_index_base) << 32) | length;
-      auto found = native_index_cache_->entries.find(buffer_key);
+      NativeIndexCache::Entry* found = native_index_cache_->Find(buffer_key);
       // Process validated the bytes before returning this immutable shadow.
       // Its identity excludes the fresh scratch shadow rewritten each draw.
-      if (found != native_index_cache_->entries.end() &&
-          primitives.native_index_snapshot == found->second.bytes.data()) {
-        entry = &found->second;
+      if (found && primitives.native_index_snapshot == found->bytes.data()) {
+        entry = found;
         if (entry->bounds_valid && entry->bounds_key == key) {
           static thread_local uint64_t reused = 0;
           if (++reused <= 8 || !(reused & 4095)) {
@@ -348,14 +388,19 @@ bool VulkanPrimitiveProcessor::TryRetainedNativeIndexBuffer(uint32_t address, ui
   }
   uint64_t key = (uint64_t(address) << 32) | length;
   if (native_index_cache_) {
-    auto found = native_index_cache_->entries.find(key);
-    if (found != native_index_cache_->entries.end()) {
-      const NativeIndexCache::Entry& entry = found->second;
-      if ((!entry.watch || !entry.watch->IsCurrent()) &&
-          XXH3_64bits(source, length) != entry.hash) {
-        // Keep the old GPU version immutable while earlier draws use it.
-        return false;
+    if (NativeIndexCache::Entry* found = native_index_cache_->Find(key)) {
+      NativeIndexCache::Entry& entry = *found;
+      uint64_t epoch = command_processor_.guest_progress_epoch();
+      if (entry.checked_epoch != epoch && (!entry.watch || !entry.watch->IsCurrent())) {
+        CountNativeSnapshot(kNativeSnapshotIndexHashedBytes,
+                            NativeSnapshotHashedBytes(source, entry.bytes.data(), length));
+        if (!draw_util::BufferContentMatches(source, entry.bytes.data(), length, entry.hash)) {
+          // Keep the old GPU version immutable while earlier draws use it.
+          return false;
+        }
+        entry.checked_epoch = epoch;
       }
+      CountNativeSnapshot(kNativeSnapshotIndexReused);
       cpu_snapshot_out = entry.bytes.data();
       backend_handle_out = frame_index_buffers_.size();
       frame_index_buffers_.push_back(entry.buffer);
@@ -367,7 +412,7 @@ bool VulkanPrimitiveProcessor::TryRetainedNativeIndexBuffer(uint32_t address, ui
     }
     size_t byte_limit = size_t(std::clamp(REXCVAR_GET(native_index_buffer_cache_mb), 1, 64)) << 20;
     if (native_index_cache_->bytes + length > byte_limit ||
-        native_index_cache_->entries.size() >= 4096) {
+        native_index_cache_->entries.size() >= NativeIndexCache::kMaxEntries) {
       native_index_cache_->pool.FlushWrites();
       native_index_caches_retired_.emplace_back(command_processor_.GetCurrentFrame(),
                                                 std::move(native_index_cache_));
@@ -379,7 +424,8 @@ bool VulkanPrimitiveProcessor::TryRetainedNativeIndexBuffer(uint32_t address, ui
   NativeIndexCache::Entry entry;
   entry.bytes.resize(length);
   std::memcpy(entry.bytes.data(), source, length);
-  entry.hash = XXH3_64bits(entry.bytes.data(), length);
+  entry.hash = draw_util::HashBufferContent(entry.bytes.data(), length);
+  entry.checked_epoch = command_processor_.guest_progress_epoch();
   uint8_t* mapping =
       native_index_cache_->pool.Request(command_processor_.GetCurrentFrame(), length,
                                         sizeof(uint32_t), entry.buffer.first, entry.buffer.second);
@@ -394,8 +440,7 @@ bool VulkanPrimitiveProcessor::TryRetainedNativeIndexBuffer(uint32_t address, ui
     entry.watch = std::make_unique<NativeBufferWatch>(shared_memory());
     entry.watch->AddRange(address, length, entry.bytes.data(), source);
   }
-  cpu_snapshot_out =
-      native_index_cache_->entries.emplace(key, std::move(entry)).first->second.bytes.data();
+  cpu_snapshot_out = native_index_cache_->Add(key, std::move(entry)).bytes.data();
   return true;
 }
 

@@ -1,0 +1,22 @@
+{
+  "id": "examples.combat-workshop",
+  "name": "Combat workshop",
+  "author": "",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "state",
+  "description": "A commented native encounter workshop: choose loaded NPC targets, real death events, objectives, failure and retry.",
+  "requires_operations": [
+    "system.try_call", "world.status", "world.catalog", "world.spawn", "world.owned", "world.destroy",
+    "entities.health", "entities.damage", "entities.heal", "players.controlled", "players.health",
+    "entities.set_visible",
+    "missions.register", "missions.get", "missions.start", "missions.restart", "missions.advance",
+    "missions.checkpoint", "missions.fail", "ui.register_page", "log.info"
+  ],
+  "requires_events": [
+    "initialize", "level.ready", "level.unloading", "code.reloaded", "state.loaded", "save.restored",
+    "simulation", "ui.action", "entity.died", "entity.removed"
+  ]
+}

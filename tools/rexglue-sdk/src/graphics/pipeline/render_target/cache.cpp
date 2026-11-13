@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bitset>
 #include <cmath>
 #include <cstring>
 #include <iterator>
@@ -818,6 +819,14 @@ uint32_t RenderTargetCache::GetLastUpdateBoundRenderTargets(
   return rts_used;
 }
 
+bool RenderTargetCache::IsLastUpdateOriginalResolution() const {
+  auto* targets = last_update_accumulated_render_targets();
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i)
+    if (targets[i] && targets[i]->key().original_resolution)
+      return true;
+  return false;
+}
+
 bool RenderTargetCache::IsOriginalResolutionRenderTarget(uint32_t base_tiles,
                                                          uint32_t pitch_tiles_at_32bpp,
                                                          bool is_depth) const {
@@ -983,6 +992,148 @@ void RenderTargetCache::GetResolveCopyRectanglesToDump(
     get_rectangles_in_extent(0, std::min(resolve_area_end & (xenos::kEdramTileCount - 1), base),
                              xenos::kEdramTileCount);
   }
+}
+
+bool RenderTargetCache::PlanNativeResolveOwnership(const draw_util::ResolveInfo& resolve,
+                                                   uint32_t base, uint32_t row_length,
+                                                   uint32_t rows, uint32_t pitch,
+                                                   NativeResolveOwnershipPlan& plan,
+                                                   bool allow_mixed_resolution) const {
+  plan = {};
+  if (GetPath() != Path::kHostRenderTargets || !rows || !row_length || row_length > pitch ||
+      base >= xenos::kEdramTileCount)
+    return false;
+  const bool depth = resolve.IsCopyingDepth();
+  const auto& edram = depth ? resolve.depth_edram_info : resolve.color_edram_info;
+  RenderTargetKey key;
+  key.base_tiles = depth ? resolve.depth_original_base : resolve.color_original_base;
+  key.is_depth = depth;
+  key.resource_format =
+      depth ? edram.format
+            : uint32_t(GetColorResourceFormat(xenos::ColorRenderTargetFormat(edram.format)));
+  // Resolves decode gamma EDRAM bytes as ordinary unorm. Reinterpreting another
+  // owner's bits through a linear 16-bit gamma attachment first can lose a
+  // boundary value, even when the resolve itself does no gamma conversion.
+  if (!depth && edram.format == uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA))
+    key.resource_format = uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8);
+  key.msaa_samples = GetKeyMsaaSamples(edram.msaa_samples);
+  uint32_t pitch_at_32bpp = pitch >> uint32_t(key.Is64bpp());
+  if (!pitch_at_32bpp || pitch_at_32bpp > 255 ||
+      (pitch_at_32bpp << uint32_t(key.Is64bpp())) != pitch)
+    return false;
+  key.pitch_tiles_at_32bpp = pitch_at_32bpp;
+  key.original_resolution = allow_mixed_resolution &&
+                            IsOriginalResolutionRenderTarget(key.base_tiles, pitch_at_32bpp, depth);
+  plan.destination = key;
+  // Claim only the tiles the resolve actually reads. Row padding may have a
+  // different owner, or none at all; transferring it is unnecessary and must
+  // not make a fully defined narrow resolve depend on uninitialized contents.
+  std::bitset<xenos::kEdramTileCount> requested;
+  for (uint32_t row = 0; row < rows; ++row) {
+    uint32_t start =
+        (base - uint32_t(key.base_tiles) + row * pitch) & (xenos::kEdramTileCount - 1u);
+    for (uint32_t column = 0; column < row_length; ++column)
+      requested.set((start + column) & (xenos::kEdramTileCount - 1u));
+    if (requested.all())
+      break;
+  }
+  plan.start = xenos::kEdramTileCount;
+  for (uint32_t tile = 0; tile < xenos::kEdramTileCount;) {
+    if (!requested.test(tile)) {
+      ++tile;
+      continue;
+    }
+    uint32_t first = tile++;
+    while (tile < xenos::kEdramTileCount && requested.test(tile))
+      ++tile;
+    plan.tile_ranges.emplace_back(first, tile - first);
+    plan.start = std::min(plan.start, first);
+    plan.length = tile - plan.start;
+  }
+  const bool needs_host_depth = depth && IsHostDepthEncodingDifferent(key.GetDepthFormat());
+  for (const auto& [start, length] : plan.tile_ranges) {
+    uint32_t remaining = length;
+    uint32_t cursor = (uint32_t(key.base_tiles) + start) & (xenos::kEdramTileCount - 1u);
+    while (remaining) {
+      auto it = ownership_ranges_.upper_bound(cursor);
+      if (it == ownership_ranges_.begin())
+        return false;
+      --it;
+      const auto& range = it->second;
+      if (cursor < it->first || cursor >= range.end_tiles || range.render_target.IsEmpty())
+        return false;
+      const RenderTargetKey source_key = range.render_target;
+      if (!allow_mixed_resolution &&
+          (GetRenderTargetScaleX(source_key) != draw_resolution_scale_x() ||
+           GetRenderTargetScaleY(source_key) != draw_resolution_scale_y()))
+        return false;
+      uint32_t count = std::min(remaining, range.end_tiles - cursor);
+      if (source_key != key) {
+        auto source = render_targets_.find(source_key);
+        if (source == render_targets_.end() || !source->second)
+          return false;
+        RenderTarget* host_depth = nullptr;
+        if (needs_host_depth) {
+          RenderTargetKey host_key = range.GetHostDepthRenderTarget(key.GetDepthFormat());
+          if (!host_key.IsEmpty() && host_key != source_key) {
+            auto host = render_targets_.find(host_key);
+            if (host == render_targets_.end() || !host->second ||
+                (!allow_mixed_resolution &&
+                 (GetRenderTargetScaleX(host_key) != draw_resolution_scale_x() ||
+                  GetRenderTargetScaleY(host_key) != draw_resolution_scale_y())))
+              return false;
+            host_depth = host->second;
+          }
+        }
+        if (!plan.transfers.empty() && plan.transfers.back().end_tiles == cursor &&
+            plan.transfers.back().source == source->second &&
+            plan.transfers.back().host_depth_source == host_depth)
+          plan.transfers.back().end_tiles += count;
+        else
+          plan.transfers.emplace_back(cursor, cursor + count, source->second, host_depth);
+      }
+      remaining -= count;
+      cursor = (cursor + count) & (xenos::kEdramTileCount - 1);
+    }
+  }
+  return !plan.transfers.empty();
+}
+
+RenderTargetCache::RenderTarget* RenderTargetCache::FindNativeResolveSource(uint32_t base,
+                                                                            uint32_t row_length,
+                                                                            uint32_t rows,
+                                                                            uint32_t pitch) const {
+  if (!row_length || row_length > pitch || !rows || base >= xenos::kEdramTileCount)
+    return nullptr;
+  auto first_owner = ownership_ranges_.upper_bound(base);
+  if (first_owner != ownership_ranges_.begin()) {
+    --first_owner;
+    if (!first_owner->second.render_target.IsEmpty() &&
+        uint64_t(base) + uint64_t(rows - 1) * pitch + row_length <= first_owner->second.end_tiles)
+      return FindRenderTarget(first_owner->second.render_target);
+  }
+  RenderTargetKey source;
+  for (uint32_t row = 0; row < rows; ++row) {
+    uint32_t cursor = (base + row * pitch) & (xenos::kEdramTileCount - 1);
+    uint32_t remaining = row_length;
+    while (remaining) {
+      auto owner = ownership_ranges_.upper_bound(cursor);
+      if (owner == ownership_ranges_.begin())
+        return nullptr;
+      --owner;
+      const auto& range = owner->second;
+      if (cursor < owner->first || cursor >= range.end_tiles || range.render_target.IsEmpty())
+        return nullptr;
+      if (source.IsEmpty())
+        source = range.render_target;
+      else if (source != range.render_target)
+        return nullptr;
+      uint32_t count = std::min(remaining, range.end_tiles - cursor);
+      remaining -= count;
+      cursor = (cursor + count) & (xenos::kEdramTileCount - 1);
+    }
+  }
+  return FindRenderTarget(source);
 }
 
 void RenderTargetCache::GetResolveCopyDispatchesToDump(

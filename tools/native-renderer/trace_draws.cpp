@@ -9,9 +9,8 @@
 // AOT shader manifest and the pipeline inventory, is exactly the input the
 // native draw path replays.
 //
-// Memory payloads are skipped (only their ranges are tallied); the vertex,
-// index and texture data step comes once the draw list itself is proven
-// against a real trace.
+// Recorded memory snapshots are applied in order. Indirect shader/constant
+// loads wait for their own snapshots before the next draw state is sampled.
 
 #include <cstdint>
 #include <cstdio>
@@ -20,8 +19,15 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
+#include <rex/graphics/native_gpu_calls.h>
+#include <rex/graphics/native_gpu_direct.h>
+#include <rex/graphics/native_gpu_program.h>
+#include <rex/graphics/native_gpu_shader_reference.h>
+#include <rex/graphics/native_gpu_indirect.h>
+#include <rex/graphics/packet_state.h>
 #include <rex/graphics/packet_disassembler.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/trace_protocol.h>
@@ -78,6 +84,7 @@ int main(int argc, char** argv) {
               data.size() >> 20);
 
   std::vector<uint32_t> regs(kRegisterCount, 0);
+  PacketState packet_state;
   Stats stats;
 
   // Reconstructed guest physical memory and the active shader pair, updated
@@ -128,10 +135,16 @@ int main(int argc, char** argv) {
 
   // Registers of interest for a draw record: the same state the emulated
   // backend samples when it builds a pipeline and issues a draw.
-  static const struct { uint32_t index; const char* name; } kDrawRegs[] = {
+  static const struct {
+    uint32_t index;
+    const char* name;
+  } kDrawRegs[] = {
       {reg::SQ_PROGRAM_CNTL::register_index, "sq_program_cntl"},
+      {reg::SQ_CONTEXT_MISC::register_index, "sq_context_misc"},
       {reg::RB_MODECONTROL::register_index, "rb_modecontrol"},
       {reg::RB_SURFACE_INFO::register_index, "rb_surface_info"},
+      {XE_GPU_REG_RB_HIZCONTROL, "rb_hizcontrol"},
+      {reg::RB_COLOR_MASK::register_index, "rb_color_mask"},
       {reg::RB_DEPTHCONTROL::register_index, "rb_depthcontrol"},
       {reg::RB_COLORCONTROL::register_index, "rb_colorcontrol"},
       {reg::RB_BLENDCONTROL::register_index, "rb_blendcontrol0"},
@@ -139,6 +152,8 @@ int main(int argc, char** argv) {
       {reg::RB_DEPTH_INFO::register_index, "rb_depth_info"},
       {reg::PA_SU_SC_MODE_CNTL::register_index, "pa_su_sc_mode_cntl"},
       {reg::VGT_DRAW_INITIATOR::register_index, "vgt_draw_initiator"},
+      {XE_GPU_REG_VGT_DMA_BASE, "vgt_dma_base"},
+      {XE_GPU_REG_VGT_DMA_SIZE, "vgt_dma_size"},
       {0x2318, "rb_copy_control"},
       {0x2319, "rb_copy_dest_base"},
       {0x231A, "rb_copy_dest_pitch"},
@@ -147,119 +162,55 @@ int main(int argc, char** argv) {
       {0x4908 + 31, "loop31"},
   };
 
-  // Memory pre-pass: a packet's memory reads are recorded after the packet
-  // command itself, so IM_LOAD must hash against fully-populated memory (the
-  // same content the runtime hashed at execution) instead of whatever an
-  // in-order pass has seen so far.
-  for (const uint8_t* q = p; q + 4 <= end;) {
-    auto type = *reinterpret_cast<const TraceCommandType*>(q);
-    if (type == TraceCommandType::kPacketStart) {
-      auto cmd = reinterpret_cast<const PacketStartCommand*>(q);
-      q += sizeof(*cmd) + cmd->count * 4;
-    } else if (type == TraceCommandType::kMemoryRead ||
-               type == TraceCommandType::kMemoryWrite) {
-      auto cmd = reinterpret_cast<const MemoryCommand*>(q);
-      const char* payload = reinterpret_cast<const char*>(q + sizeof(*cmd));
-      q += sizeof(*cmd) + cmd->encoded_length;
-      uint32_t base = cmd->base_ptr & (kGuestSpace - 1);
-      if (uint64_t(base) + cmd->decoded_length <= kGuestSpace) {
-        if (cmd->encoding_format == MemoryEncodingFormat::kSnappy) {
-          std::string decoded;
-          if (snappy::Uncompress(payload, cmd->encoded_length, &decoded))
-            std::memcpy(guest.data() + base, decoded.data(), decoded.size());
-        } else {
-          std::memcpy(guest.data() + base, payload, cmd->decoded_length);
-        }
-      }
-    } else if (type == TraceCommandType::kRegisters) {
-      auto cmd = reinterpret_cast<const RegistersCommand*>(q);
-      q += sizeof(*cmd) + cmd->encoded_length;
-    } else if (type == TraceCommandType::kEdramSnapshot) {
-      auto cmd = reinterpret_cast<const EdramSnapshotCommand*>(q);
-      q += sizeof(*cmd) + cmd->encoded_length;
-    } else if (type == TraceCommandType::kGammaRamp) {
-      auto cmd = reinterpret_cast<const GammaRampCommand*>(q);
-      q += sizeof(*cmd) + cmd->encoded_length;
-    } else if (type == TraceCommandType::kEvent) {
-      q += sizeof(EventCommand);
-    } else if (type == TraceCommandType::kPrimaryBufferStart ||
-               type == TraceCommandType::kIndirectBufferStart) {
-      q += sizeof(PrimaryBufferStartCommand);
-    } else {
-      q += 4;
-    }
-  }
+  PacketDisassembler::SetMemoryBase(guest.data(), kGuestSpace);
 
-  size_t ib_draws_at_start = 0;
-  uint32_t ib_base = 0, ib_count = 0;
-  while (p + sizeof(uint32_t) <= end) {
-    auto type = *reinterpret_cast<const TraceCommandType*>(p);
-    switch (type) {
-      case TraceCommandType::kPrimaryBufferStart: {
-        auto cmd = reinterpret_cast<const PrimaryBufferStartCommand*>(p);
-        std::printf("primary buffer %08X: %u dwords\n", cmd->base_ptr, cmd->count);
-        p += sizeof(PrimaryBufferStartCommand);
-        break;
-      }
-      case TraceCommandType::kPrimaryBufferEnd:
-        p += sizeof(PrimaryBufferEndCommand);
-        break;
-      case TraceCommandType::kIndirectBufferStart: {
-        auto cmd = reinterpret_cast<const IndirectBufferStartCommand*>(p);
-        ib_draws_at_start = stats.draws;
-        ib_base = cmd->base_ptr;
-        ib_count = cmd->count;
-        p += sizeof(IndirectBufferStartCommand);
-        break;
-      }
-      case TraceCommandType::kIndirectBufferEnd:
-        std::printf("  indirect buffer %08X: %u dwords, %zu draws\n", ib_base, ib_count,
-                    stats.draws - ib_draws_at_start);
-        p += sizeof(IndirectBufferEndCommand);
-        break;
-      case TraceCommandType::kPacketStart: {
-        auto cmd = reinterpret_cast<const PacketStartCommand*>(p);
-        p += sizeof(*cmd);
-        const uint8_t* packet_ptr = p;
-        p += cmd->count * sizeof(uint32_t);
-        ++stats.packets;
-
+  auto process_packet =
+      [&](const uint8_t* packet_ptr, uint32_t count) {
         PacketInfo info;
-        if (!PacketDisassembler::DisasmPacket(packet_ptr, &info)) {
-          break;
+        const uint32_t raw_header = be32(packet_ptr);
+        if ((raw_header >> 30) == 3 && ((raw_header >> 8) & 127) == 0x3F && count == 2) {
+          // Legacy traces copy the indirect header and address, omitting its
+          // length word. Do not read the next trace command as that operand.
+          static const PacketTypeInfo legacy_buffer = {PacketCategory::kGeneric,
+                                                       "PM4_INDIRECT_BUFFER"};
+          info.type_info = &legacy_buffer;
+        } else if (!PacketDisassembler::DisasmPacket(packet_ptr, &info)) {
+          return;
         }
-        for (const PacketAction& action : info.actions) {
-          if (action.type == PacketAction::Type::kRegisterWrite &&
-              action.register_write.index < kRegisterCount) {
-            regs[action.register_write.index] = action.register_write.value;
-            ++stats.register_writes;
-          }
-        }
+        const auto applied = packet_state.Apply(info, be32(packet_ptr), regs);
+        stats.register_writes += applied.register_writes;
         // Track the active shaders: type3 IM_LOAD (0x27, from guest memory)
         // and IM_LOAD_IMMEDIATE (0x2B, ucode inline in the packet).
         uint32_t head = be32(packet_ptr);
-        if ((head >> 30) == 3) {
+        if (applied.executed && (head >> 30) == 3) {
           uint32_t opcode = (head >> 8) & 0x7F;
-          if (opcode == 0x27 && cmd->count >= 3) {
+          if ((opcode == 0x27 || opcode == native_gpu_shader_reference::kOpcode) && count >= 3) {
             uint32_t addr_type = be32(packet_ptr + 4);
             uint32_t size_dwords = be32(packet_ptr + 8) & 0xFFFF;
             uint32_t addr = (addr_type & ~0x3u) & (kGuestSpace - 1);
             uint64_t hash = XXH3_64bits(guest.data() + addr, size_dwords * 4);
             bool is_vs = (addr_type & 0x3) == 0;
             dump_shader(hash, is_vs, guest.data() + addr, size_dwords);
-            if (is_vs) active_vs_hash = hash; else active_ps_hash = hash;
-          } else if (opcode == 0x2B && cmd->count >= 4) {
+            if (is_vs)
+              active_vs_hash = hash;
+            else
+              active_ps_hash = hash;
+          } else if (count >= 4 &&
+                     (opcode == 0x2B || native_gpu_program::IsShaderHeader(head, count - 1))) {
             uint32_t shader_type = be32(packet_ptr + 4);
             uint32_t size_dwords = be32(packet_ptr + 8) & 0xFFFF;
             uint64_t hash = XXH3_64bits(packet_ptr + 12, size_dwords * 4);
             dump_shader(hash, shader_type == 0, packet_ptr + 12, size_dwords);
-            if (shader_type == 0) active_vs_hash = hash; else active_ps_hash = hash;
+            if (shader_type == 0)
+              active_vs_hash = hash;
+            else
+              active_ps_hash = hash;
           }
         }
         if (info.type_info) {
           ++stats.packets_by_name[info.type_info->name];
         }
-        if (info.type_info && info.type_info->category == PacketCategory::kDraw) {
+        if (applied.draw) {
           ++stats.draws;
           ++stats.draws_by_packet[info.type_info->name];
           if (draws_out.is_open()) {
@@ -270,6 +221,14 @@ int main(int argc, char** argv) {
             draws_out << "{\"n\":" << stats.draws << ",\"packet\":\"" << info.type_info->name
                       << "\"" << shader_buf;
             char buf[64];
+            for (const auto& [first, count, name] : {std::tuple{0x4000u, 2048u, "alu_constants"},
+                                                     {0x4900u, 8u, "bool_constants"},
+                                                     {0x4908u, 32u, "loop_constants"}}) {
+              std::snprintf(
+                  buf, sizeof(buf), ",\"%s\":\"%016llX\"", name,
+                  (unsigned long long)XXH3_64bits(regs.data() + first, count * sizeof(uint32_t)));
+              draws_out << buf;
+            }
             for (const auto& r : kDrawRegs) {
               std::snprintf(buf, sizeof(buf), ",\"%s\":\"%08X\"", r.name, regs[r.index]);
               draws_out << buf;
@@ -292,46 +251,149 @@ int main(int argc, char** argv) {
             draws_out << "]";
             // The draw's own VGT_DRAW_INITIATOR (primitive type, index count)
             // travels in the packet: DRAW_INDX has the viz query dword first,
-            // DRAW_INDX_2 starts with it.
+            // DRAW_INDX_2 starts with it. Native calls have already applied
+            // the control register through their disassembler actions.
             uint32_t draw_opcode = (head >> 8) & 0x7F;
             uint32_t initiator_offset = draw_opcode == 0x22 ? 8 : 4;
-            if (cmd->count * 4 >= initiator_offset + 4) {
+            bool native = draw_opcode == native_gpu_calls::kOpcode ||
+                          draw_opcode == native_gpu_direct::kOpcode ||
+                          draw_opcode == native_gpu_calls::kVerticesDrawOpcode ||
+                          draw_opcode == native_gpu_calls::kRangeDrawOpcode ||
+                          draw_opcode == native_gpu_calls::kBareDrawOpcode;
+            if (native || count * 4 >= initiator_offset + 4) {
               std::snprintf(buf, sizeof(buf), ",\"initiator\":\"%08X\"",
-                            be32(packet_ptr + initiator_offset));
+                            native ? regs[reg::VGT_DRAW_INITIATOR::register_index]
+                                   : be32(packet_ptr + initiator_offset));
               draws_out << buf;
             }
             draws_out << "}\n";
           }
         }
+      };
+  const uint8_t* pending_source_packet = nullptr;
+  uint32_t pending_source_count = 0;
+
+  struct IndirectFrame {
+    size_t draws_at_start;
+    uint32_t base, bytes;
+    uint64_t executed_end;
+  };
+  std::vector<IndirectFrame> indirect_frames;
+  while (p + sizeof(uint32_t) <= end) {
+    auto type = *reinterpret_cast<const TraceCommandType*>(p);
+    switch (type) {
+      case TraceCommandType::kPrimaryBufferStart: {
+        auto cmd = reinterpret_cast<const PrimaryBufferStartCommand*>(p);
+        std::printf("primary buffer %08X: %u dwords\n", cmd->base_ptr, cmd->count);
+        p += sizeof(PrimaryBufferStartCommand);
+        break;
+      }
+      case TraceCommandType::kPrimaryBufferEnd:
+        p += sizeof(PrimaryBufferEndCommand);
+        break;
+      case TraceCommandType::kIndirectBufferStart: {
+        auto cmd = reinterpret_cast<const IndirectBufferStartCommand*>(p);
+        indirect_frames.push_back({stats.draws, cmd->base_ptr, cmd->count, cmd->base_ptr});
+        p += sizeof(IndirectBufferStartCommand);
+        break;
+      }
+      case TraceCommandType::kIndirectBufferEnd:
+        if (!indirect_frames.empty()) {
+          const auto frame = indirect_frames.back();
+          indirect_frames.pop_back();
+          const uint64_t words = frame.executed_end > frame.base
+                                     ? (frame.executed_end - frame.base) / 4
+                                     : frame.bytes / 4;
+          std::printf("  indirect buffer %08X: %u dwords, %zu draws\n", frame.base,
+                      uint32_t(words), stats.draws - frame.draws_at_start);
+        } else {
+          // A single-frame capture may begin inside an already running buffer.
+          std::puts("  indirect buffer end (capture began inside the buffer)");
+        }
+        p += sizeof(IndirectBufferEndCommand);
+        break;
+      case TraceCommandType::kPacketStart: {
+        auto cmd = reinterpret_cast<const PacketStartCommand*>(p);
+        p += sizeof(*cmd);
+        const uint8_t* packet_ptr = p;
+        p += cmd->count * sizeof(uint32_t);
+        ++stats.packets;
+        if (pending_source_packet) {
+          std::fprintf(stderr, "Source packet ended without PacketEnd\n");
+          return 1;
+        }
+        const uint32_t head = be32(packet_ptr), opcode = (head >> 8) & 0x7F;
+        if (!indirect_frames.empty()) {
+          // The runtime omits whole-buffer images (count is zero). Infer the
+          // executed span from this buffer's own packets, excluding children.
+          const uint32_t type = head >> 30;
+          const uint32_t words = type == 0 || type == 3 ? ((head >> 16) & 0x3FFF) + 2
+                                 : type == 1 ? 3 : 1;
+          auto& frame = indirect_frames.back();
+          const uint64_t packet_end = uint64_t(cmd->base_ptr) + uint64_t(words) * 4;
+          if (cmd->base_ptr >= frame.base && packet_end <= kGuestSpace)
+            frame.executed_end = std::max(frame.executed_end, packet_end);
+        }
+        const bool indirect =
+            (head >> 30) == 3 &&
+            (opcode == 0x27 || opcode == 0x2F || opcode == native_gpu_shader_reference::kOpcode ||
+             (opcode == native_gpu_indirect::kOpcode &&
+              head != native_gpu_indirect::kBufferHeader));
+        if (indirect) {
+          // Its MemoryRead snapshots follow PacketStart in the trace.
+          pending_source_packet = packet_ptr;
+          pending_source_count = cmd->count;
+        } else {
+          process_packet(packet_ptr, cmd->count);
+        }
         break;
       }
       case TraceCommandType::kPacketEnd:
         p += sizeof(PacketEndCommand);
-        break;
-      case TraceCommandType::kMemoryRead: {
-        auto cmd = reinterpret_cast<const MemoryCommand*>(p);
-        const char* payload = reinterpret_cast<const char*>(p + sizeof(*cmd));
-        p += sizeof(*cmd) + cmd->encoded_length;
-        ++stats.memory_reads;
-        stats.memory_read_bytes += cmd->decoded_length;
-        uint32_t base = cmd->base_ptr & (kGuestSpace - 1);
-        if (uint64_t(base) + cmd->decoded_length <= kGuestSpace) {
-          if (cmd->encoding_format == MemoryEncodingFormat::kSnappy) {
-            std::string decoded;
-            if (snappy::Uncompress(payload, cmd->encoded_length, &decoded) &&
-                decoded.size() == cmd->decoded_length) {
-              std::memcpy(guest.data() + base, decoded.data(), decoded.size());
-            }
-          } else {
-            std::memcpy(guest.data() + base, payload, cmd->decoded_length);
-          }
+        if (pending_source_packet) {
+          process_packet(pending_source_packet, pending_source_count);
+          pending_source_packet = nullptr;
         }
         break;
-      }
+      case TraceCommandType::kMemoryRead:
       case TraceCommandType::kMemoryWrite: {
+        if (size_t(end - p) < sizeof(MemoryCommand)) {
+          std::fprintf(stderr, "Truncated memory command\n");
+          return 1;
+        }
         auto cmd = reinterpret_cast<const MemoryCommand*>(p);
+        const char* payload = reinterpret_cast<const char*>(p + sizeof(*cmd));
+        if (cmd->encoded_length > size_t(end - p) - sizeof(*cmd)) {
+          std::fprintf(stderr, "Truncated memory snapshot\n");
+          return 1;
+        }
         p += sizeof(*cmd) + cmd->encoded_length;
-        ++stats.memory_writes;
+        if (type == TraceCommandType::kMemoryRead) {
+          ++stats.memory_reads;
+          stats.memory_read_bytes += cmd->decoded_length;
+        } else {
+          ++stats.memory_writes;
+        }
+        uint32_t base = cmd->base_ptr & (kGuestSpace - 1);
+        if (uint64_t(base) + cmd->decoded_length > kGuestSpace) {
+          std::fprintf(stderr, "Memory snapshot exceeds guest physical memory\n");
+          return 1;
+        }
+        if (cmd->encoding_format == MemoryEncodingFormat::kSnappy) {
+          std::string decoded;
+          if (!snappy::Uncompress(payload, cmd->encoded_length, &decoded) ||
+              decoded.size() != cmd->decoded_length) {
+            std::fprintf(stderr, "Invalid compressed memory snapshot\n");
+            return 1;
+          }
+          std::memcpy(guest.data() + base, decoded.data(), decoded.size());
+        } else if (cmd->encoding_format == MemoryEncodingFormat::kNone &&
+                   cmd->encoded_length == cmd->decoded_length) {
+          std::memcpy(guest.data() + base, payload, cmd->decoded_length);
+        } else {
+          std::fprintf(stderr, "Invalid memory snapshot encoding\n");
+          return 1;
+        }
         break;
       }
       case TraceCommandType::kEdramSnapshot: {
@@ -377,11 +439,15 @@ int main(int argc, char** argv) {
         break;
       }
       default:
-        std::fprintf(stderr, "unknown trace command %u at offset %zu - stopping\n",
-                     uint32_t(type), size_t(p - data.data()));
-        p = end;
-        break;
+        std::fprintf(stderr, "unknown trace command %u at offset %zu - stopping\n", uint32_t(type),
+                     size_t(p - data.data()));
+        return 1;
     }
+  }
+
+  if (pending_source_packet) {
+    std::fprintf(stderr, "Truncated source packet without PacketEnd\n");
+    return 1;
   }
 
   std::printf("packets: %zu  register writes: %zu  swaps: %zu\n", stats.packets,

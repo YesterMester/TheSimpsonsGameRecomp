@@ -27,6 +27,7 @@
 #include <rex/graphics/graphics_system.h>
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
+#include <rex/graphics/shader_warmup.h>
 #endif
 #if REX_HAS_D3D12
 #include <rex/graphics/d3d12/graphics_system.h>
@@ -42,11 +43,15 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
+#include <rex/ui/graphics_backend.h>
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
 
 #include <fmt/format.h>
 #include <imgui.h>
+#include <rex/graphics/shader_storage.h>
+#include <rex/system/user_module.h>
+#include <rex/system/xex_module.h>
 
 #include <algorithm>
 #include <chrono>
@@ -54,6 +59,15 @@
 #include <filesystem>
 #include <thread>
 #include <string_view>
+
+REXCVAR_DEFINE_BOOL(seed_shader_storage, REX_PLATFORM_ANDROID, "GPU",
+                    "Add the executable's own shader programs to the shader storage before it "
+                    "loads, so stored or shipped pipeline descriptions can be prepared before "
+                    "the game starts on a fresh install");
+
+REXCVAR_DEFINE_STRING(shader_precompile_recipe_path, "", "GPU",
+                      "Vertex patch metadata used to prepare shaders from the owned executable");
+
 
 REXCVAR_DEFINE_INT32(shutdown_watchdog_seconds, 10, "UI",
                      "Seconds after the window closes before the process exits even if "
@@ -359,51 +373,69 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 }
 
 bool ReXApp::SetupPresentation() {
-  // Vulkan is the primary backend everywhere it is built: its fragment
-  // shader interlock render path is the one that plays the VP6 FMVs and
-  // matches console colors, while D3D12 only has the host render target
-  // path, which still loses the video render target's dumps (black intro
-  // videos). D3D12 remains available with gpu = "d3d12" and as the
-  // automatic fallback when Vulkan cannot initialize.
-#if REX_HAS_D3D12 && REX_HAS_VULKAN
-  const bool want_d3d12 = REXCVAR_GET(gpu) == "d3d12";
-  if (want_d3d12) {
-    config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
-  } else {
-    config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
-  }
-#elif REX_HAS_VULKAN
-  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
-#elif REX_HAS_D3D12
-  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
+#if REX_HAS_VULKAN
+  constexpr bool has_vulkan = true;
+#else
+  constexpr bool has_vulkan = false;
+#endif
+#if REX_HAS_D3D12
+  constexpr bool has_d3d12 = true;
+#else
+  constexpr bool has_d3d12 = false;
 #endif
 #if REX_HAS_D3D11
-#if !REX_HAS_VULKAN && !REX_HAS_D3D12
-  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d11::D3D11GraphicsSystem);
+  constexpr bool has_d3d11 = true;
 #else
-  if (REXCVAR_GET(gpu) == "d3d11") {
-    config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d11::D3D11GraphicsSystem);
-  }
+  constexpr bool has_d3d11 = false;
 #endif
+  const auto backends =
+      ui::GetGraphicsBackendOrder(REXCVAR_GET(gpu), has_vulkan, has_d3d12, has_d3d11);
+  auto create_graphics =
+      [](ui::GraphicsBackend backend) -> std::unique_ptr<graphics::GraphicsSystem> {
+    switch (backend) {
+#if REX_HAS_VULKAN
+      case ui::GraphicsBackend::kVulkan:
+        return REX_GRAPHICS_BACKEND(graphics::vulkan::VulkanGraphicsSystem);
 #endif
+#if REX_HAS_D3D12
+      case ui::GraphicsBackend::kD3D12:
+        return REX_GRAPHICS_BACKEND(graphics::d3d12::D3D12GraphicsSystem);
+#endif
+#if REX_HAS_D3D11
+      case ui::GraphicsBackend::kD3D11:
+        return REX_GRAPHICS_BACKEND(graphics::d3d11::D3D11GraphicsSystem);
+#endif
+      default:
+        return nullptr;
+    }
+  };
+  if (backends.count)
+    config_.graphics = create_graphics(backends.backends[0]);
+  const auto* selected_graphics = config_.graphics.get();
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;
 
   OnPreSetup(config_);
 
+  if (!backends.count && !config_.graphics) {
+    REXLOG_ERROR("The requested graphics backend '{}' is not available in this build",
+                 REXCVAR_GET(gpu));
+    return false;
+  }
+
   if (config_.graphics) {
     X_STATUS status = config_.graphics->SetupPresentation(&app_context());
-#if REX_HAS_D3D12 && REX_HAS_VULKAN
-    if (XFAILED(status) && !want_d3d12 && REXCVAR_GET(gpu) != "d3d11") {
-      REXLOG_WARN(
-          "Vulkan presentation setup failed ({:08X}) - falling back to the "
-          "D3D12 backend",
-          status);
-      config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
-      status = config_.graphics->SetupPresentation(&app_context());
+    if (config_.graphics.get() == selected_graphics) {
+      for (size_t i = 1; XFAILED(status) && i < backends.count; ++i) {
+        REXLOG_WARN("{} presentation setup failed ({:08X}); trying {}",
+                    ui::GraphicsBackendName(backends.backends[i - 1]), status,
+                    ui::GraphicsBackendName(backends.backends[i]));
+        config_.graphics.reset();
+        config_.graphics = create_graphics(backends.backends[i]);
+        status = config_.graphics->SetupPresentation(&app_context());
+      }
     }
-#endif
     if (XFAILED(status)) {
       REXLOG_ERROR("Graphics presentation setup failed: {:08X}", status);
       return false;
@@ -518,11 +550,25 @@ void ReXApp::LaunchModule() {
     if (graphics_system && !runtime_->cache_root().empty()) {
       uint32_t title_id = runtime_->kernel_state()->title_id();
       if (title_id != 0) {
+        if (REXCVAR_GET(seed_shader_storage)) {
+          auto module = runtime_->kernel_state()->GetExecutableModule();
+          auto* xex = module ? module->xex_module() : nullptr;
+          if (xex) {
+            rex::graphics::SeedShaderStorageFromExecutable(
+                runtime_->cache_root() / "shaders" / "shareable" /
+                    fmt::format("{:08X}.xsh", title_id),
+                runtime_->memory()->virtual_membase() + xex->base_address(), xex->image_size(),
+                rex::to_path(REXCVAR_GET(shader_precompile_recipe_path)));
+          }
+        }
         REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
         graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
       }
     }
 
+#if REX_HAS_VULKAN
+    rex_graphics_shader_warmup_finish();
+#endif
     OnPostLaunchModule(main_thread.get());
     main_thread->Resume();
 
@@ -550,6 +596,11 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
 }
 
 void ReXApp::OnKeyDown(ui::KeyEvent& e) {
+  // Editing a setting or console command must not fire game shortcuts. In
+  // particular, typing an underscore also presses the Minus photo-mode bind.
+  if (imgui_drawer_ && imgui_drawer_->GetIO().WantTextInput) {
+    return;
+  }
   rex::ui::ProcessKeyEvent(e);
 }
 
@@ -564,14 +615,30 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   // finished in time, end the process.
   int32_t watchdog_seconds = REXCVAR_GET(shutdown_watchdog_seconds);
   if (watchdog_seconds > 0) {
-    std::thread([watchdog_seconds]() {
+    std::thread([watchdog_seconds, complete = shutdown_complete_]() {
       std::this_thread::sleep_for(std::chrono::seconds(watchdog_seconds));
-      REXLOG_WARN("Shutdown did not finish within {} s, exiting (last step logged above)",
-                  watchdog_seconds);
+      // A completed shutdown no longer owns the process's lifetime.
+      if (complete->load(std::memory_order_acquire)) {
+        return;
+      }
+      // Report it from another thread and do not wait for it: a thread this
+      // shutdown is stuck behind may hold the log, and a watchdog that waits
+      // for the log would never end the process.
+      std::thread([watchdog_seconds]() {
+        REXLOG_WARN("Shutdown did not finish within {} s, exiting (last step logged above)",
+                    watchdog_seconds);
+      }).detach();
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
       std::_Exit(0);
     }).detach();
   }
   if (runtime_ && runtime_->kernel_state()) {
+    // Finish audio callbacks while the guest threads they may wait for still
+    // run. Keep drivers and decoder state alive until those threads stop.
+    if (auto* audio = dynamic_cast<audio::AudioSystem*>(runtime_->audio_system())) {
+      REXLOG_INFO("Shutdown: pause audio callbacks");
+      audio->Pause();
+    }
     runtime_->kernel_state()->TerminateTitle();
   }
   app_context().QuitFromUIThread();
@@ -617,6 +684,7 @@ void ReXApp::OnDestroy() {
   }
   window_.reset();
   runtime_.reset();
+  shutdown_complete_->store(true, std::memory_order_release);
 }
 
 void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {

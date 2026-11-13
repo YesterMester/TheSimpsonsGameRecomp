@@ -43,6 +43,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke) override;
   void OnWindowAvailable(rex::ui::Window* window) override;
+  std::vector<InputDevice> GetDevices() override;
 
  private:
   struct ControllerState {
@@ -51,6 +52,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     X_INPUT_STATE state;
     bool state_changed;
     bool is_active;
+    InputDevice device;
   };
 
   enum class RepeatState {
@@ -73,6 +75,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 
   void HandleEvent(const SDL_Event& event);
+  static bool SDLCALL WatchEvents(void* userdata, SDL_Event* event);
   std::unique_lock<std::mutex> DrainAndLock();
   void ProcessEventLocked(const SDL_Event& event);
   void OnControllerDeviceAddedLocked(const SDL_Event& event);
@@ -88,8 +91,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void QueueControllerUpdate();
 
   rex::ui::Window* attached_window_ = nullptr;
-  bool sdl_events_initialized_;
-  bool SDL_Gamepad_initialized_;
+  std::atomic<bool> sdl_events_initialized_;
+  std::atomic<bool> SDL_Gamepad_initialized_;
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;

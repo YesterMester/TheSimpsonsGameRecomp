@@ -1,0 +1,62 @@
+name: Launcher installer checks
+
+on:
+  pull_request:
+    paths:
+      - 'launcher/**'
+      - 'tools/launcher/stage_windows_extractor.py'
+      - 'tools/bench/*extractor*'
+      - 'tools/bench/steam_shortcut_check.py'
+      - 'tools/bench/launcher_patch_check.py'
+      - 'tools/bench/launcher_update_check.py'
+      - 'tools/bench/xiso_extract_check.py'
+      - '.github/workflows/installer-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'launcher/**'
+      - 'tools/launcher/stage_windows_extractor.py'
+      - 'tools/bench/*extractor*'
+      - 'tools/bench/steam_shortcut_check.py'
+      - 'tools/bench/launcher_patch_check.py'
+      - 'tools/bench/launcher_update_check.py'
+      - 'tools/bench/xiso_extract_check.py'
+      - '.github/workflows/installer-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Steam shortcut and launcher checks
+        env:
+          PYTHONPATH: launcher
+        run: |
+          python tools/bench/steam_shortcut_check.py
+          python tools/bench/launcher_patch_check.py
+          python tools/bench/launcher_update_check.py
+          python tools/bench/xiso_extract_check.py
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Verify and run the packaged upstream extractor
+        shell: pwsh
+        run: |
+          python tools/launcher/stage_windows_extractor.py "$env:RUNNER_TEMP/extract-xiso"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python tools/bench/windows_extractor_check.py --package "$env:RUNNER_TEMP/extract-xiso"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Install without extract-xiso (blocked by Smart App Control, #54)
+        run: python tools/bench/xiso_extract_check.py

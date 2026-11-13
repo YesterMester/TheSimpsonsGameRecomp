@@ -1,4 +1,20 @@
 #include "simpsons_init.h"
+#include <rex/ppc/barriers.h>
+#include "native_gpu_recorded.h"
+#include "native_gpu_recorded_view.h"
+#include "native_gpu_direct_draws.h"
+#include "native_gpu_command_storage.h"
+
+namespace simpsons::native_gpu_calls {
+bool TryRetirementChunk(PPCContext&, uint8_t*);
+bool TryClearResolveDraw(PPCContext&, uint8_t*);
+bool TryCopyResolveDraw(PPCContext&, uint8_t*);
+bool TryIndirectConstants(PPCContext&, uint8_t*);
+bool TryShaderSetup(uint32_t, PPCContext&, uint8_t*);
+bool TryPrimaryShaderReference(PPCContext&, uint8_t*);
+bool TryShaderState(uint32_t, PPCContext&, uint8_t*);
+}
+
 
 #include <cstdio>
 #include <cstring>
@@ -27,8 +43,7 @@ static bool HandPatchEnsureWritable(void* host_addr, size_t len) {
 	// here via raw mprotect stripped the GPU write-watch protection, which
 	// broke texture upload tracking (black menu/UI). Keep the symbol so
 	// call sites compile; it must do nothing.
-	(void)host_addr; (void)len;
-	return true;
+	return simpsons::native_gpu_memory::EnsureCommandStorageWritable(host_addr, len);
 }
 
 DEFINE_REX_FUNC(sub_82455108) {
@@ -2508,6 +2523,8 @@ loc_824560A0:
 	// stfs f13,20(r3)
 	temp.f32 = float(ctx.f13.f64);
 	REX_STORE_U32(ctx.r3.u32 + 20, temp.u32);
+	// HAND PATCH: native command construction after the real clear geometry.
+	if (simpsons::native_gpu_calls::TryClearResolveDraw(ctx, base)) goto loc_native_824561A4;
 	// stwu r10,4(r30)
 	ea = 4 + ctx.r30.u32;
 	REX_STORE_U32(ea, ctx.r10.u32);
@@ -2568,12 +2585,13 @@ loc_824560A0:
 	ctx.r10.u64 = ctx.r10.u64 | 13824;
 	// stwu r10,4(r11)
 	ea = 4 + ctx.r11.u32;
-	REX_STORE_U32(ea, ctx.r10.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r10.u32));
 	ctx.r11.u32 = ea;
 	// stwu r9,4(r11)
 	ea = 4 + ctx.r11.u32;
 	REX_STORE_U32(ea, ctx.r9.u32);
 	ctx.r11.u32 = ea;
+loc_native_824561A4:
 	// lwz r10,56(r31)
 	ctx.r10.u64 = REX_LOAD_U32(ctx.r31.u32 + 56);
 	// mr r3,r11
@@ -3435,12 +3453,15 @@ DEFINE_REX_FUNC(sub_82456748) {
 	// stw r4,10952(r3)
 	REX_STORE_U32(ctx.r3.u32 + 10952, ctx.r4.u32);
 	// sync 
+	REX_PPC_SYNC();
 	// lis r11,32712
 	ctx.r11.s64 = 2143813632;
 	// stw r4,1812(r11)
 	REX_MM_STORE_U32(ctx.r11.u32 + 1812, ctx.r4.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// sync 
+	REX_PPC_SYNC();
 	// blr 
 	return;
 }
@@ -4035,6 +4056,7 @@ DEFINE_REX_FUNC(sub_82456A90) {
 	// subf r29,r8,r11
 	ctx.r29.u64 = ctx.r11.u64 - ctx.r8.u64;
 	// eieio 
+	REX_PPC_EIEIO();
 	// mr r3,r30
 	ctx.r3.u64 = ctx.r30.u64;
 	// bl 0x8245da50
@@ -4043,6 +4065,7 @@ DEFINE_REX_FUNC(sub_82456A90) {
 	// stw r30,0(r31)
 	REX_MM_STORE_U32(ctx.r31.u32 + 0, ctx.r30.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// addi r4,r29,16
 	ctx.r4.s64 = ctx.r29.s64 + 16;
 	// mr r3,r29
@@ -4742,12 +4765,15 @@ loc_82456FEC:
 	// stw r29,10952(r26)
 	REX_STORE_U32(ctx.r26.u32 + 10952, ctx.r29.u32);
 	// sync 
+	REX_PPC_SYNC();
 	// lis r11,32712
 	ctx.r11.s64 = 2143813632;
 	// stw r29,1812(r11)
 	REX_MM_STORE_U32(ctx.r11.u32 + 1812, ctx.r29.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// sync 
+	REX_PPC_SYNC();
 	// lwz r3,21508(r26)
 	ctx.r3.u64 = REX_LOAD_U32(ctx.r26.u32 + 21508);
 	// cmplwi r3,0
@@ -9060,6 +9086,8 @@ DEFINE_REX_FUNC(sub_82458B40) {
 
 DEFINE_REX_FUNC(sub_82458B80) {
 	REX_FUNC_PROLOGUE();
+	// HAND PATCH: keep aggregate native editing state inside the copied iterator.
+	simpsons::native_gpu_calls::RecordedIteratorView native_view(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r1.u32);
 	// std r30,-16(r1)
 	REX_STORE_U64(ctx.r1.u32 + -16, ctx.r30.u64);
 	// std r31,-8(r1)
@@ -9133,6 +9161,8 @@ loc_82458BF4:
 	ctx.r10.s64 = ctx.r11.s64 + 4;
 	// lwz r9,0(r11)
 	ctx.r9.u64 = REX_LOAD_U32(ctx.r11.u32 + 0);
+	// HAND PATCH: expose native record payloads to the original buffer editors.
+	ctx.r9.u64 = native_view.Header(ctx.r9.u32, ctx.r11.u32);
 	// rlwinm r8,r9,16,18,31
 	ctx.r8.u64 = __builtin_rotateleft64(ctx.r9.u32 | (ctx.r9.u64 << 32), 16) & 0x3FFF;
 	// stw r10,0(r3)
@@ -11210,6 +11240,8 @@ loc_82459A54:
 
 DEFINE_REX_FUNC(sub_82459A70) {
 	REX_FUNC_PROLOGUE();
+	// HAND PATCH: retain aggregate origin when restarting at an inner draw.
+	uint32_t native_restart_flags = 0;
 	uint32_t ea{};
 	// mflr r12
 	ctx.r12.u64 = ctx.lr;
@@ -11368,6 +11400,7 @@ loc_82459B7C:
 loc_82459B90:
 	// lwz r28,8(r30)
 	ctx.r28.u64 = REX_LOAD_U32(ctx.r30.u32 + 8);
+	native_restart_flags = simpsons::native_gpu_calls::RecordedIteratorView::RestartFlags(base, ctx.r30.u32, ctx.r28.u32);
 	// lwz r10,4(r30)
 	ctx.r10.u64 = REX_LOAD_U32(ctx.r30.u32 + 4);
 	// subf r10,r28,r10
@@ -11428,6 +11461,7 @@ loc_82459BD0:
 	REX_STORE_U32(ctx.r30.u32 + 4, ctx.r11.u32);
 	// bl 0x82458b80
 	ctx.lr = 0x82459C00;
+	if (native_restart_flags) simpsons::StoreGuestU32(base, ctx.r30.u32 + 24, native_restart_flags);
 	sub_82458B80(ctx, base);
 loc_82459C00:
 	// cmplwi cr6,r25,0
@@ -14061,6 +14095,7 @@ loc_8245ADC8:
 DEFINE_REX_FUNC(sub_8245ADF0) {
 	REX_FUNC_PROLOGUE();
 	// sync 
+	REX_PPC_SYNC();
 	// lwz r11,108(r3)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r3.u32 + 108);
 	// li r10,1
@@ -17493,6 +17528,7 @@ DEFINE_REX_FUNC(sub_8245C508) {
 	ctx.lr = 0x8245C534;
 	sub_82458FB8(ctx, base);
 	// sync 
+	REX_PPC_SYNC();
 	// addi r1,r1,96
 	ctx.r1.s64 = ctx.r1.s64 + 96;
 	// lwz r12,-8(r1)
@@ -17781,6 +17817,7 @@ loc_8245C71C:
 	// stw r11,13492(r31)
 	REX_STORE_U32(ctx.r31.u32 + 13492, ctx.r11.u32);
 	// sync 
+	REX_PPC_SYNC();
 	// lwz r11,48(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 48);
 	// addi r11,r11,4
@@ -20833,6 +20870,7 @@ loc_8245DB0C:
 	if (ctx.cr6.lt) goto loc_8245DB0C;
 loc_8245DB28:
 	// sync 
+	REX_PPC_SYNC();
 	// blr 
 	return;
 }
@@ -25067,6 +25105,8 @@ DEFINE_REX_FUNC(sub_8245F6B0) {
 	ctx.cr0.compare<uint32_t>(ctx.r3.u32, 0, ctx.xer);
 	// beq 0x8245f808
 	if (ctx.cr0.eq) goto loc_8245F808;
+	// HAND PATCH: native inline shader metadata; retain the original copy and fixups.
+	if (simpsons::native_gpu_calls::TryShaderSetup(0, ctx, base)) goto loc_native_resource_shader;
 	// lis r11,-16384
 	ctx.r11.s64 = -1073741824;
 	// li r10,256
@@ -25105,6 +25145,7 @@ DEFINE_REX_FUNC(sub_8245F6B0) {
 	ea = 4 + ctx.r3.u32;
 	REX_STORE_U32(ea, ctx.r11.u32);
 	ctx.r3.u32 = ea;
+loc_native_resource_shader:
 	// lwzx r11,r30,r31
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r30.u32 + ctx.r31.u32);
 	// lwz r10,32(r31)
@@ -25132,6 +25173,7 @@ DEFINE_REX_FUNC(sub_8245F6B0) {
 	// addis r30,r11,-16384
 	ctx.r30.s64 = ctx.r11.s64 + -1073741824;
 	// sync 
+	REX_PPC_SYNC();
 	// mr r5,r27
 	ctx.r5.u64 = ctx.r27.u64;
 	// mr r4,r30
@@ -25282,6 +25324,8 @@ loc_8245F844:
 	ctx.lr = 0x8245F87C;
 	sub_82457CC8(ctx, base);
 loc_8245F87C:
+	// HAND PATCH: retain descriptor parsing, growth and the original loop.
+	if (simpsons::native_gpu_calls::TryIndirectConstants(ctx, base)) goto loc_8245F8B0;
 	// lis r11,-16382
 	ctx.r11.s64 = -1073610752;
 	// clrlwi r10,r30,3
@@ -25748,6 +25792,8 @@ loc_8245FB2C:
 	// mr r11,r3
 	ctx.r11.u64 = ctx.r3.u64;
 loc_8245FBA0:
+	// HAND PATCH: native pixel reference after the original declaration fixups.
+	if (simpsons::native_gpu_calls::TryShaderState(0, ctx, base)) goto loc_native_8245FBF4;
 	// mr r10,r17
 	ctx.r10.u64 = ctx.r17.u64;
 	// ori r20,r20,16384
@@ -25794,6 +25840,7 @@ loc_8245FBA0:
 	ea = 4 + ctx.r11.u32;
 	REX_STORE_U32(ea, ctx.r10.u32);
 	ctx.r11.u32 = ea;
+loc_native_8245FBF4:
 	// lwz r10,10580(r30)
 	ctx.r10.u64 = REX_LOAD_U32(ctx.r30.u32 + 10580);
 	// stw r11,48(r30)
@@ -26235,6 +26282,8 @@ loc_8245FEE0:
 	// mr r11,r3
 	ctx.r11.u64 = ctx.r3.u64;
 loc_8245FF08:
+	// HAND PATCH: native conditional shader/state batch; keep growth and publication.
+	if (simpsons::native_gpu_calls::TryShaderState(1, ctx, base)) goto loc_82460220;
 	// lis r10,-16384
 	ctx.r10.s64 = -1073741824;
 	// lis r9,5461
@@ -26668,6 +26717,8 @@ loc_824601A0:
 	// mr r11,r3
 	ctx.r11.u64 = ctx.r3.u64;
 loc_824601C4:
+	// HAND PATCH: native primary shader reference; retain fixups and publication.
+	if (simpsons::native_gpu_calls::TryPrimaryShaderReference(ctx, base)) goto loc_82460220;
 	// addi r10,r19,112
 	ctx.r10.s64 = ctx.r19.s64 + 112;
 	// stwu r17,4(r11)
@@ -30854,6 +30905,7 @@ loc_82461D90:
 DEFINE_REX_FUNC(sub_82461DA8) {
 	REX_FUNC_PROLOGUE();
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// blr 
 	return;
 }
@@ -30922,6 +30974,7 @@ loc_82461DEC:
 	// bne cr6,0x82461db8
 	if (!ctx.cr6.eq) goto loc_82461DB8;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// blr 
 	return;
 }
@@ -30929,6 +30982,7 @@ loc_82461DEC:
 DEFINE_REX_FUNC(sub_82461E00) {
 	REX_FUNC_PROLOGUE();
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// li r11,0
 	ctx.r11.s64 = 0;
 	// stw r11,0(r3)
@@ -31110,6 +31164,7 @@ loc_82461EF4:
 	// stwx r3,r11,r9
 	REX_STORE_U32(ctx.r11.u32 + ctx.r9.u32, ctx.r3.u32);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// blr 
 	return;
 }
@@ -31232,6 +31287,7 @@ loc_82461F80:
 	// blt cr6,0x82461f80
 	if (ctx.cr6.lt) goto loc_82461F80;
 	// sync 
+	REX_PPC_SYNC();
 	// addi r1,r1,112
 	ctx.r1.s64 = ctx.r1.s64 + 112;
 	// lwz r12,-8(r1)
@@ -32055,6 +32111,7 @@ loc_82462530:
 	// bne cr6,0x82462500
 	if (!ctx.cr6.eq) goto loc_82462500;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// lwz r11,20(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 20);
 	// lwz r10,16(r31)
@@ -32108,6 +32165,7 @@ loc_82462584:
 	// lwz r11,56(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 56);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// stw r29,0(r11)
 	REX_STORE_U32(ctx.r11.u32 + 0, ctx.r29.u32);
 	// li r3,1
@@ -32237,6 +32295,7 @@ loc_8246265C:
 	// bne cr6,0x8246262c
 	if (!ctx.cr6.eq) goto loc_8246262C;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// lwz r11,20(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 20);
 	// lwz r10,16(r31)
@@ -32262,6 +32321,7 @@ loc_8246265C:
 	// lwz r11,56(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 56);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// stw r30,0(r11)
 	REX_STORE_U32(ctx.r11.u32 + 0, ctx.r30.u32);
 	// addi r1,r1,112
@@ -34197,6 +34257,7 @@ loc_82463440:
 	__imp__KeUnlockL2(ctx, base);
 loc_82463464:
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// li r11,0
 	ctx.r11.s64 = 0;
 	// li r3,-1
@@ -34327,6 +34388,7 @@ loc_82463518:
 	// bne cr6,0x824634ec
 	if (!ctx.cr6.eq) goto loc_824634EC;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// lwz r11,60(r30)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r30.u32 + 60);
 	// lwz r10,56(r30)
@@ -34343,6 +34405,7 @@ loc_82463518:
 	ctx.lr = 0x82463544;
 	sub_82461EB0(ctx, base);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// stw r29,0(r31)
 	REX_STORE_U32(ctx.r31.u32 + 0, ctx.r29.u32);
 loc_8246354C:
@@ -34453,6 +34516,7 @@ loc_824635EC:
 	// stw r11,24(r31)
 	REX_STORE_U32(ctx.r31.u32 + 24, ctx.r11.u32);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// b 0x82463664
 	goto loc_82463664;
 loc_82463614:
@@ -34496,6 +34560,7 @@ loc_82463640:
 	// stw r10,36(r31)
 	REX_STORE_U32(ctx.r31.u32 + 36, ctx.r10.u32);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// li r6,0
 	ctx.r6.s64 = 0;
 loc_82463664:
@@ -34601,6 +34666,7 @@ loc_824636F4:
 	// stw r5,36(r31)
 	REX_STORE_U32(ctx.r31.u32 + 36, ctx.r5.u32);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// stw r29,0(r31)
 	REX_STORE_U32(ctx.r31.u32 + 0, ctx.r29.u32);
 	// b 0x8246372c
@@ -34663,6 +34729,7 @@ loc_82463764:
 	// bne cr6,0x82463738
 	if (!ctx.cr6.eq) goto loc_82463738;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// lwz r5,36(r31)
 	ctx.r5.u64 = REX_LOAD_U32(ctx.r31.u32 + 36);
 	// b 0x82463790
@@ -35811,6 +35878,9 @@ loc_82463F1C:
 	// bl 0x82451e10
 	ctx.lr = 0x82463F24;
 	sub_82451E10(ctx, base);
+	// HAND PATCH: replace only owned-buffer GPU construction; retain all
+	// original polling, lock/CAS, submission, retry and fence code.
+	if (simpsons::native_gpu_calls::TryRetirementChunk(ctx, base)) goto loc_82464054;
 	// addi r11,r31,256
 	ctx.r11.s64 = ctx.r31.s64 + 256;
 	// mr r10,r30
@@ -36018,6 +36088,7 @@ loc_82464084:
 	// bne cr6,0x82464054
 	if (!ctx.cr6.eq) goto loc_82464054;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// subf r11,r31,r11
 	ctx.r11.u64 = ctx.r11.u64 - ctx.r31.u64;
 	// li r5,1
@@ -36055,6 +36126,7 @@ loc_82464084:
 	// stw r11,24(r22)
 	REX_STORE_U32(ctx.r22.u32 + 24, ctx.r11.u32);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// stw r30,0(r22)
 	REX_STORE_U32(ctx.r22.u32 + 0, ctx.r30.u32);
 	// b 0x82463e9c
@@ -37288,6 +37360,7 @@ loc_82464944:
 	// bne cr6,0x82464914
 	if (!ctx.cr6.eq) goto loc_82464914;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// lwz r11,20(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 20);
 	// lwz r10,16(r31)
@@ -37313,6 +37386,7 @@ loc_82464944:
 	// lwz r11,56(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 56);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// stw r30,0(r11)
 	REX_STORE_U32(ctx.r11.u32 + 0, ctx.r30.u32);
 	// addi r1,r1,112
@@ -37443,6 +37517,7 @@ loc_82464A40:
 	// bne cr6,0x82464a10
 	if (!ctx.cr6.eq) goto loc_82464A10;
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// lwz r11,20(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 20);
 	// lwz r10,16(r31)
@@ -37496,6 +37571,7 @@ loc_82464A94:
 	// lwz r10,56(r31)
 	ctx.r10.u64 = REX_LOAD_U32(ctx.r31.u32 + 56);
 	// lwsync 
+	REX_PPC_LWSYNC();
 	// stw r30,0(r10)
 	REX_STORE_U32(ctx.r10.u32 + 0, ctx.r30.u32);
 	// li r3,1
@@ -39639,6 +39715,7 @@ DEFINE_REX_FUNC(sub_82465908) {
 	// stw r4,0(r11)
 	REX_MM_STORE_U32(ctx.r11.u32 + 0, ctx.r4.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// blr 
 	return;
 }
@@ -40234,6 +40311,7 @@ DEFINE_REX_FUNC(sub_82465C88) {
 	// stw r4,0(r11)
 	REX_MM_STORE_U32(ctx.r11.u32 + 0, ctx.r4.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// blr 
 	return;
 }
@@ -41369,11 +41447,13 @@ DEFINE_REX_FUNC(sub_82466430) {
 	// stw r10,12820(r11)
 	REX_MM_STORE_U32(ctx.r11.u32 + 12820, ctx.r10.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// li r10,2048
 	ctx.r10.s64 = 2048;
 	// stw r10,13320(r11)
 	REX_MM_STORE_U32(ctx.r11.u32 + 13320, ctx.r10.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 	// blr 
 	return;
 }
@@ -51412,6 +51492,7 @@ loc_8246A728:
 	// stw r11,15428(r10)
 	REX_MM_STORE_U32(ctx.r10.u32 + 15428, ctx.r11.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 loc_8246A734:
 	// lwz r11,15436(r10)
 	ctx.r11.u64 = REX_MM_LOAD_U32(ctx.r10.u32 + 15436);
@@ -51434,6 +51515,7 @@ loc_8246A74C:
 	// stw r9,15428(r10)
 	REX_MM_STORE_U32(ctx.r10.u32 + 15428, ctx.r9.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 loc_8246A758:
 	// lwz r9,15436(r10)
 	ctx.r9.u64 = REX_MM_LOAD_U32(ctx.r10.u32 + 15436);
@@ -51492,6 +51574,7 @@ loc_8246A7A8:
 	// stw r10,15428(r7)
 	REX_MM_STORE_U32(ctx.r7.u32 + 15428, ctx.r10.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 loc_8246A7B4:
 	// lwz r10,15436(r7)
 	ctx.r10.u64 = REX_MM_LOAD_U32(ctx.r7.u32 + 15436);
@@ -51535,6 +51618,7 @@ loc_8246A7F8:
 	// stw r10,15428(r7)
 	REX_MM_STORE_U32(ctx.r7.u32 + 15428, ctx.r10.u32);
 	// eieio 
+	REX_PPC_EIEIO();
 loc_8246A804:
 	// lwz r10,15436(r7)
 	ctx.r10.u64 = REX_MM_LOAD_U32(ctx.r7.u32 + 15436);
@@ -52695,7 +52779,7 @@ loc_8246AF24:
 	ctx.r10.u64 = (__builtin_rotateleft64(ctx.r30.u32 | (ctx.r30.u64 << 32), 16) & 0xFFFF0000) | (ctx.r10.u64 & 0xFFFFFFFF0000FFFF);
 	// stwu r11,4(r3)
 	ea = 4 + ctx.r3.u32;
-	REX_STORE_U32(ea, ctx.r11.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r11.u32));
 	ctx.r3.u32 = ea;
 	// stwu r10,4(r3)
 	ea = 4 + ctx.r3.u32;
@@ -53098,7 +53182,7 @@ loc_8246B130:
 	ctx.r3.u32 = ea;
 	// stwu r10,4(r3)
 	ea = 4 + ctx.r3.u32;
-	REX_STORE_U32(ea, ctx.r10.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r10.u32));
 	ctx.r3.u32 = ea;
 	// stwu r4,4(r3)
 	ea = 4 + ctx.r3.u32;
@@ -56702,6 +56786,8 @@ loc_8246C954:
 	// bl 0x82457f50
 	ctx.lr = 0x8246C960;
 	sub_82457F50(ctx, base);
+	// HAND PATCH: native VS metadata after the real reservation.
+	if (simpsons::native_gpu_calls::TryShaderSetup(1, ctx, base)) goto loc_native_copy_vs;
 	// lis r11,-16384
 	ctx.r11.s64 = -1073741824;
 	// li r10,768
@@ -56748,6 +56834,7 @@ loc_8246C954:
 	ea = 4 + ctx.r3.u32;
 	REX_STORE_U32(ea, ctx.r9.u32);
 	ctx.r3.u32 = ea;
+loc_native_copy_vs:
 	// mr r27,r3
 	ctx.r27.u64 = ctx.r3.u64;
 	// addi r3,r27,4
@@ -56771,6 +56858,8 @@ loc_8246C954:
 	ctx.lr = 0x8246C9D0;
 	sub_82457CC8(ctx, base);
 loc_8246C9D0:
+	// HAND PATCH: native PS metadata; preserve its inline code and operand offsets.
+	if (simpsons::native_gpu_calls::TryShaderSetup(2, ctx, base)) goto loc_native_copy_ps;
 	// lis r11,-16368
 	ctx.r11.s64 = -1072693248;
 	// li r10,1
@@ -56795,6 +56884,7 @@ loc_8246C9D0:
 	ea = 4 + ctx.r3.u32;
 	REX_STORE_U32(ea, ctx.r9.u32);
 	ctx.r3.u32 = ea;
+loc_native_copy_ps:
 	// mr r29,r3
 	ctx.r29.u64 = ctx.r3.u64;
 	// addi r3,r29,4
@@ -57334,6 +57424,8 @@ loc_8246CD40:
 	// mr r11,r3
 	ctx.r11.u64 = ctx.r3.u64;
 loc_8246CD5C:
+	// HAND PATCH: retain the original split loop and ring-growth steps.
+	if (simpsons::native_gpu_calls::TryCopyResolveDraw(ctx, base)) goto loc_native_8246CD94;
 	// li r9,8450
 	ctx.r9.s64 = 8450;
 	// mr r10,r29
@@ -57342,7 +57434,7 @@ loc_8246CD5C:
 	ctx.cr6.compare<uint32_t>(ctx.r29.u32, 65535, ctx.xer);
 	// stwu r9,4(r11)
 	ea = 4 + ctx.r11.u32;
-	REX_STORE_U32(ea, ctx.r9.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingStateHeader(base, ctx.r31.u32, ea, ctx.r9.u32));
 	ctx.r11.u32 = ea;
 	// stwu r28,4(r11)
 	ea = 4 + ctx.r11.u32;
@@ -57368,7 +57460,7 @@ loc_8246CD7C:
 	ctx.cr0.compare<int32_t>(ctx.r29.s32, 0, ctx.xer);
 	// stwu r9,4(r11)
 	ea = 4 + ctx.r11.u32;
-	REX_STORE_U32(ea, ctx.r9.u32);
+	REX_STORE_U32(ea, simpsons::native_gpu_calls::DirectRingDrawHeader(base, ctx.r31.u32, ea, ctx.r9.u32));
 	ctx.r11.u32 = ea;
 	// stwu r8,4(r11)
 	ea = 4 + ctx.r11.u32;
@@ -57376,6 +57468,9 @@ loc_8246CD7C:
 	ctx.r11.u32 = ea;
 	// stw r11,48(r31)
 	REX_STORE_U32(ctx.r31.u32 + 48, ctx.r11.u32);
+loc_native_8246CD94:
+	// Refresh the branch field here as well for register-locals builds.
+	ctx.cr0.compare<int32_t>(ctx.r29.s32, 0, ctx.xer);
 	// beq 0x8246cda8
 	if (ctx.cr0.eq) goto loc_8246CDA8;
 	// add r28,r10,r28
@@ -59399,6 +59494,7 @@ DEFINE_REX_FUNC(sub_8246DAF8) {
 	// mr r24,r6
 	ctx.r24.u64 = ctx.r6.u64;
 	// sync 
+	REX_PPC_SYNC();
 	// lwz r11,788(r31)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 788);
 	// rlwinm. r11,r11,0,3,3

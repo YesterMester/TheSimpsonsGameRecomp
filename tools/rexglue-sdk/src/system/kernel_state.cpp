@@ -583,15 +583,19 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
       auto global_lock = global_critical_region_.AcquireDeferred();
       while (dispatch_thread_running_) {
         global_lock.lock();
-        if (dispatch_queue_.empty()) {
+        while (dispatch_thread_running_ && (dispatch_queue_.empty() || dispatch_paused_)) {
+          dispatch_busy_ = false;
+          // Lets PauseDispatch see the queue drained.
+          dispatch_cond_.notify_all();
           dispatch_cond_.wait(global_lock);
-          if (!dispatch_thread_running_) {
-            global_lock.unlock();
-            break;
-          }
+        }
+        if (!dispatch_thread_running_) {
+          global_lock.unlock();
+          break;
         }
         auto fn = std::move(dispatch_queue_.front());
         dispatch_queue_.pop_front();
+        dispatch_busy_ = true;
         REXSYS_NOISY_DEBUG("Dispatch thread processing queued item ({} remaining)",
                            dispatch_queue_.size());
         global_lock.unlock();
@@ -914,6 +918,25 @@ void KernelState::OnThreadExit(XThread* thread) {
 
   // TODO(tomc): Do we need this? Same idea as OnThreadExecute
   (void)thread;
+}
+
+bool KernelState::PauseDispatch(std::chrono::milliseconds timeout) {
+  auto global_lock = global_critical_region_.Acquire();
+  const bool drained = dispatch_cond_.wait_for(global_lock, timeout, [this] {
+    return !dispatch_thread_running_ || (dispatch_queue_.empty() && !dispatch_busy_);
+  });
+  if (drained) {
+    dispatch_paused_ = true;
+  }
+  return drained;
+}
+
+void KernelState::ResumeDispatch() {
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    dispatch_paused_ = false;
+  }
+  dispatch_cond_.notify_all();
 }
 
 object_ref<XThread> KernelState::GetThreadByID(uint32_t thread_id) {

@@ -1,28 +1,29 @@
-# The game's D3D command-writer method table
+# Historical D3D function inventory
 
-Extracted from live guest memory (image data at `0x821F4274`, read passively
-from the running game). This is the game's dispatch table mapping D3D-level
-rendering operations to the handler functions that encode them as PM4 GPU
-command packets -- i.e. **the complete API boundary between "the game decides
-what to draw" and "GPU command buffer bytes."** Every draw, state change,
-texture bind, resolve and swap the game ever performs goes through exactly one
-of these 73 handlers. All 73 are verified present in the recompiled function
-table (nothing the renderer calls was missed by analysis).
+The entries below were extracted from guest image data at `0x821F4274`.
+The original interpretation as a complete, 73-handler D3D dispatch table is
+unverified and must not be used to measure native rendering coverage.
 
-The `pm4 ops` column lists PM4 type-3 opcodes whose opcode-byte immediates
-appear in the handler body (conservative static extraction -- absence means
-the header is composed dynamically, not that the handler does nothing; the
-many unlabeled short handlers are almost certainly SET_CONSTANT-style state
-writers whose packet headers come from the shared ring-writer using the
-`meta` word). `meta` is the table's per-entry descriptor (0x4000XXYY; XX
-correlates with ring space needed, YY with an argument/type field).
+The metadata pairing is suspect: `0x40007003` encodes the 112-instruction
+length of the preceding function `sub_82461500`, and `0x40004603` matches
+the preceding `sub_824616C0`'s 70 instructions. This is consistent with
+mispaired unwind data. The inventory also includes debug printing
+(`sub_82465C18`), shutdown (`sub_82466450`) and an `ExGetXConfigSetting`
+caller (`sub_824667C0`), rather than only command writers.
 
-**Draw inventory (the batching/native-renderer hook set):** entries 17, 18,
-33, 38, 39 and 45 are the six in-table draw emitters; additionally
-`sub_82455570`, `sub_82444A48`, `sub_82444A80` (outside this table) contain
-draw-packet encodings -- the latter two belong to a separate submission path
-(UI/video layer suspect). Entry 45 pairs its draw with VIZ_QUERY/COND_EXEC:
-the predicated (occlusion-tested) draw path.
+Keep the addresses as research leads. Verify each function's body, callers,
+buffer lifetime and patching contract before replacing it. See
+[native_gpu_calls.md](native_gpu_calls.md) for the bounded conversion pilot.
+
+The historical `pm4 ops` column was a conservative immediate-value scan,
+not a decoded command stream. Matching an opcode byte does not prove a draw:
+`sub_82464D98`'s `0x2200` is a register-base argument. The `meta` words and
+unverified notes are retained below for comparison, not API contracts.
+
+The current draw telemetry hooks 18 verified header emitters, including
+functions outside this inventory, and excludes `sub_82464D98`. Some emitters
+reserve space that another function commits later; a header match alone is
+not sufficient to move execution into a host draw call.
 
 | # | meta | handler | len | pm4 ops | notes |
 |---|------|---------|-----|---------|-------|
@@ -43,7 +44,7 @@ the predicated (occlusion-tested) draw path.
 | 14 | `0x40001A05` | `sub_824623A0` | 136 |  | state write (header composed via shared ring writer) |
 | 15 | `0x40003B03` | `sub_82462490` | 181 | EVENT_WRITE_SHD | flush/sync event |
 | 16 | `0x40004A03` | `sub_824625B8` | 156 | EVENT_WRITE_SHD | flush/sync event |
-| 17 | `0x40004005` | `sub_824626B8` | 178 | DRAW_INDX_2,SET_BIN_MASK,WAIT_REG_MEM | **DRAW** (inline-index variant) |
+| 17 | `0x40004005` | `sub_824626B8` | 178 | DRAW_INDX_2,SET_BIN_MASK,WAIT_REG_MEM | **DRAW** (auto-index variant) |
 | 18 | `0x40005602` | `sub_82462810` | 227 | DRAW_INDX,SET_BIN_MASK,WAIT_REG_MEM | **DRAW** (DMA index buffer) -- telemetry hook target |
 | 19 | `0x40006D02` | `sub_824629C8` | 236 | EVENT_WRITE_SHD | flush/sync event |
 | 20 | `0x40006803` | `sub_82462B68` | 58 |  | state write (header composed via shared ring writer) |
@@ -64,29 +65,29 @@ the predicated (occlusion-tested) draw path.
 | 35 | `0x40003705` | `sub_824641D8` | 93 | EVENT_WRITE_ZPD | occlusion/z-pass query (begin or end) |
 | 36 | `0x40002301` | `sub_82464268` | 271 | EVENT_WRITE_ZPD | occlusion/z-pass query (begin or end) |
 | 37 | `0x40006B03` | `sub_824644A0` | 136 |  | state write (header composed via shared ring writer) |
-| 38 | `0x40003B03` | `sub_82464590` | 178 | DRAW_INDX_2,SET_BIN_MASK,WAIT_REG_MEM | **DRAW** (inline-index variant) |
+| 38 | `0x40003B03` | `sub_82464590` | 178 | DRAW_INDX_2,SET_BIN_MASK,WAIT_REG_MEM | **DRAW** (auto-index variant) |
 | 39 | `0x40005602` | `sub_824646E8` | 227 | DRAW_INDX,SET_BIN_MASK,WAIT_REG_MEM | **DRAW** (DMA index buffer) -- telemetry hook target |
 | 40 | `0x40006D02` | `sub_824648A0` | 156 | EVENT_WRITE_SHD | flush/sync event |
 | 41 | `0x40004005` | `sub_824649A0` | 181 | EVENT_WRITE_SHD | flush/sync event |
 | 42 | `0x40004A03` | `sub_82464AC8` | 247 |  | state write (header composed via shared ring writer) |
 | 43 | `0x40006C03` | `sub_82464C78` | 117 |  | state write (header composed via shared ring writer) |
 | 44 | `0x40003104` | `sub_82464D40` | 55 |  | state write (header composed via shared ring writer) |
-| 45 | `0x40001603` | `sub_82464D98` | 565 | COND_EXEC,DRAW_INDX,EVENT_WRITE,EVENT_WRITE_EXT,REG_RMW,VIZ_QUERY | **DRAW**, predicated (viz-query/cond-exec -- occlusion-tested draw path) |
+| 45 | `0x40001603` | `sub_82464D98` | 565 | COND_EXEC,DRAW_INDX,EVENT_WRITE,EVENT_WRITE_EXT,REG_RMW,VIZ_QUERY | Historical false positive: `0x2200` is a register base, not a draw header |
 | 46 | `0x4000FB03` | `sub_82465188` | 444 | EVENT_WRITE,EVENT_WRITE_ZPD | query/event resolve |
 | 47 | `0x4000BD03` | `sub_82465480` | 362 | EVENT_WRITE_EXT,EVENT_WRITE_ZPD | screen-extent + z-pass events (resolve-adjacent) |
 | 48 | `0x40009503` | `sub_824656D8` | 76 |  | state write (header composed via shared ring writer) |
 | 49 | `0x40002005` | `sub_82465758` | 96 |  | state write (header composed via shared ring writer) |
 | 50 | `0x40002803` | `sub_824657F8` | 118 |  | state write (header composed via shared ring writer) |
 | 51 | `0x40003303` | `sub_82465948` | 287 | REG_RMW | register read-modify-write |
-| 52 | `0x40007403` | `sub_82465C18` | 57 |  | state write (header composed via shared ring writer) |
+| 52 | `0x40007403` | `sub_82465C18` | 57 |  | debug printing |
 | 53 | `0x4000180A` | `sub_82465CB0` | 76 |  | state write (header composed via shared ring writer) |
 | 54 | `0x4000200A` | `sub_82465D30` | 355 |  | state write (header composed via shared ring writer) |
 | 55 | `0x40009A03` | `sub_82465FC0` | 72 |  | state write (header composed via shared ring writer) |
 | 56 | `0x40001D03` | `sub_82466038` | 120 |  | state write (header composed via shared ring writer) |
 | 57 | `0x40003303` | `sub_82466108` | 360 |  | state write (header composed via shared ring writer) |
 | 58 | `0x40009F03` | `sub_82466388` | 94 |  | state write (header composed via shared ring writer) |
-| 59 | `0x40002804` | `sub_82466450` | 29 |  | state write (header composed via shared ring writer) |
-| 60 | `0x40000A03` | `sub_824667C0` | 38 |  | state write (header composed via shared ring writer) |
+| 59 | `0x40002804` | `sub_82466450` | 29 |  | shutdown |
+| 60 | `0x40000A03` | `sub_824667C0` | 38 |  | calls ExGetXConfigSetting |
 | 61 | `0x40000F03` | `sub_82466800` | 346 |  | state write (header composed via shared ring writer) |
 | 62 | `0x40009A03` | `sub_82466A68` | 331 |  | state write (header composed via shared ring writer) |
 | 63 | `0x40008F03` | `sub_82466CA8` | 99 |  | state write (header composed via shared ring writer) |

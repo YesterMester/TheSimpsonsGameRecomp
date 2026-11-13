@@ -60,7 +60,7 @@ class RenderTargetTransfer {
     bool write_stencil_reference = false;
   };
   RenderTargetTransfer(ui::d3d11::D3D11Device& device, DrawContext& draws)
-      : draws_(draws), shaders_(device), buffers_(device, 1024 * 1024) {}
+      : device_(device), draws_(draws), buffers_(device, 1024 * 1024) {}
   bool Transfer(RenderTargetSurface& destination, const RenderTargetSurface& source,
                 const RenderTargetSurface* host_depth, const ShaderProgram& pixel,
                 const Constants& constants, std::span<const D3D11_RECT> rectangles,
@@ -75,18 +75,17 @@ class RenderTargetTransfer {
   void Clear();
 
  private:
-  const ShaderProgram* Helper(const char* source, const char* profile, std::string& error);
   bool Prepare(DrawCommand& command, const RenderTargetSurface& destination, std::string& error);
   bool Rectangles(DrawCommand& command, std::span<const D3D11_RECT> rectangles, std::string& error);
   std::shared_ptr<const BufferVersion> Constant(const void* data, size_t size, std::string& error);
+  ui::d3d11::D3D11Device& device_;
   DrawContext& draws_;
-  ShaderCache shaders_;
   BufferCache buffers_;
-  const ShaderProgram* vertex_ = nullptr;
-  const ShaderProgram* color_float_ = nullptr;
-  const ShaderProgram* color_integer_ = nullptr;
-  const ShaderProgram* depth_ = nullptr;
-  const ShaderProgram* stencil_ = nullptr;
+  std::unique_ptr<ShaderProgram> vertex_;
+  std::unique_ptr<ShaderProgram> color_float_;
+  std::unique_ptr<ShaderProgram> color_integer_;
+  std::unique_ptr<ShaderProgram> depth_;
+  std::unique_ptr<ShaderProgram> stencil_;
 };
 
 }  // namespace rex::graphics::d3d11

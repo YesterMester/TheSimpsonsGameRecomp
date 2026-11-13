@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "backend": "d3d11",
+  "strict": true,
+  "complete": true,
+  "failed": false,
+  "frames": 200,
+  "dependencies": {
+    "edram": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "memory_mirror": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "scaled_mirror_read": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "scaled_mirror_write": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "resolve_fallback": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "vertex_fallback": {"calls": 0, "bytes": 0, "first_detail": ""},
+    "texture_fallback": {"calls": 0, "bytes": 0, "first_detail": ""}
+  },
+  "operations": {
+    "vertex_streams": 560,
+    "cpu_texture_upload": 120,
+    "gpu_texture_upload": 0,
+    "resolve": 0,
+    "alias_transfer": 0,
+    "native_draw_call": 564,
+    "legacy_draw_packet": 0
+  },
+  "allocations": {
+    "edram": {"calls": 0, "virtual_bytes": 0, "resident_bytes": 0},
+    "memory_mirror": {"calls": 0, "virtual_bytes": 0, "resident_bytes": 0},
+    "scaled_mirror": {"calls": 0, "virtual_bytes": 0, "resident_bytes": 0}
+  },
+  "diagnostic_readback": {"calls": 0, "bytes": 0, "allocations": 0, "virtual_bytes": 0, "resident_bytes": 0}
+}

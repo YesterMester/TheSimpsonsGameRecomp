@@ -621,6 +621,29 @@ uint32_t GetNormalizedColorMask(const RegisterFile& regs,
   return normalized_color_mask;
 }
 
+bool CanUseNativeMemExports(const RegisterFile& regs, const Shader& shader) {
+  if (!shader.memexport_eM_written())
+    return true;
+  if (!shader.has_static_memexport_addresses() || shader.memexport_address_zero_factors().empty())
+    return false;
+  uint32_t base = shader.type() == xenos::ShaderType::kVertex ? 0 : 256;
+  uint32_t configured_base = shader.type() == xenos::ShaderType::kVertex
+                                 ? regs.Get<reg::SQ_VS_CONST>().base
+                                 : regs.Get<reg::SQ_PS_CONST>().base;
+  if (configured_base && configured_base != base)
+    return false;
+  auto zero = [&](uint32_t factor) {
+    return factor == UINT32_MAX ||
+           (factor < 1024 &&
+            regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + base * 4 + factor) == 0.0f);
+  };
+  for (const auto& factors : shader.memexport_address_zero_factors())
+    for (uint32_t field = 0; field < 3; ++field)
+      if (!zero(factors[field * 2]) && !zero(factors[field * 2 + 1]))
+        return false;
+  return true;
+}
+
 void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
                         std::vector<MemExportRange>& ranges_out) {
   if (!shader.memexport_eM_written()) {
@@ -630,6 +653,10 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
   uint32_t float_constants_base = shader.type() == xenos::ShaderType::kVertex
                                       ? regs.Get<reg::SQ_VS_CONST>().base
                                       : regs.Get<reg::SQ_PS_CONST>().base;
+  // An unset PS bank selects the same stage-local bank uploaded by all
+  // backends, rather than the vertex constants at c0.
+  if (!float_constants_base && shader.type() == xenos::ShaderType::kPixel)
+    float_constants_base = 256;
   for (uint32_t constant_index : shader.memexport_stream_constants()) {
     xenos::xe_gpu_memexport_stream_t stream =
         regs.GetMemExportStream(float_constants_base + constant_index);

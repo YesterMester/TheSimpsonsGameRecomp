@@ -1,0 +1,124 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The build script can reuse an already compiled ARM64 game and runtime.
+def nativeLibraryDir = providers.gradleProperty('nativeLibraryDir').orNull
+// Keep release credentials outside the checkout and command-line arguments.
+def releaseCredentials = ['STORE_FILE', 'STORE_PASSWORD', 'KEY_ALIAS', 'KEY_PASSWORD']
+        .collectEntries { name -> [name, providers.environmentVariable('RECOMP_ANDROID_SIGNING_' + name).orNull] }
+def hasReleaseCredentials = releaseCredentials.values().every { it }
+
+android {
+    namespace 'io.github.yestermester.simpsons'
+    compileSdk 36
+    ndkVersion '29.0.14206865'
+    if (System.getenv('ANDROID_NDK_HOME')) {
+        ndkPath System.getenv('ANDROID_NDK_HOME')
+    }
+    defaultConfig {
+        applicationId 'io.github.yestermester.simpsons'
+        minSdk 29
+        targetSdk 36
+        versionCode 700
+        versionName '0.0.7.0'
+        ndk { abiFilters 'arm64-v8a' }
+        if (!nativeLibraryDir) externalNativeBuild {
+            cmake {
+                arguments '-DREXSDK_DIR=' + file('../../tools/rexglue-sdk').absolutePath,
+                          '-DREXGLUE_ENABLE_TRACY=OFF',
+                          '-DREXGLUE_ENABLE_PERF_COUNTERS=ON',
+                          '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON',
+                          '-DANDROID_STL=c++_shared'
+                targets 'simpsons'
+                cppFlags '-std=c++23'
+            }
+        }
+    }
+    if (!nativeLibraryDir) externalNativeBuild {
+        cmake {
+            path file('../../simpsons/CMakeLists.txt')
+            version providers.gradleProperty('cmakeVersion').getOrElse('3.31.6')
+        }
+    }
+    sourceSets {
+        main {
+            // Use the Java glue shipped with the same SDL version as the runtime.
+            java.srcDir '../../tools/rexglue-sdk/thirdparty/sdl3/android-project/app/src/main/java'
+            java.exclude '**/ModProjects.java'
+            assets.srcDir layout.buildDirectory.dir('game-assets')
+            if (nativeLibraryDir) jniLibs.srcDir file(nativeLibraryDir)
+        }
+    }
+    signingConfigs {
+        if (hasReleaseCredentials) {
+            ownerRelease {
+                storeFile file(releaseCredentials.STORE_FILE)
+                storePassword releaseCredentials.STORE_PASSWORD
+                keyAlias releaseCredentials.KEY_ALIAS
+                keyPassword releaseCredentials.KEY_PASSWORD
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (hasReleaseCredentials) signingConfig signingConfigs.ownerRelease
+        }
+    }
+    packaging {
+        jniLibs { useLegacyPackaging false }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+tasks.register('requireReleaseSigning') {
+    doLast {
+        if (!hasReleaseCredentials) {
+            throw new GradleException('Release signing requires all four RECOMP_ANDROID_SIGNING_* environment variables; see android/README.md.')
+        }
+        def releaseStore = file(releaseCredentials.STORE_FILE)
+        if (!releaseStore.isFile() || releaseStore.canonicalFile == android.signingConfigs.debug.storeFile.canonicalFile) {
+            throw new GradleException('Select the owner release keystore, separate from the Android development key.')
+        }
+    }
+}
+tasks.configureEach {
+    if (name == 'preReleaseBuild') dependsOn 'requireReleaseSigning'
+}
+
+tasks.register('prepareGameAssets', Exec) {
+    inputs.file('../../tools/native-renderer/translated_shaders.tar.xz')
+    inputs.file('../../tools/native-renderer/warmup-pipelines.txt')
+    inputs.file('../../tools/native-renderer/warmup-vertex-patches.txt')
+    inputs.file('../../tools/android/prepare_assets.py')
+    inputs.file('../touch-controls.json')
+    inputs.dir('../../tools/native-renderer/native_shaders')
+    inputs.file('../../launcher/launcher.py')
+    inputs.dir('../../launcher/ui')
+    inputs.file('../../modkit/api.json')
+    inputs.dir('../../modkit/examples/health-tools')
+    inputs.dir('../../modkit/examples/mission-walk')
+    inputs.file('../../tools/modkit/generate_templates.py')
+    outputs.dir(layout.buildDirectory.dir('game-assets'))
+    workingDir '../..'
+    commandLine 'python3', 'tools/android/prepare_assets.py',
+                layout.buildDirectory.dir('game-assets').get().asFile.absolutePath
+}
+tasks.named('preBuild').configure { dependsOn 'prepareGameAssets' }
+
+if (nativeLibraryDir) {
+    tasks.register('checkNativeLibraries') {
+        doLast {
+            for (name in ['libmain.so', 'librexruntime.so', 'libSDL3.so', 'libc++_shared.so']) {
+                if (!new File(nativeLibraryDir, 'arm64-v8a/' + name).isFile()) {
+                    throw new GradleException('Missing compiled Android library: ' + name)
+                }
+            }
+        }
+    }
+    tasks.named('preBuild').configure { dependsOn 'checkNativeLibraries' }
+}

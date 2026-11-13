@@ -1,0 +1,350 @@
+{
+  "version": 1,
+  "generated_at": "2026-11-04T20:53:49.044074+00:00",
+  "scope": "Historical generated geometry fixtures from native-direct-ring-20261101/backends-final: one 200-frame mode per renderer on Steam Deck hardware, Windows APIs through Proton. These older reports contain paired draw counters only; other systems remain unknown. They do not qualify the current build, campaign, native Windows drivers or Android hardware.",
+  "valid_input_reports": true,
+  "overall_completion_percent": null,
+  "full_game_native_proven": false,
+  "current_build_qualified": false,
+  "tracked_systems": 12,
+  "exercised_systems": 1,
+  "paired_counters_present": false,
+  "legacy_dependency_events": 0,
+  "legacy_allocation_events": 0,
+  "systems": {
+    "Draw command dispatch": {
+      "native": 1692,
+      "legacy": 0,
+      "total": 1692,
+      "percent": 100.0,
+      "reason": "counted draw dispatches only"
+    },
+    "Geometry source selection": {
+      "percent": null,
+      "reason": "paired route counters were not recorded",
+      "recorded_native_operations": 1680,
+      "recorded_dependency_events": 0
+    },
+    "Texture upload commits": {
+      "percent": null,
+      "reason": "paired route counters were not recorded",
+      "recorded_native_operations": 520,
+      "recorded_dependency_events": 0
+    },
+    "Host resolve requests": {
+      "percent": null,
+      "reason": "paired route counters were not recorded",
+      "recorded_native_operations": 0,
+      "recorded_dependency_events": 0
+    },
+    "Shader command dispatch": {
+      "percent": null,
+      "reason": "paired route counters were not recorded"
+    },
+    "GPU synchronization": {
+      "percent": null,
+      "reason": "paired route counters were not recorded"
+    },
+    "Buffer submissions": {
+      "percent": null,
+      "reason": "paired route counters were not recorded"
+    },
+    "Presentation commands": {
+      "percent": null,
+      "reason": "paired route counters were not recorded"
+    },
+    "State and constants": {
+      "percent": null,
+      "reason": "paired route counters were not recorded"
+    },
+    "Queries": {
+      "percent": null,
+      "reason": "paired route counters were not recorded"
+    },
+    "Other commands": {
+      "percent": null,
+      "reason": "paired route counters were not recorded"
+    },
+    "Host presentation": {
+      "percent": null,
+      "reason": "paired route counters were not recorded"
+    }
+  },
+  "backends": {
+    "vulkan": {
+      "reports": 1,
+      "native": 564,
+      "legacy": 0,
+      "total": 564,
+      "percent": 100.0,
+      "reason": "counted draw dispatches only"
+    },
+    "d3d11": {
+      "reports": 1,
+      "native": 564,
+      "legacy": 0,
+      "total": 564,
+      "percent": 100.0,
+      "reason": "counted draw dispatches only"
+    },
+    "d3d12": {
+      "reports": 1,
+      "native": 564,
+      "legacy": 0,
+      "total": 564,
+      "percent": 100.0,
+      "reason": "counted draw dispatches only"
+    }
+  },
+  "samples": [
+    {
+      "path": "simpsons/re/native-progress/0.0.7.0/gpu-native.json",
+      "errors": [],
+      "sha256": "0ea5d74952aab1fb4e691cf6998539e0e3494206fccc964d4cdc80bea218ed24",
+      "report": {
+        "version": 1,
+        "backend": "vulkan",
+        "strict": true,
+        "complete": true,
+        "failed": false,
+        "frames": 200,
+        "dependencies": {
+          "edram": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "memory_mirror": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "scaled_mirror_read": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "scaled_mirror_write": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "resolve_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "vertex_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "texture_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          }
+        },
+        "operations": {
+          "vertex_streams": 560,
+          "cpu_texture_upload": 200,
+          "gpu_texture_upload": 0,
+          "resolve": 0,
+          "alias_transfer": 0,
+          "native_draw_call": 564,
+          "legacy_draw_packet": 0
+        },
+        "allocations": {
+          "edram": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          },
+          "memory_mirror": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          },
+          "scaled_mirror": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          }
+        },
+        "diagnostic_readback": {
+          "calls": 0,
+          "bytes": 0,
+          "allocations": 0,
+          "virtual_bytes": 0,
+          "resident_bytes": 0
+        }
+      }
+    },
+    {
+      "path": "simpsons/re/native-progress/0.0.7.0/gpu-dx11.json",
+      "errors": [],
+      "sha256": "9d4ed1a893586c2052d2117186dffcd71f94940d6b3ead447e1e2ab79749d78c",
+      "report": {
+        "version": 1,
+        "backend": "d3d11",
+        "strict": true,
+        "complete": true,
+        "failed": false,
+        "frames": 200,
+        "dependencies": {
+          "edram": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "memory_mirror": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "scaled_mirror_read": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "scaled_mirror_write": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "resolve_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "vertex_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "texture_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          }
+        },
+        "operations": {
+          "vertex_streams": 560,
+          "cpu_texture_upload": 120,
+          "gpu_texture_upload": 0,
+          "resolve": 0,
+          "alias_transfer": 0,
+          "native_draw_call": 564,
+          "legacy_draw_packet": 0
+        },
+        "allocations": {
+          "edram": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          },
+          "memory_mirror": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          },
+          "scaled_mirror": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          }
+        },
+        "diagnostic_readback": {
+          "calls": 0,
+          "bytes": 0,
+          "allocations": 0,
+          "virtual_bytes": 0,
+          "resident_bytes": 0
+        }
+      }
+    },
+    {
+      "path": "simpsons/re/native-progress/0.0.7.0/gpu-dx12.json",
+      "errors": [],
+      "sha256": "301ec714759f42acec0d4e9510e5045894f2fd8f94c3f6e5089b20f87ed4b6c8",
+      "report": {
+        "version": 1,
+        "backend": "d3d12",
+        "strict": true,
+        "complete": true,
+        "failed": false,
+        "frames": 200,
+        "dependencies": {
+          "edram": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "memory_mirror": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "scaled_mirror_read": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "scaled_mirror_write": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "resolve_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "vertex_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          },
+          "texture_fallback": {
+            "calls": 0,
+            "bytes": 0,
+            "first_detail": ""
+          }
+        },
+        "operations": {
+          "vertex_streams": 560,
+          "cpu_texture_upload": 200,
+          "gpu_texture_upload": 0,
+          "resolve": 0,
+          "alias_transfer": 0,
+          "native_draw_call": 564,
+          "legacy_draw_packet": 0
+        },
+        "allocations": {
+          "edram": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          },
+          "memory_mirror": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          },
+          "scaled_mirror": {
+            "calls": 0,
+            "virtual_bytes": 0,
+            "resident_bytes": 0
+          }
+        },
+        "diagnostic_readback": {
+          "calls": 0,
+          "bytes": 0,
+          "allocations": 0,
+          "virtual_bytes": 0,
+          "resident_bytes": 0
+        }
+      }
+    }
+  ]
+}

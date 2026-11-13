@@ -18,6 +18,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/native_gpu_diagnostics.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -458,9 +459,16 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
 }
 
 bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_load) {
+  NativeGpuDiagnostics::RouteScope route(NativeGpuDiagnostics::ForRegisterFile(&register_file_),
+                                         NativeGpuDiagnostics::RouteSystem::kTextures);
   if (!pending_load.texture || (!pending_load.load_base && !pending_load.load_mips)) {
+    route.Skip();
     return true;
   }
+  if (pending_load.from_cpu || pending_load.from_native_gpu)
+    route.Native();
+  else
+    route.Retained();
 
   Texture& texture = *pending_load.texture;
   TextureKey texture_key = texture.key();
@@ -498,9 +506,10 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
-  if (pending_load.from_cpu) {
+  if (pending_load.from_cpu || pending_load.from_native_gpu) {
     // Watches must catch reuse and in-place texture updates without marking
-    // the mirror valid: no bytes were uploaded to that mirror.
+    // the mirror valid: no bytes were uploaded to that mirror. Native GPU
+    // inputs may also include CPU-owned base/mip levels or unresolved padding.
     if (pending_load.load_base) {
       shared_memory().WatchCpuMemoryRange(texture_key.base_page << 12, texture.GetGuestBaseSize());
     }
@@ -510,6 +519,7 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   }
   texture.LogAction("Loaded");
 
+  route.Finish(true);
   return true;
 }
 

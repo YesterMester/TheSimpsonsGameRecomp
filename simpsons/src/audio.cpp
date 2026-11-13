@@ -28,3 +28,23 @@ REX_FUNC(sub_823462F8) {
   }
   __imp__sub_823462F8(ctx, base);
 }
+
+#if REX_PLATFORM_GNU_LINUX && !REX_PLATFORM_ANDROID
+// The DAC loop reads this timebase between mixed buffers and polls voice state
+// at 0x82C3F4E8 while retiring them. Ready work can keep both loops running
+// without a blocking wait. Give real-time audio a safe budget boundary while
+// retaining the original clock, voice state and mixer behavior.
+REX_EXTERN(__imp__sub_82345470);
+REX_EXTERN(sub_82345470);
+REX_FUNC(sub_82345470) {
+  rex_audio_yield_realtime_budget();
+  __imp__sub_82345470(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_82C3F4E8);
+REX_EXTERN(sub_82C3F4E8);
+REX_FUNC(sub_82C3F4E8) {
+  rex_audio_yield_realtime_budget();
+  __imp__sub_82C3F4E8(ctx, base);
+}
+#endif

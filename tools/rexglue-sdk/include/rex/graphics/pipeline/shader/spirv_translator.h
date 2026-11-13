@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
@@ -223,7 +224,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   //
   // Using the std140 layout - vec2 must be aligned to 8 bytes, vec3 and vec4 to
   // 16 bytes.
-  struct SystemConstants {
+  struct alignas(16) SystemConstants {
     uint32_t flags;
     uint32_t vertex_index_load_address;
     xenos::Endian vertex_index_endian;
@@ -234,31 +235,32 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_reset;
     // Number of guest vertices processed by the memexport compute dispatch.
     uint32_t compute_memexport_vertex_count;
-    float user_clip_planes[6][4];
+    // One bit per texture fetch constant indicating that it references a
+    // draw-resolution-scaled texture. Fill the prefix before the first vec4
+    // so clip planes and viewport vectors obey std140 without scalar layout.
+    uint32_t textures_resolution_scaled;
+    alignas(16) float user_clip_planes[6][4];
 
-    float ndc_scale[3];
+    alignas(16) float ndc_scale[3];
     float point_vertex_diameter_min;
 
-    float ndc_offset[3];
+    alignas(16) float ndc_offset[3];
     float point_vertex_diameter_max;
 
-    float point_constant_diameter[2];
+    alignas(8) float point_constant_diameter[2];
     // Diameter in guest screen coordinates > radius (0.5 * diameter) in the NDC
     // for the host viewport.
-    float point_screen_diameter_to_ndc_radius[2];
-    // One bit per texture fetch constant indicating that it references a
-    // draw-resolution-scaled texture.
-    uint32_t textures_resolution_scaled;
+    alignas(8) float point_screen_diameter_to_ndc_radius[2];
 
     // Each byte contains post-swizzle TextureSign values for each of the needed
     // components of each of the 32 used texture fetch constants.
-    uint32_t texture_swizzled_signs[8];
+    alignas(16) uint32_t texture_swizzled_signs[8];
 
     // If the imageViewFormatSwizzle portability subset is not supported, the
     // component swizzle (taking both guest and host swizzles into account) to
     // apply to the result directly in the shader code. In each uint32_t,
     // swizzles for 2 texture fetch constants (in bits 0:11 and 12:23).
-    uint32_t texture_swizzles[16];
+    alignas(16) uint32_t texture_swizzles[16];
 
     float alpha_test_reference;
     // Bits 0:7 - alpha-to-coverage dither offsets from RB_COLORCONTROL bits
@@ -267,14 +269,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t edram_32bpp_tile_pitch_dwords_scaled;
     uint32_t edram_depth_base_dwords_scaled;
 
-    float color_exp_bias[4];
+    alignas(16) float color_exp_bias[4];
 
     float edram_poly_offset_front_scale;
     float edram_poly_offset_back_scale;
     float edram_poly_offset_front_offset;
     float edram_poly_offset_back_offset;
 
-    union {
+    union alignas(8) {
       struct {
         uint32_t edram_stencil_front_reference_masks;
         uint32_t edram_stencil_front_func_ops;
@@ -288,30 +290,31 @@ class SpirvShaderTranslator : public ShaderTranslator {
       };
     };
 
-    uint32_t edram_rt_base_dwords_scaled[4];
+    alignas(16) uint32_t edram_rt_base_dwords_scaled[4];
 
     // RT format combined with RenderTargetCache::kPSIColorFormatFlag values
     // (pass via RenderTargetCache::AddPSIColorFormatFlags).
-    uint32_t edram_rt_format_flags[4];
+    alignas(16) uint32_t edram_rt_format_flags[4];
 
     // Render target blending options - RB_BLENDCONTROL, with only the relevant
     // options (factors and operations - AND 0x1FFF1FFF). If 0x00010001
     // (1 * src + 0 * dst), blending is disabled for the render target.
-    uint32_t edram_rt_blend_factors_ops[4];
+    alignas(16) uint32_t edram_rt_blend_factors_ops[4];
 
     // Format info - mask to apply to the old packed RT data, and to apply as
     // inverted to the new packed data, before storing (more or less the inverse
     // of the write mask packed like render target channels). This can be used
     // to bypass unpacking if blending is not used. If 0 and not blending,
     // reading the old data from the EDRAM buffer is not required.
-    uint32_t edram_rt_keep_mask[4][2];
+    alignas(16) uint32_t edram_rt_keep_mask[4][2];
 
     // Format info - values to clamp the color to before blending or storing.
     // Low color, low alpha, high color, high alpha.
-    float edram_rt_clamp[4][4];
+    alignas(16) float edram_rt_clamp[4][4];
 
     // The constant blend factor for the respective modes.
-    float edram_blend_constant[4];
+    alignas(16) float edram_blend_constant[4];
+    uint32_t native_memexport_base;
 
     // Tessellation helper shader constants.
     uint32_t vertex_index_min;
@@ -319,6 +322,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
     float tessellation_factor_range_min;
     float tessellation_factor_range_max;
   };
+
+  // The native fragment replacements declare these offsets explicitly.
+  static_assert(offsetof(SystemConstants, textures_resolution_scaled) == 28);
+  static_assert(offsetof(SystemConstants, texture_swizzled_signs) == 176);
+  static_assert(offsetof(SystemConstants, color_exp_bias) == 288);
 
   enum ConstantBuffer : uint32_t {
     kConstantBufferSystem,
@@ -433,7 +441,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // makes modules translated earlier behave differently, so stored ones (the
   // ahead-of-time shader set) are no longer used. 1: reads from vertex fetch
   // constants with zero size are skipped instead of going to guest address 0.
-  static constexpr uint32_t kTranslatedModuleVersion = 1;
+  // 2: std140 system constants and valid compute vertex exports on Vulkan 1.1.
+  static constexpr uint32_t kTranslatedModuleVersion = 2;
 
   static constexpr uint32_t GetSharedMemoryStorageBufferCountLog2(
       uint32_t max_storage_buffer_range) {
@@ -535,8 +544,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   }
 
   bool IsSpirvVertexShader() const {
-    return is_vertex_shader() && !Shader::IsHostVertexShaderTypeDomain(
-                                     GetSpirvShaderModification().vertex.host_vertex_shader_type);
+    return is_vertex_shader() && !IsSpirvComputeShader() &&
+           !Shader::IsHostVertexShaderTypeDomain(
+               GetSpirvShaderModification().vertex.host_vertex_shader_type);
   }
   bool IsSpirvTessEvalShader() const {
     return is_vertex_shader() && Shader::IsHostVertexShaderTypeDomain(
@@ -916,6 +926,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantNativeMemexportBase,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;

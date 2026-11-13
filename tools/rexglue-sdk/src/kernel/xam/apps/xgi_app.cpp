@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+
+#include <rex/kernel/xam/achievements.h>
 #include <rex/kernel/xam/apps/xgi_app.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
@@ -18,6 +21,19 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+namespace {
+AchievementHost achievement_host;
+}  // namespace
+
+void SetAchievementHost(AchievementHost host) {
+  achievement_host = std::move(host);
+}
+
+const AchievementHost& GetAchievementHost() {
+  return achievement_host;
+}
+
 namespace apps {
 using namespace rex::system;
 
@@ -59,6 +75,17 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t achievements_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
       REXKRNL_DEBUG("XGIUserWriteAchievements({:08X}, {:08X})", achievement_count,
                     achievements_ptr);
+      // XUSER_ACHIEVEMENT: user index, achievement id.
+      for (uint32_t i = 0; achievements_ptr && i < std::min(achievement_count, 64u); ++i) {
+        const auto* entry = memory_->TranslateVirtual(achievements_ptr + i * 8);
+        const uint32_t user_index = memory::load_and_swap<uint32_t>(entry + 0);
+        const uint32_t achievement_id = memory::load_and_swap<uint32_t>(entry + 4);
+        REXKRNL_INFO("XGIUserWriteAchievements: user {} achievement {}", user_index,
+                     achievement_id);
+        if (achievement_host.award) {
+          achievement_host.award(user_index, achievement_id);
+        }
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0010: {

@@ -110,6 +110,10 @@ void Init();
 
 // CSV logging
 void SetCsvLogPath(const std::string& path);
+// Whether the timed counters are recorded anywhere (a perf CSV log). Timing a
+// scope takes two clock reads, which the command processor would otherwise
+// pay several times per draw for numbers nobody reads.
+bool TimedCountersEnabled();
 void WriteCsvFrame();
 void FlushCsv();
 
@@ -168,12 +172,16 @@ class Profiler {
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 
 // Generic helpers for easily adding new counters
-// Adds the microseconds the scope took to a counter.
 namespace rex::perf {
+// Adds the microseconds the scope took to a counter.
 class ScopedCounterTimer {
  public:
-  explicit ScopedCounterTimer(rex::perf::CounterId id)
-      : id_(id), start_(std::chrono::steady_clock::now()) {}
+  explicit ScopedCounterTimer(rex::perf::CounterId id) : id_(id) {
+    if (TimedCountersEnabled()) {
+      start_ = std::chrono::steady_clock::now();
+      stopped_ = false;
+    }
+  }
   ~ScopedCounterTimer() { Stop(); }
   // Adds the time so far, and nothing more later.
   void Stop() {
@@ -189,7 +197,7 @@ class ScopedCounterTimer {
  private:
   rex::perf::CounterId id_;
   std::chrono::steady_clock::time_point start_;
-  bool stopped_ = false;
+  bool stopped_ = true;
 };
 }  // namespace rex::perf
 

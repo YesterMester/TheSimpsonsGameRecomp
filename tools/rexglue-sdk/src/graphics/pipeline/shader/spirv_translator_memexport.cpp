@@ -718,6 +718,14 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
                             builder_->createCompositeExtract(eA_vector, type_uint_, 0),
                             const_uint_2),
       builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, eM0_index, element_bytes_log2));
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantNativeMemexportBase));
+  spv::Id native_base =
+      builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                       uniform_system_constants_, id_vector_temp_),
+                           spv::NoPrecision);
+  eM0_address_bytes =
+      builder_->createBinOp(spv::OpISub, type_uint_, eM0_address_bytes, native_base);
 
   // Store based on the element size.
   auto store_needed_eM = [&](std::function<void(uint32_t eM_index)> fn) {

@@ -1,0 +1,27 @@
+{
+  "id": "euphoria.ragdolls",
+  "name": "Experimental Knockdowns",
+  "author": "YesterMester",
+  "version": "1.1.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "state",
+  "default_locale": "en",
+  "locales": {
+    "en": "locales/en.json"
+  },
+  "description": "Experimental whole-character knockback and tumbling. This prototype has no jointed ragdoll, terrain collision or Euphoria solver. Disabled by default; use in a test save.",
+  "requires_operations": [
+    "locale.text",
+    "log.info",
+    "ui.register_page",
+    "physics.knockdowns"
+  ],
+  "requires_events": [
+    "code.reloaded",
+    "initialize",
+    "ui.action",
+    "level.ready"
+  ]
+}

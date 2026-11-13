@@ -18,6 +18,10 @@ struct StageBindings {
   std::span<ID3D11Buffer* const> constants;
   std::span<ID3D11ShaderResourceView* const> resources;
   std::span<ID3D11SamplerState* const> samplers;
+  // Optional windows in 16-byte constants. Both arrays match constants;
+  // offsets and lengths are multiples of 16 constants. Empty arrays bind whole buffers.
+  std::span<const uint32_t> constant_first = {};
+  std::span<const uint32_t> constant_count = {};
 };
 
 struct DrawState {
@@ -84,7 +88,10 @@ class DrawContext {
     uint64_t output_changes = 0;
   };
 
-  explicit DrawContext(ui::d3d11::D3D11Device& device) : device_(device) {}
+  explicit DrawContext(ui::d3d11::D3D11Device& device) : device_(device) {
+    if (device.features().constant_buffer_ranges)
+      device.context()->QueryInterface(IID_PPV_ARGS(constant_context_.GetAddressOf()));
+  }
   bool Draw(const DrawCommand& command, std::string& error);
   // Releases context references and invalidates all cached bindings. It does
   // not wait for queued GPU commands or discard cached immutable state objects.
@@ -102,6 +109,8 @@ class DrawContext {
     std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>,
                D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT>
         constants;
+    std::array<uint32_t, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> constant_first = {};
+    std::array<uint32_t, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> constant_lengths = {};
     std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
                D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>
         resources;
@@ -123,6 +132,9 @@ class DrawContext {
   };
   bool OutputsMatch(const DrawCommand& command) const;
   void BindStage(DrawStage stage, const StageBindings& bindings);
+  void BindConstants(DrawStage stage, const StageBindings& bindings);
+  void SetConstants(DrawStage stage, uint32_t first, uint32_t count, ID3D11Buffer* const* buffers,
+                    const uint32_t* offsets, const uint32_t* lengths);
   void SetResources(DrawStage stage, uint32_t first, uint32_t count,
                     ID3D11ShaderResourceView* const* views);
   void ReleaseOutputs();
@@ -146,6 +158,7 @@ class DrawContext {
   // Reused by every draw.
   std::vector<DrawViewRange> writes_;
   Statistics statistics_;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext1> constant_context_;
 };
 
 }  // namespace rex::graphics::d3d11

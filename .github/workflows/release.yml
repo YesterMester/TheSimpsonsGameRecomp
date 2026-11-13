@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.3.0)"
+        description: "Release tag (e.g. v0.0.7.0)"
         required: true
-        default: "v0.0.0-test"
+        default: "v0.0.7.0"
       draft:
         description: "Create the GitHub release as a draft"
         type: boolean
@@ -30,6 +30,27 @@ env:
   LLVM_VERSION: "20.1.8"
 
 jobs:
+  checks:
+    name: Release preparation checks
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Check updates, installed settings and Steam shortcuts
+        run: |
+          python3 tools/bench/launcher_patch_check.py
+          python3 tools/bench/launcher_update_check.py
+          python3 tools/bench/steam_shortcut_check.py
+          python3 tools/bench/xiso_extract_check.py
+      - name: Check Modkit packages and native progress accounting
+        run: |
+          python3 -m unittest discover -s modkit/tests -p 'test_*.py'
+          python3 tools/bench/native_progress_check.py
+
   # ---------------------------------------------------------------- Shaders
   # The shader set for Windows packages: every shader translated ahead of
   # time on a Steam Deck, then the hand-written replacements (glslang is
@@ -38,6 +59,7 @@ jobs:
   # the ones they were made with, and translates at runtime everywhere else.
   shaders:
     name: Shader set
+    needs: checks
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +100,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+
       - name: Install LLVM/Clang ${{ env.LLVM_VERSION }}
         shell: pwsh
         run: |
@@ -95,6 +122,7 @@ jobs:
         run: |
           cmake --preset win-amd64-relwithdebinfo `
             -DREXSDK_DIR="$env:GITHUB_WORKSPACE/tools/rexglue-sdk" `
+            -DSIMPSONS_MODKIT_TOOLS=ON `
             -DREXGLUE_USE_D3D11=ON `
             -DREXGLUE_ENABLE_LTO=ON `
             -DSIMPSONS_X86_MARCH=${{ matrix.march }} `
@@ -102,14 +130,23 @@ jobs:
 
       - name: Build simpsons.exe
         working-directory: simpsons
-        run: cmake --build --preset win-amd64-relwithdebinfo --target simpsons
+        run: cmake --build --preset win-amd64-relwithdebinfo --target simpsons modkit_streams
 
-      - name: Build extract-xiso
+      - name: Check native GPU hooks in the linked Windows executable
         shell: pwsh
         run: |
-          cmake -S tools/extract-xiso -B tools/extract-xiso/build -G Ninja `
-            -DCMAKE_C_COMPILER=clang "-DCMAKE_C_FLAGS=-DWIN32 -Wno-deprecated-declarations"
-          cmake --build tools/extract-xiso/build
+          python tools/native-renderer/check_gpu_hook_linkage.py `
+            --binary simpsons/out/build/win-amd64-relwithdebinfo/simpsons.exe `
+            --nm (Get-Command llvm-nm).Source
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Stage verified upstream Windows extractor
+        shell: pwsh
+        run: |
+          python tools/launcher/stage_windows_extractor.py "$env:RUNNER_TEMP/extract-xiso"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python tools/bench/windows_extractor_check.py --package "$env:RUNNER_TEMP/extract-xiso"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Stamp launcher version from release tag
         shell: pwsh
@@ -139,12 +176,11 @@ jobs:
           # any other program.
           python -m pip install --upgrade pip
           $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
-          python -m pip install --no-binary pyinstaller pyinstaller
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Compiling the PyInstaller bootloader failed; using the prebuilt one"
-            python -m pip install pyinstaller
-            if ($LASTEXITCODE -ne 0) { exit 1 }
-          }
+          # A cached wheel skips the source build even with the environment
+          # variable set. Fail if compilation fails instead of shipping the
+          # prebuilt bootloader that this step was meant to replace.
+          python -m pip install --force-reinstall --no-cache-dir --no-binary pyinstaller "pyinstaller==6.22.3"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           python -m pip install PySide6
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
@@ -176,6 +212,12 @@ jobs:
             --version-file version_info.txt --add-data "launcher/ui;ui" launcher/launcher.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: Build separate Modkit entry
+        shell: pwsh
+        run: |
+          python tools/launcher/build_modkit_entry.py dist --cc clang-cl --windows
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Fetch ffmpeg (launcher artwork)
         shell: pwsh
         run: |
@@ -198,6 +240,18 @@ jobs:
           $bd = "simpsons/out/build/win-amd64-relwithdebinfo"
           New-Item -ItemType Directory -Force release | Out-Null
           Copy-Item "$bd/simpsons.exe"                 release/
+          # The launcher reads this beside the game to know that it can
+          # load mods; without it mods cannot be enabled.
+          Copy-Item "$bd/simpsons-modkit.json"         release/
+          Copy-Item "$bd/modkit/modkit_streams.exe"     release/
+          # Hybrid-laptop hints must be exported by the game process itself.
+          $exports = (llvm-readobj --coff-exports "$bd/simpsons.exe") -join "`n"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          foreach ($symbol in @("NvOptimusEnablement", "AmdPowerXpressRequestHighPerformance")) {
+            if ($exports -notmatch "Name: $symbol(\r?\n|$)") {
+              throw "The game is missing its $symbol export"
+            }
+          }
           Copy-Item "$bd/*.dll"                         release/ -ErrorAction SilentlyContinue
           # REXSDK_DIR's add_subdirectory build does NOT colocate the SDK's
           # DLLs with the game exe -- they land in the SDK's own out dir
@@ -206,10 +260,19 @@ jobs:
           # real CI run: rexruntimerd.dll was silently missing from the
           # package (Copy-Item on a non-matching wildcard doesn't error).
           Copy-Item "tools/rexglue-sdk/out/win-amd64/*.dll" release/ -ErrorAction SilentlyContinue
-          Copy-Item "tools/extract-xiso/build/extract-xiso.exe" release/
+          $extractor = "$env:RUNNER_TEMP/extract-xiso"
+          Copy-Item "$extractor/extract-xiso.exe" release/
+          Copy-Item "$extractor/extract-xiso-runtime" release/ -Recurse -Force
+          Copy-Item "$extractor/extract-xiso-source.json" release/
+          New-Item -ItemType Directory -Force release/licenses | Out-Null
+          Copy-Item "$extractor/licenses/extract-xiso" release/licenses/ -Recurse -Force
+          python tools/launcher/stage_windows_extractor.py release --verify
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           Copy-Item "dist/simpsons-launcher.exe"        release/
+          Copy-Item "dist/simpsons-modkit.exe"          release/
           Copy-Item "ffmpeg.exe"                         release/
           Copy-Item "README.md"                         release/
+          Copy-Item "LICENSE"                           release/
           Set-Content release/build_variant.txt -Encoding ascii -Value "${{ matrix.march }}"
           python tools/native-renderer/write_runtime_defaults.py release/simpsons.toml windows
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -221,7 +284,8 @@ jobs:
           # Fail here, not for a player after download, if a required file
           # never made it into the package (Copy-Item on a non-matching
           # wildcard is silent, so this is the only real check we get).
-          $required = @("simpsons.exe", "extract-xiso.exe", "simpsons-launcher.exe", "ffmpeg.exe", "rexruntimerd.dll", "build_variant.txt")
+          $required = @("simpsons.exe", "simpsons-modkit.json", "modkit_streams.exe", "extract-xiso.exe", "simpsons-launcher.exe", "simpsons-modkit.exe", "ffmpeg.exe", "rexruntimerd.dll", "build_variant.txt", "LICENSE")
+          $required += @("extract-xiso-runtime/extract-xiso.exe", "extract-xiso-runtime/VCRUNTIME140.dll", "extract-xiso-source.json", "licenses/extract-xiso/LICENSE.TXT")
           $required += (Get-ChildItem "$bd" -Filter "*.dll" -Name -ErrorAction SilentlyContinue)
           $required += (Get-ChildItem "tools/rexglue-sdk/out/win-amd64" -Filter "*.dll" -Name -ErrorAction SilentlyContinue)
           $required = $required | Select-Object -Unique
@@ -242,6 +306,7 @@ jobs:
   # Best-effort; mirrors the documented Linux build. Uses the Vulkan backend.
   linux:
     name: Linux x64 ${{ matrix.march }} (clang / Vulkan)
+    needs: checks
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -267,13 +332,15 @@ jobs:
             libxcursor-dev libxi-dev libxfixes-dev libxss-dev \
             libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev wayland-protocols libudev-dev \
-            libasound2-dev libpulse-dev libpipewire-0.3-dev libdbus-1-dev glslang-tools
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libdbus-1-dev glslang-tools \
+            libxcb-cursor0 libnss3 python3-venv
 
       - name: Configure (game + SDK, Vulkan)
         working-directory: simpsons
         run: |
           cmake --preset linux-amd64-relwithdebinfo \
             -DREXSDK_DIR="$GITHUB_WORKSPACE/tools/rexglue-sdk" \
+            -DSIMPSONS_MODKIT_TOOLS=ON \
             -DSDL_DBUS=ON \
             -DREXGLUE_ENABLE_LTO=ON \
             -DSIMPSONS_X86_MARCH=${{ matrix.march }} \
@@ -281,7 +348,25 @@ jobs:
 
       - name: Build simpsons
         working-directory: simpsons
-        run: cmake --build --preset linux-amd64-relwithdebinfo --target simpsons
+        run: cmake --build --preset linux-amd64-relwithdebinfo --target simpsons modkit_streams
+
+      - name: Check native animation lookup and high-FPS handlers
+        run: |
+          python3 tools/bench/animation_catalog_check.py --cxx clang++-20 \
+            --output "$RUNNER_TEMP/animation-catalog-check"
+          python3 tools/bench/camera_input_check.py --cxx clang++-20 \
+            --output "$RUNNER_TEMP/camera-input-check"
+          python3 tools/bench/physics_keyframes_check.py --cxx clang++-20 \
+            --output "$RUNNER_TEMP/physics-keyframes-check"
+
+      - name: Check native GPU hooks in the linked Linux executable
+        run: |
+          # llvm.sh does not always install llvm-nm-20; binutils nm reads the
+          # same symbol table of the final (not LTO bitcode) executable.
+          nm_tool=$(command -v llvm-nm-20 || command -v llvm-nm || command -v nm)
+          python3 tools/native-renderer/check_gpu_hook_linkage.py \
+            --binary simpsons/out/build/linux-amd64-relwithdebinfo/simpsons \
+            --nm "$nm_tool"
 
       - name: Build extract-xiso
         run: |
@@ -305,6 +390,10 @@ jobs:
           bd="simpsons/out/build/linux-amd64-relwithdebinfo"
           mkdir -p release
           cp "$bd/simpsons" release/
+          # The launcher reads this beside the game to know that it can
+          # load mods; without it mods cannot be enabled.
+          cp "$bd/simpsons-modkit.json" release/
+          cp "$bd/modkit/modkit_streams" release/
           # REXSDK_DIR's add_subdirectory build does NOT colocate the SDK's
           # shared libs with the game executable -- they land in the SDK's
           # own out dir (relative to tools/rexglue-sdk, not $bd) regardless
@@ -315,7 +404,21 @@ jobs:
           cp tools/rexglue-sdk/out/linux-amd64/*.so* release/ 2>/dev/null || true
           cp tools/extract-xiso/build/extract-xiso release/
           cp -r launcher release/launcher
-          cp README.md release/
+          # Keep the native window independent of Steam Runtime's Python and
+          # the player's installed packages. The shell entry point prefers it.
+          python3 -m venv "$RUNNER_TEMP/launcher-build"
+          "$RUNNER_TEMP/launcher-build/bin/python" -m pip install \
+            -r tools/launcher/requirements-linux.txt
+          "$RUNNER_TEMP/launcher-build/bin/python" tools/launcher/build_linux.py release/launcher
+          cp README.md LICENSE release/
+          # A launcher from before 0.0.7.0 updates launcher.py and ui/ only.
+          # launcher.py imports these modules from ui/modules when they are
+          # not beside it, so it still starts after that update and can fetch
+          # the files the old updater left out.
+          mkdir -p release/launcher/ui/modules
+          for module in launcher/*.py; do
+            [ "$(basename "$module")" = launcher.py ] || cp "$module" release/launcher/ui/modules/
+          done
           # Older launchers already update launcher/ui, but do not copy new
           # top-level folders. Keep the shader assets there so the first
           # update from those versions receives them too.
@@ -344,8 +447,16 @@ jobs:
 
           # One obvious double-clickable/runnable entry point at the top of
           # the download, so a player never has to know the internal layout.
-          printf '#!/bin/sh\ncd "$(dirname "$0")/launcher" && exec ./simpsons-launcher.sh\n' > release/Play.sh
+          printf '#!/bin/sh\ncd "$(dirname "$0")/launcher" && exec ./simpsons-launcher.sh "$@"\n' > release/Play.sh
           chmod +x release/Play.sh
+          printf '#!/bin/sh\ncd "$(dirname "$0")/launcher" && exec ./simpsons-modkit.sh "$@"\n' > release/Modkit.sh
+          chmod +x release/Modkit.sh release/launcher/simpsons-modkit.sh
+          test -x release/launcher/simpsons-modkit
+          test -x release/modkit_streams
+          test -s release/simpsons-modkit.json
+          test -f release/launcher/ui/modules/mod_packages.py
+          test -f release/launcher/ui/modules/xiso_extract.py
+          test -f release/launcher/ui/bundled-mods/euphoria.ragdolls/mod.json
 
           # The runtime lib pulls in libTracyClient.so as a NEEDED entry it
           # doesn't actually use symbols from; loading two copies of Tracy

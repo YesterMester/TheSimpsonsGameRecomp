@@ -44,6 +44,11 @@ class ObjectTable {
   // Restores a XObject reference with a handle. Mainly for internal use - do
   // not use.
   X_STATUS RestoreHandle(X_HANDLE handle, XObject* object);
+  // Puts an object under a given handle with its open count (moving objects
+  // between handles when a title's memory is restored from a snapshot).
+  X_STATUS RestoreHandle(X_HANDLE handle, XObject* object, int ref_count);
+  // How many times a handle is open (0 if it isn't).
+  int HandleRefCount(X_HANDLE handle);
 
   // `already_locked` skips re-acquiring the global critical region for
   // callers that provably hold it for the whole call (the raw two-arg

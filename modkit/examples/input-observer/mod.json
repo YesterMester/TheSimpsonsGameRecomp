@@ -1,0 +1,22 @@
+{
+  "id": "examples.input-observer",
+  "name": "Input observer",
+  "author": "",
+  "version": "1.0.0",
+  "api": 1,
+  "kind": "lua",
+  "entry": "main.lua",
+  "save_mode": "stateless",
+  "requires_operations": [
+    "input.state",
+    "players.controlled",
+    "ui.register_page"
+  ],
+  "requires_events": [
+    "initialize",
+    "simulation",
+    "ui.action",
+    "level.unloading"
+  ],
+  "description": "A commented two-player input and controlled-character reader with a native Options page. It observes without changing gameplay."
+}

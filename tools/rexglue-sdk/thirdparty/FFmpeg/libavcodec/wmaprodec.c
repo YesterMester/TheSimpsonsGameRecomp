@@ -2034,6 +2034,28 @@ static av_cold int xmaframes_decode_end(AVCodecContext* avctx)
     return 0;
 }
 
+/**
+ *@brief Start a new stream as a freshly opened decoder would (modified
+ *       2026-10-05 for TheSimpsonsGameRecomp_ff): no overlap from the previous
+ *       stream's last frame, and its first frame windowed as after init.
+ *       Without this, a context reused for another sound mixed the end of the
+ *       old one into the start of the new one.
+ *@param avctx codec context
+ */
+static void xmaframes_flush(AVCodecContext *avctx)
+{
+    WMAProDecodeCtx *s = avctx->priv_data;
+    int i;
+
+    for (i = 0; i < s->nb_channels; i++) {
+        memset(s->channel[i].out, 0, sizeof(s->channel[i].out));
+        s->channel[i].prev_block_len = s->samples_per_frame;
+    }
+    s->packet_loss = 1;
+    s->skip_packets = 0;
+    s->eof_done = 0;
+}
+
 
 /**
  *@brief Decode a single WMA frame. Packet parsing is out of this decoders scope.
@@ -2152,6 +2174,7 @@ AVCodec ff_xmaframes_decoder = {
     .init           = xmaframes_decode_init,
     .close          = xmaframes_decode_end,
     .decode         = xmaframes_decode_packet,
+    .flush          = xmaframes_flush,
     .capabilities   = AV_CODEC_CAP_DR1,
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_FLTP,

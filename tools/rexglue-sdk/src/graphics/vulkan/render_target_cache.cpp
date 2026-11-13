@@ -13,7 +13,9 @@
 #include <bit>
 #include <cmath>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <unordered_set>
 #include <optional>
@@ -36,6 +38,10 @@
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/gpu_page_mask.h>
+#include <rex/graphics/util/native_color_resolve.h>
+#include <rex/graphics/util/native_resolve_image_copy.h>
+#include <rex/graphics/util/native_resolve_source.h>
 #include <rex/graphics/util/native_surface_copy.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
@@ -159,10 +165,6 @@ REXCVAR_DEFINE_BOOL(native_resolve_composed_reads, true, "GPU/Vulkan",
                     "Textures only partly covered by native resolve buffers are assembled "
                     "from them and guest memory (zero when scaled), not read from the guest "
                     "memory mirror");
-REXCVAR_DEFINE_INT32(native_resolve_buffer_mb, 128, "GPU/Vulkan",
-                     "Maximum MiB of retained native resolve buffers, times the pixel count of "
-                     "the resolution scale")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(native_resolve_debug_skip_scaled_memory, false, "GPU/Vulkan",
                     "Measurement only, unsafe: with draw resolution scaling, native resolves keep "
@@ -472,9 +474,17 @@ struct VulkanRenderTargetCache::NativeResolveBuffer {
   bool scaled = false;
   bool valid = false;
   bool pending_memory = false;
+  bool padding_fresh = false;
+  uint32_t resolve_base = 0;
+  uint32_t resolve_pitch = 0;
+  uint32_t resolve_flags = 0;
+  uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
   // Written by resolves of other extents too (a smaller one into a larger
   // one's buffer), so it holds memory several resolves build on.
   bool shared = false;
+  // Shader exports may share a resource with CPU-owned input pages. Keep
+  // neighboring GPU pages available when only one input page is rewritten.
+  std::vector<uint8_t> valid_pages;
 };
 
 VulkanRenderTargetCache::VulkanRenderTargetCache(const RegisterFile& register_file,
@@ -1276,6 +1286,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   // so ShutdownCommon is called by the RenderTargetCache destructor, when it's
   // already too late.
   DestroyRetiredRenderTargetObjects(UINT64_MAX);
+  native_depth_snapshots_.clear();
   DestroyAllRenderTargets(true);
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
@@ -1395,8 +1406,8 @@ void VulkanRenderTargetCache::ClearCache() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  // Held back transfers and resolves reference render targets the common
-  // ClearCache destroys.
+  // Pending work has been recorded before the idle wait. The common clear
+  // preserves render targets that still own tiles.
   pending_copy_free_resolve_.active = false;
   deferred_transfer_targets_ = 0;
   for (std::vector<Transfer>& transfers : deferred_transfers_) {
@@ -1406,7 +1417,21 @@ void VulkanRenderTargetCache::ClearCache() {
 
   // Called with the GPU idle.
   DestroyRetiredRenderTargetObjects(UINT64_MAX);
-  ClearNativeResolveBuffers();
+  native_depth_snapshots_.clear();
+  // Live resolved pages remain authoritative after derived textures are gone.
+  {
+    auto lock = native_resolve_buffers_critical_region_.Acquire();
+    std::erase_if(native_resolve_buffers_, [&](const auto& buffer) {
+      if (buffer.use_count() != 1 || IsNativeResolveBufferLive(*buffer))
+        return false;
+      if (buffer->watch)
+        buffer->shared_memory->UnwatchMemoryRange(buffer->watch);
+      dfn.vkDestroyBuffer(device, buffer->buffer, nullptr);
+      dfn.vkFreeMemory(device, buffer->memory, nullptr);
+      native_resolve_buffer_bytes_ -= buffer->capacity;
+      return true;
+    });
+  }
 
   // Framebuffer objects must be destroyed because they reference views of
   // attachment images, which may be removed by the common ClearCache.
@@ -1425,7 +1450,22 @@ void VulkanRenderTargetCache::ClearCache() {
   RenderTargetCache::ClearCache();
 }
 
+void VulkanRenderTargetCache::ClearSharedMemoryCache(VulkanSharedMemory& shared_memory) {
+  auto lock = native_resolve_buffers_critical_region_.Acquire();
+  native_resolve_clearing_cache_ = true;
+  shared_memory.SharedMemory::ClearCache();
+  native_resolve_clearing_cache_ = false;
+  // The common clear releases individual watch nodes. Page owners use the
+  // persistent global watch; re-arm any older whole-range owner separately.
+  for (const auto& buffer : native_resolve_buffers_)
+    if (buffer->valid && buffer->valid_pages.empty() && buffer->shared_memory && !buffer->watch)
+      WatchNativeResolveBuffer(*buffer);
+}
+
 void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
+  while (!native_depth_snapshots_.empty() &&
+         native_depth_snapshots_.front().first <= command_processor_.GetCompletedSubmission())
+    native_depth_snapshots_.pop_front();
   DestroyRetiredRenderTargetObjects(command_processor_.GetCompletedSubmission());
   if (edram_snapshot_restore_pool_) {
     edram_snapshot_restore_pool_->Reclaim(command_processor_.GetCompletedSubmission());
@@ -1740,6 +1780,44 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
   // Copying.
   bool copied = false;
+  // Find the target while it still matches memory. An image-only resolve
+  // retains the previous native version solely for its untouched padding.
+  NativeResolvePlan native_resolve_plan;
+  bool native_resolve_planned =
+      native_resolve_enabled_ &&
+      PrepareNativeResolve(resolve_info, texture_cache, native_resolve_plan);
+  std::shared_ptr<NativeResolveBuffer> native_padding_source;
+  uint32_t padding_page_mask = uint32_t(rex::memory::page_size()) - 1;
+  bool native_padding_fresh =
+      resolve_info.copy_dest_extent_length &&
+      !((resolve_info.copy_dest_extent_start | resolve_info.copy_dest_extent_length) &
+        padding_page_mask) &&
+      !shared_memory.IsRangeGpuWritten(resolve_info.copy_dest_extent_start,
+                                       resolve_info.copy_dest_extent_length);
+  auto find_padding_source = [&] {
+    auto global_lock = native_resolve_buffers_critical_region_.Acquire();
+    NativeResolveBuffer* source = FindNativeResolveBufferRange(
+        resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length, true);
+    if (source) {
+      if (source->padding_fresh && source->resolve_base == native_resolve_plan.dest_base &&
+          source->resolve_pitch == native_resolve_plan.dest_pitch_texels &&
+          source->resolve_flags == native_resolve_plan.memory_flags &&
+          native_resolve_plan.x0 <= source->x0 && native_resolve_plan.y0 <= source->y0 &&
+          native_resolve_plan.x1 >= source->x1 && native_resolve_plan.y1 >= source->y1) {
+        native_padding_fresh = true;
+        return;
+      }
+      for (const auto& candidate : native_resolve_buffers_) {
+        if (candidate.get() == source) {
+          native_padding_source = candidate;
+          break;
+        }
+      }
+    }
+  };
+  if (draw_resolution_scaled && native_resolve_planned) {
+    find_padding_source();
+  }
   // Resolved data still only in textures, in the range about to be written.
   if (resolve_info.copy_dest_extent_length && !pending_scaled_resolve_memory_.empty()) {
     // Earlier resolves of another extent to the memory: from now on, resolves
@@ -1758,14 +1836,13 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       }
     }
     PrepareScaledResolveMemoryForResolve(resolve_info.copy_dest_extent_start,
-                                         resolve_info.copy_dest_extent_length);
+                                         resolve_info.copy_dest_extent_length,
+                                         native_resolve_planned ? &native_resolve_plan : nullptr,
+                                         native_padding_source, native_padding_fresh);
+    if (draw_resolution_scaled && native_resolve_planned && !native_padding_source) {
+      find_padding_source();
+    }
   }
-  // Textures sampling the destination must be found while their data still
-  // matches memory, before the resolved range is invalidated.
-  NativeResolvePlan native_resolve_plan;
-  bool native_resolve_planned =
-      native_resolve_enabled_ &&
-      PrepareNativeResolve(resolve_info, texture_cache, native_resolve_plan);
   if (!native_resolve_planned && native_resolve_enabled_ && resolve_info.copy_dest_extent_length) {
     // Reports resolves still done by dumping the EDRAM and running the
     // resolve shader (each distinct kind once).
@@ -1809,10 +1886,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       GetNativeResolvePipeline(native_resolve_plan.shader, native_resolve_plan.targets[0].format) !=
           VK_NULL_HANDLE;
   if (native_buffer_candidate && native_resolve_single_pass && draw_resolution_scaled &&
-      !native_resolve_plan.memory_only &&
-      REXCVAR_GET(native_resolve_buffer_texture_first) &&
+      !native_resolve_plan.memory_only && REXCVAR_GET(native_resolve_buffer_texture_first) &&
       REXCVAR_GET(native_resolve_scaled_lazy_memory) &&
       (native_resolve_plan.memory_flags & kNativeResolveFlagMemoryScaled) &&
+      (native_padding_source || native_padding_fresh) &&
       !multi_extent_resolve_bases_.count(native_resolve_plan.dest_base) &&
       !OverlapsLiveNativeResolveBuffer(resolve_info.copy_dest_extent_start,
                                        resolve_info.copy_dest_extent_length, true)) {
@@ -1830,6 +1907,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   // must get them (or it would be outdated, see above): a memory-only resolve
   // into that buffer, then one of only the textures.
   bool memory_in_native_buffer = false;
+  if (native_buffer_candidate) {
+    // The compact resolve itself preserves the padding. Do not pin its
+    // previous allocation against in-place reuse for an image-only path that
+    // will not be taken.
+    native_padding_source.reset();
+  }
   if (!native_buffer_candidate && native_resolve_planned &&
       resolve_info.copy_dest_extent_length && !native_resolve_plan.memory_only &&
       !IsNativeResolveDepthShader(native_resolve_plan.shader) &&
@@ -1863,7 +1946,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     // The first target's draw writes the scaled resolve buffer, bound from the
     // destination's base (the address the scaled resolve shaders use).
     uint32_t bytes_per_block_log2 =
-        (native_resolve_plan.memory_flags & kNativeResolveFlagMemory64bpp) ? 3 : 2;
+        GetNativeResolveMemorySizeLog2(native_resolve_plan.memory_flags);
     uint32_t dest_range_unscaled = resolve_info.copy_dest_extent_start +
                                    resolve_info.copy_dest_extent_length -
                                    native_resolve_plan.dest_base;
@@ -1881,8 +1964,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     // before it's replaced. Color targets hold the raw bits the memory would;
     // depth targets hold converted depth (invertible) but no stencil, which is
     // captured separately.
-    bool lazy_memory =
-        REXCVAR_GET(native_resolve_scaled_lazy_memory) && !native_resolve_plan.memory_only;
+    bool lazy_memory = REXCVAR_GET(native_resolve_scaled_lazy_memory) &&
+                       !native_resolve_plan.memory_only &&
+                       (native_padding_source || native_padding_fresh);
     uint32_t stencil_capture = UINT32_MAX;
     bool stencil_capture_quads = false;
     VkDescriptorSet stencil_capture_descriptor_set = VK_NULL_HANDLE;
@@ -2009,8 +2093,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                     native_resolve_plan.y1, verify_stencil_capture);
       }
       PendingScaledResolveMemory& pending = pending_scaled_resolve_memory_.emplace_back();
+      pending.shared_memory = &shared_memory;
+      pending.padding_source = std::move(native_padding_source);
+      pending.padding_fresh = native_padding_fresh;
       pending.is_depth = IsNativeResolveDepthShader(native_resolve_plan.shader);
-      pending.depth_float_view = native_resolve_plan.shader == NativeResolveShader::kDepthFloat;
+      pending.depth_float_view = GetSingleSampleNativeResolveShader(native_resolve_plan.shader) ==
+                                 NativeResolveShader::kDepthFloat;
       pending.flags = native_resolve_plan.flags;
       pending.stencil_capture = stencil_capture;
       pending.stencil_capture_quads = stencil_capture_quads;
@@ -2027,7 +2115,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       pending.x1 = native_resolve_plan.x1;
       pending.y1 = native_resolve_plan.y1;
       pending.memory_flags = native_resolve_plan.memory_flags;
-      if (native_resolve_plan.shader == NativeResolveShader::kColorUnorm) {
+      if (GetSingleSampleNativeResolveShader(native_resolve_plan.shader) ==
+          NativeResolveShader::kColorUnorm) {
         pending.unorm_packing = uint32_t(native_resolve_plan.packing);
       }
       texture_cache.AddScaledMemoryPending(pending.texture, 1);
@@ -3119,7 +3208,7 @@ bool VulkanRenderTargetCache::CreateRenderTargetImage(RenderTargetKey key, uint3
   }
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-  if (REXCVAR_GET(native_rt_size_by_use) || REXCVAR_GET(native_resolve_copy_free) ||
+  if (key.is_depth || REXCVAR_GET(native_rt_size_by_use) || REXCVAR_GET(native_resolve_copy_free) ||
       REXCVAR_GET(native_resolve_image_copies)) {
     // Growing copies the image; textures that take over images are loaded
     // with copies (and have the same usages).
@@ -3437,6 +3526,7 @@ void VulkanRenderTargetCache::EnsureRenderTargetTileRows(RenderTargetKey key,
       (xenos::kEdramTileHeightSamples >> uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X)) *
       GetRenderTargetScaleY(key);
   region.extent.depth = 1;
+  CountNativeSnapshot(kImageCopiesTileRows);
   command_processor_.deferred_command_buffer().CmdVkCopyImage(
       render_target->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, new_image.image,
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
@@ -3544,10 +3634,13 @@ bool VulkanRenderTargetCache::EnsureEdramBuffer() {
 }
 
 void VulkanRenderTargetCache::UseEdramBuffer(EdramBufferUsage new_usage) {
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kEdram, 0,
-      fmt::format("usage {} at {}", uint32_t(new_usage),
-                  SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
+  // The detail looks up a symbol name: only when anything records it.
+  if (command_processor_.native_gpu_diagnostics().enabled()) {
+    command_processor_.native_gpu_diagnostics().RecordDependency(
+        NativeGpuDiagnostics::Dependency::kEdram, 0,
+        fmt::format("usage {} at {}", uint32_t(new_usage),
+                    SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
+  }
   if (!EnsureEdramBuffer()) {
     REX_FATAL("Unable to allocate the EDRAM compatibility buffer");
   }
@@ -4074,8 +4167,12 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   // Working with unsigned numbers for simplicity now, bitcasting to signed will
   // be done at texture fetch.
 
-  uint32_t tile_width_samples = xenos::kEdramTileWidthSamples * draw_resolution_scale_x();
-  uint32_t tile_height_samples = xenos::kEdramTileHeightSamples * draw_resolution_scale_y();
+  const bool resample = key.dest_original_resolution || key.source_original_resolution ||
+                        key.host_depth_source_original_resolution;
+  uint32_t tile_width_samples =
+      xenos::kEdramTileWidthSamples * (resample ? 1u : draw_resolution_scale_x());
+  uint32_t tile_height_samples =
+      xenos::kEdramTileHeightSamples * (resample ? 1u : draw_resolution_scale_y());
 
   // Split the destination pixel index into 32bpp tile and 32bpp-tile-relative
   // pixel index.
@@ -4093,6 +4190,35 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
       builder.createRvalueSwizzle(spv::NoPrecision, type_float2,
                                   builder.createLoad(input_fragment_coord, spv::NoPrecision),
                                   uint_vector_temp));
+  const spv::Id dest_host_pixel_coord = dest_pixel_coord;
+  if (resample && !key.dest_original_resolution) {
+    id_vector_temp = {builder.makeUintConstant(draw_resolution_scale_x()),
+                      builder.makeUintConstant(draw_resolution_scale_y())};
+    dest_pixel_coord =
+        builder.createBinOp(spv::OpUDiv, type_uint2, dest_pixel_coord,
+                            builder.createCompositeConstruct(type_uint2, id_vector_temp));
+  }
+  auto source_image_coord = [&](spv::Id guest_coord, bool original_resolution) {
+    if (!resample || original_resolution)
+      return guest_coord;
+    const uint32_t scales[] = {draw_resolution_scale_x(), draw_resolution_scale_y()};
+    std::vector<spv::Id> coordinates;
+    for (uint32_t axis = 0; axis < 2; ++axis) {
+      spv::Id subpixel = key.dest_original_resolution
+                             ? builder.makeUintConstant(scales[axis] / 2u)
+                             : builder.createBinOp(spv::OpUMod, type_uint,
+                                                   builder.createCompositeExtract(
+                                                       dest_host_pixel_coord, type_uint, axis),
+                                                   builder.makeUintConstant(scales[axis]));
+      coordinates.push_back(builder.createBinOp(
+          spv::OpIAdd, type_int,
+          builder.createBinOp(spv::OpIMul, type_int,
+                              builder.createCompositeExtract(guest_coord, type_int, axis),
+                              builder.makeIntConstant(int32_t(scales[axis]))),
+          builder.createUnaryOp(spv::OpBitcast, type_int, subpixel)));
+    }
+    return builder.createCompositeConstruct(type_int2, coordinates);
+  };
   spv::Id dest_pixel_x = builder.createCompositeExtract(dest_pixel_coord, type_uint, 0);
   spv::Id const_dest_tile_width_pixels = builder.makeUintConstant(
       tile_width_samples >>
@@ -4525,6 +4651,9 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
       source_sample_ids_int[1] = source_sample_ids_int[0];
     }
   }
+  for (uint32_t i = 0; i <= uint32_t(source_load_is_two_32bpp_samples); ++i)
+    source_coordinates[i] =
+        source_image_coord(source_coordinates[i], key.source_original_resolution);
   spv::Id source_color[2][4] = {};
   if (source_color_texture != spv::NoResult) {
     source_texture_parameters.sampler = builder.createLoad(source_color_texture, spv::NoPrecision);
@@ -5485,21 +5614,23 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                 spv::OpBitcast, type_int,
                 builder.createBinOp(
                     spv::OpIAdd, type_uint,
-                    builder.createBinOp(spv::OpIMul, type_uint,
-                                        builder.makeUintConstant(tile_width_samples >>
-                                                                 uint32_t(key.source_msaa_samples >=
-                                                                          xenos::MsaaSamples::k4X)),
-                                        host_depth_source_tile_index_x),
+                    builder.createBinOp(
+                        spv::OpIMul, type_uint,
+                        builder.makeUintConstant(tile_width_samples >>
+                                                 uint32_t(key.host_depth_source_msaa_samples >=
+                                                          xenos::MsaaSamples::k4X)),
+                        host_depth_source_tile_index_x),
                     host_depth_source_tile_pixel_x));
             spv::Id host_depth_source_pixel_y_int = builder.createUnaryOp(
                 spv::OpBitcast, type_int,
                 builder.createBinOp(
                     spv::OpIAdd, type_uint,
-                    builder.createBinOp(spv::OpIMul, type_uint,
-                                        builder.makeUintConstant(tile_height_samples >>
-                                                                 uint32_t(key.source_msaa_samples >=
-                                                                          xenos::MsaaSamples::k2X)),
-                                        host_depth_source_tile_index_y),
+                    builder.createBinOp(
+                        spv::OpIMul, type_uint,
+                        builder.makeUintConstant(tile_height_samples >>
+                                                 uint32_t(key.host_depth_source_msaa_samples >=
+                                                          xenos::MsaaSamples::k2X)),
+                        host_depth_source_tile_index_y),
                     host_depth_source_tile_pixel_y));
             // Load the host depth source.
             spv::Builder::TextureParameters host_depth_source_texture_parameters = {};
@@ -5509,7 +5640,8 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
             id_vector_temp.push_back(host_depth_source_pixel_x_int);
             id_vector_temp.push_back(host_depth_source_pixel_y_int);
             host_depth_source_texture_parameters.coords =
-                builder.createCompositeConstruct(type_int2, id_vector_temp);
+                source_image_coord(builder.createCompositeConstruct(type_int2, id_vector_temp),
+                                   key.host_depth_source_original_resolution);
             if (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X) {
               host_depth_source_texture_parameters.sample =
                   builder.createUnaryOp(spv::OpBitcast, type_int, host_depth_source_sample_id);
@@ -6116,6 +6248,7 @@ bool VulkanRenderTargetCache::TryNativeSurfaceCopies(
     transition(*copy.source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT);
     transition(*copy.dest, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT);
     command_processor_.SubmitBarriers(true);
+    CountNativeSnapshot(kImageCopiesSurface);
     command_processor_.deferred_command_buffer().CmdVkCopyImage(
         copy.source->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copy.dest->image(),
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copy.regions.size()), copy.regions.data());
@@ -6142,9 +6275,64 @@ bool VulkanRenderTargetCache::TryNativeSurfaceCopies(
   }
   static uint64_t batches = 0;
   if (++batches <= 8 || !(batches & 255)) {
-    REXGPU_INFO("[native-surface-copy] {} surface copies ({})", copies.size(), batches);
+    size_t regions = 0;
+    for (const Copy& copy : copies) {
+      regions += copy.regions.size();
+    }
+    REXGPU_INFO("[native-surface-copy] {} surface copies, {} regions ({})", copies.size(),
+                regions, batches);
   }
   return true;
+}
+
+VulkanRenderTargetCache::VulkanRenderTarget* VulkanRenderTargetCache::SnapshotNativeHostDepth(
+    VulkanRenderTarget& source) {
+  const auto key = source.key();
+  VulkanRenderTarget::Image image;
+  if (!CreateRenderTargetImage(key, source.tile_rows(), image))
+    return nullptr;
+  auto snapshot = std::make_unique<VulkanRenderTarget>(key, *this, image);
+  command_processor_.EndRenderPass();
+  auto range = ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                            VK_IMAGE_ASPECT_STENCIL_BIT);
+  command_processor_.PushImageMemoryBarrier(
+      source.image(), range, source.current_stage_mask(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+      source.current_access_mask(), VK_ACCESS_TRANSFER_READ_BIT, source.current_layout(),
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  command_processor_.PushImageMemoryBarrier(
+      snapshot->image(), range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+  std::array<VkImageCopy, 2> regions = {};
+  for (uint32_t i = 0; i < regions.size(); ++i) {
+    auto& region = regions[i];
+    region.srcSubresource.aspectMask = i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+    region.srcSubresource.layerCount = 1;
+    region.dstSubresource = region.srcSubresource;
+    region.extent.width = key.GetWidth() * GetRenderTargetScaleX(key);
+    region.extent.height =
+        source.tile_rows() *
+        (xenos::kEdramTileHeightSamples >> uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X)) *
+        GetRenderTargetScaleY(key);
+    region.extent.depth = 1;
+  }
+  CountNativeSnapshot(kImageCopiesDepthSnapshot);
+  command_processor_.deferred_command_buffer().CmdVkCopyImage(
+      source.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snapshot->image(),
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()), regions.data());
+  source.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  snapshot->SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  snapshot->uniform_stencil() = source.uniform_stencil();
+  auto* result = snapshot.get();
+  native_depth_snapshots_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                       std::move(snapshot));
+  if (++native_depth_snapshot_count_ <= 8 || !(native_depth_snapshot_count_ & 255))
+    REXGPU_INFO("[native-depth-snapshot] {} in-place depth versions retained as images",
+                native_depth_snapshot_count_);
+  return result;
 }
 
 void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
@@ -6159,38 +6347,36 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
-  // Transfers from or to original resolution render targets would need
-  // resampling between the resolution scales (and the host depth store works
-  // with the scaled EDRAM buffer layout), so they're dropped. The games they're
-  // used for only move dead data that way - a shadow map overlapping the old
-  // main depth buffer, or a render target cleared right after taking over.
-  std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets> scale_kept_transfers;
+  std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets> native_transfers;
+  bool needs_depth_snapshot = false;
   if (render_target_transfers) {
-    bool any_dropped = false;
+    for (uint32_t i = 0; i < render_target_count && !needs_depth_snapshot; ++i)
+      needs_depth_snapshot =
+          render_targets[i] &&
+          std::any_of(render_target_transfers[i].begin(), render_target_transfers[i].end(),
+                      [&](const Transfer& transfer) {
+                        return transfer.host_depth_source == render_targets[i];
+                      });
+  }
+  if (needs_depth_snapshot) {
+    assert_true(render_target_count <= native_transfers.size());
+    bool replaced = false;
     for (uint32_t i = 0; i < render_target_count; ++i) {
-      if (!render_targets[i]) {
-        continue;
-      }
-      bool dest_original = render_targets[i]->key().original_resolution;
-      for (const Transfer& transfer : render_target_transfers[i]) {
-        if (dest_original || transfer.source->key().original_resolution ||
-            (transfer.host_depth_source &&
-             transfer.host_depth_source->key().original_resolution)) {
-          any_dropped = true;
+      native_transfers[i] = render_target_transfers[i];
+      RenderTarget* snapshot = nullptr;
+      for (auto& transfer : native_transfers[i]) {
+        if (!render_targets[i] || transfer.host_depth_source != render_targets[i])
           continue;
+        if (!snapshot)
+          snapshot = SnapshotNativeHostDepth(*static_cast<VulkanRenderTarget*>(render_targets[i]));
+        if (snapshot) {
+          transfer.host_depth_source = snapshot;
+          replaced = true;
         }
-        scale_kept_transfers[i].push_back(transfer);
       }
     }
-    if (any_dropped) {
-      static bool dropped_logged = false;
-      if (!dropped_logged) {
-        dropped_logged = true;
-        REXGPU_INFO(
-            "Dropping EDRAM ownership transfers involving original resolution render targets");
-      }
-      render_target_transfers = scale_kept_transfers.data();
-    }
+    if (replaced)
+      render_target_transfers = native_transfers.data();
   }
   for (uint32_t i = 0; i < render_target_count; ++i) {
     RenderTarget* render_target = render_targets[i];
@@ -6582,6 +6768,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       TransferShaderKey new_transfer_shader_key;
       new_transfer_shader_key.dest_msaa_samples = dest_rt_key.msaa_samples;
       new_transfer_shader_key.dest_resource_format = dest_rt_key.resource_format;
+      new_transfer_shader_key.dest_original_resolution = dest_rt_key.original_resolution;
       uint32_t stencil_clear_rectangle_count = 0;
       for (uint32_t j = 0; j <= uint32_t(need_stencil_bit_draws); ++j) {
         // j == 0 - color or depth.
@@ -6614,13 +6801,19 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           RenderTargetKey source_rt_key = source_vulkan_rt.key();
           new_transfer_shader_key.source_msaa_samples = source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format = source_rt_key.resource_format;
+          new_transfer_shader_key.source_original_resolution = source_rt_key.original_resolution;
           bool host_depth_source_is_copy = host_depth_source_vulkan_rt == &dest_vulkan_rt;
+          new_transfer_shader_key.host_depth_source_original_resolution =
+              host_depth_source_vulkan_rt && !host_depth_source_is_copy
+                  ? host_depth_source_vulkan_rt->key().original_resolution
+                  : 0;
           // The host depth copy buffer has only raw samples.
           new_transfer_shader_key.host_depth_source_msaa_samples =
               (host_depth_source_vulkan_rt && !host_depth_source_is_copy)
                   ? host_depth_source_vulkan_rt->key().msaa_samples
                   : xenos::MsaaSamples::k1X;
           if (j) {
+            new_transfer_shader_key.host_depth_source_original_resolution = 0;
             new_transfer_shader_key.mode = source_rt_key.is_depth
                                                ? TransferMode::kDepthToStencilBit
                                                : TransferMode::kColorToStencilBit;
@@ -6717,13 +6910,13 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             const Transfer::Rectangle& stencil_clear_rectangle =
                 transfer_stencil_clear_rectangles[j];
             stencil_clear_rect_write_ptr->rect.offset.x =
-                int32_t(stencil_clear_rectangle.x_pixels * draw_resolution_scale_x());
+                int32_t(stencil_clear_rectangle.x_pixels * GetRenderTargetScaleX(dest_rt_key));
             stencil_clear_rect_write_ptr->rect.offset.y =
-                int32_t(stencil_clear_rectangle.y_pixels * draw_resolution_scale_y());
+                int32_t(stencil_clear_rectangle.y_pixels * GetRenderTargetScaleY(dest_rt_key));
             stencil_clear_rect_write_ptr->rect.extent.width =
-                stencil_clear_rectangle.width_pixels * draw_resolution_scale_x();
+                stencil_clear_rectangle.width_pixels * GetRenderTargetScaleX(dest_rt_key);
             stencil_clear_rect_write_ptr->rect.extent.height =
-                stencil_clear_rectangle.height_pixels * draw_resolution_scale_y();
+                stencil_clear_rectangle.height_pixels * GetRenderTargetScaleY(dest_rt_key);
             stencil_clear_rect_write_ptr->baseArrayLayer = 0;
             stencil_clear_rect_write_ptr->layerCount = 1;
             ++stencil_clear_rect_write_ptr;
@@ -6745,8 +6938,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       transfer_viewport.minDepth = 0.0f;
       transfer_viewport.maxDepth = 1.0f;
       command_processor_.SetViewport(transfer_viewport);
-      float pixels_to_ndc_x = (2.0f / transfer_viewport.width) * float(draw_resolution_scale_x());
-      float pixels_to_ndc_y = (2.0f / transfer_viewport.height) * float(draw_resolution_scale_y());
+      float pixels_to_ndc_x =
+          (2.0f / transfer_viewport.width) * float(GetRenderTargetScaleX(dest_rt_key));
+      float pixels_to_ndc_y =
+          (2.0f / transfer_viewport.height) * float(GetRenderTargetScaleY(dest_rt_key));
       VkRect2D transfer_scissor;
       transfer_scissor.offset.x = 0;
       transfer_scissor.offset.y = 0;
@@ -8581,6 +8776,13 @@ layout(push_constant) uniform XeNativeResolveConstants {
   uint xe_native_resolve_stencil_capture_origin;
   uint xe_native_resolve_stencil_capture_pitch_quads;
   uint xe_native_resolve_memory_base_dwords;
+  uint xe_native_resolve_dest_height;
+  uint xe_native_resolve_dest_slice;
+  float xe_native_resolve_exp_bias;
+  uint xe_native_resolve_sample_select;
+  uint xe_native_resolve_sample_map;
+  uint xe_native_resolve_source_layout;
+  uint xe_native_resolve_destination_packing;
 };
 #if XE_NATIVE_RESOLVE_FLOAT_OUTPUT
 layout(location = 0) out vec4 xe_native_resolve_output_float;
@@ -8614,6 +8816,27 @@ void XeSharedMemoryStore(uint address_dwords, uint value) {
   }
 #endif
 }
+void XeSharedMemoryStoreMasked(uint address_dwords, uint mask, uint value) {
+#if XE_SHARED_MEMORY_BINDING_COUNT_LOG2 == 0
+  atomicAnd(xe_shared_memory[0].data[address_dwords], ~mask);
+  atomicOr(xe_shared_memory[0].data[address_dwords], value & mask);
+#else
+  const uint binding_address_bits = 27u - uint(XE_SHARED_MEMORY_BINDING_COUNT_LOG2);
+  uint binding_address = address_dwords & ((1u << binding_address_bits) - 1u);
+  #define XE_NATIVE_MASKED_STORE(i) \
+    atomicAnd(xe_shared_memory[i].data[binding_address], ~mask); \
+    atomicOr(xe_shared_memory[i].data[binding_address], value & mask)
+  switch (address_dwords >> binding_address_bits) {
+    case 0u: XE_NATIVE_MASKED_STORE(0); break;
+    case 1u: XE_NATIVE_MASKED_STORE(1); break;
+    #if XE_SHARED_MEMORY_BINDING_COUNT_LOG2 >= 2
+    case 2u: XE_NATIVE_MASKED_STORE(2); break;
+    case 3u: XE_NATIVE_MASKED_STORE(3); break;
+    #endif
+  }
+  #undef XE_NATIVE_MASKED_STORE
+#endif
+}
 )";
 
 // Addressing shared with the scaled memory write-back compute shader; uses
@@ -8626,6 +8849,18 @@ int XeTiledOffset2D(int x, int y, uint pitch, uint bytes_per_block_log2) {
   int offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
   return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
          (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+uint XeTiledOffset3D(uvec3 p, uint pitch, uint height, uint size_log2) {
+  uint outer = ((p.y >> 4u) + (p.z >> 2u) * (height >> 4u)) * (pitch >> 5u);
+  uint macro = ((((p.x >> 5u) + outer) << (size_log2 + 6u)) & 0xFFFFFFFu) << 1u;
+  uint micro = ((p.x & 7u) + ((p.y & 6u) << 2u)) << size_log2;
+  uint bank = ((p.y >> 3u) + (p.z >> 2u)) & 1u;
+  uint pipe = bank + ((((p.x >> 3u) + (bank << 1u)) & 3u) << 1u);
+  uint offset = ((macro + (micro & ~15u)) << 1u) + (micro & 15u) +
+                ((p.z & 3u) << (size_log2 + 6u)) + ((p.y & 1u) << 4u);
+  uint address = (bank << 3u) + ((offset >> 6u) & 7u);
+  address = ((address << 3u) + (pipe & ~1u)) << 2u;
+  return ((address + (offset & ~511u)) << 3u) + (offset & 63u);
 }
 uint XeEndianSwap32(uint value, uint endian) {
   if (endian == 1u || endian == 2u) {
@@ -8648,7 +8883,8 @@ uint XeEndianSwap32(uint value, uint endian) {
 // GPUs have no instruction for).
 uint XeNativeResolveScaledOffset(ivec2 host_texel, uint bytes_per_block_log2) {
   uvec2 scale = uvec2(xe_native_resolve_scale & 0xFFu, (xe_native_resolve_scale >> 8u) & 0xFFu);
-  uint group_texels_log2 = 4u - bytes_per_block_log2;
+  uint group_bytes_log2 = bytes_per_block_log2 == 0u ? 3u : 4u;
+  uint group_texels_log2 = group_bytes_log2 - bytes_per_block_log2;
   uvec2 position = uvec2(host_texel);
   uvec2 host_group = uvec2(position.x >> group_texels_log2, position.y);
   uvec2 guest_group, host_group_in_guest_group;
@@ -8665,8 +8901,20 @@ uint XeNativeResolveScaledOffset(ivec2 host_texel, uint bytes_per_block_log2) {
   uint host_group_index = host_group_in_guest_group.x * scale.y + host_group_in_guest_group.y;
   uint guest_offset = uint(XeTiledOffset2D(int(guest_group_origin.x), int(guest_group_origin.y),
                                            xe_native_resolve_dest_pitch, bytes_per_block_log2));
-  return guest_offset * (scale.x * scale.y) + (host_group_index << 4u) +
+  return guest_offset * (scale.x * scale.y) + (host_group_index << group_bytes_log2) +
          ((position.x & ((1u << group_texels_log2) - 1u)) << bytes_per_block_log2);
+}
+uint XeNativeResolveScaledOffset3D(ivec2 texel, uint size_log2, uint height, uint slice) {
+  uvec2 scale = uvec2(xe_native_resolve_scale & 255u, (xe_native_resolve_scale >> 8u) & 255u);
+  uint group_bytes_log2 = size_log2 == 0u ? 3u : 4u;
+  uint group_log2 = group_bytes_log2 - size_log2;
+  uvec2 host_group = uvec2(uint(texel.x) >> group_log2, uint(texel.y));
+  uvec2 guest_group = host_group / scale;
+  uvec2 subpixel = host_group - guest_group * scale;
+  uint tiled = XeTiledOffset3D(uvec3(guest_group.x << group_log2, guest_group.y, slice),
+                               xe_native_resolve_dest_pitch, height, size_log2);
+  return tiled * (scale.x * scale.y) + ((subpixel.x * scale.y + subpixel.y) << group_bytes_log2) +
+         ((uint(texel.x) & ((1u << group_log2) - 1u)) << size_log2);
 }
 )";
 
@@ -8674,30 +8922,60 @@ constexpr char kNativeResolveFragmentShaderFunctions[] = R"(
 bool XeNativeResolveMemoryIs64bpp() {
   return (xe_native_resolve_flags & 64u) != 0u;
 }
-// Dword address in the bound memory of this fragment's texel.
-uint XeNativeResolveMemoryAddress() {
+uint XeNativeResolveMemorySizeLog2() {
+  return (xe_native_resolve_flags & 262144u) != 0u ? (xe_native_resolve_flags >> 15u) & 7u
+                                                 : XeNativeResolveMemoryIs64bpp() ? 3u : 2u;
+}
+// Byte address in the bound memory of this fragment's texel.
+uint XeNativeResolveMemoryByteAddress() {
   ivec2 texel = ivec2(gl_FragCoord.xy);
-  uint bytes_per_block_log2 = XeNativeResolveMemoryIs64bpp() ? 3u : 2u;
+  uint bytes_per_block_log2 = XeNativeResolveMemorySizeLog2();
+  bool array = (xe_native_resolve_flags & 2048u) != 0u;
   if ((xe_native_resolve_flags & 128u) != 0u) {
-    return (XeNativeResolveScaledOffset(texel, bytes_per_block_log2) >> 2u) -
-           xe_native_resolve_memory_base_dwords;
+    uint offset = array ? XeNativeResolveScaledOffset3D(texel, bytes_per_block_log2,
+                                                       xe_native_resolve_dest_height,
+                                                       xe_native_resolve_dest_slice)
+                        : XeNativeResolveScaledOffset(texel, bytes_per_block_log2);
+    return offset - xe_native_resolve_memory_base_dwords * 4u;
   }
-  return xe_native_resolve_dest_base_dwords +
+  if (array)
+    return xe_native_resolve_dest_base_dwords * 4u +
+           (XeTiledOffset3D(uvec3(texel, xe_native_resolve_dest_slice),
+                             xe_native_resolve_dest_pitch, xe_native_resolve_dest_height,
+                             bytes_per_block_log2)) - xe_native_resolve_memory_base_dwords * 4u;
+  return xe_native_resolve_dest_base_dwords * 4u +
          (uint(XeTiledOffset2D(texel.x, texel.y, xe_native_resolve_dest_pitch,
-                               bytes_per_block_log2)) >> 2u) -
-         xe_native_resolve_memory_base_dwords;
+                               bytes_per_block_log2))) -
+         xe_native_resolve_memory_base_dwords * 4u;
 }
 // Stores the fragment's texel where the EDRAM resolve would write it. (Each
 // fragment writing its own texel measured faster than one fragment per 16 bytes
 // writing the whole run.)
-void XeNativeResolveStoreMemory(uvec2 words) {
-  bool is_64bpp = XeNativeResolveMemoryIs64bpp();
-  uint endian = (xe_native_resolve_flags >> 4u) & 3u;
-  uint address = XeNativeResolveMemoryAddress();
-  XeSharedMemoryStore(address, XeEndianSwap32(words.x, endian));
-  if (is_64bpp) {
-    XeSharedMemoryStore(address + 1u, XeEndianSwap32(words.y, endian));
+void XeNativeResolveStoreMemory(uvec4 words) {
+  uint size_log2 = XeNativeResolveMemorySizeLog2();
+  uint endian = ((xe_native_resolve_flags >> 4u) & 3u) |
+                ((xe_native_resolve_flags >> 8u) & 4u);
+  uint byte_address = XeNativeResolveMemoryByteAddress();
+  uint address = byte_address >> 2u;
+  // Extended swaps apply within one destination texel. A 32-bit resolve does
+  // not permute adjacent pixels when given an 8-in-64/128 mode.
+  if (size_log2 < 2u) {
+    uint value = words.x;
+    if (size_log2 == 1u && endian == 1u)
+      value = ((value & 255u) << 8u) | ((value >> 8u) & 255u);
+    uint mask = size_log2 == 1u ? 65535u : 255u;
+    uint shift = (byte_address & 3u) * 8u;
+    XeSharedMemoryStoreMasked(address, mask << shift, (value & mask) << shift);
+  } else {
+    uint word_xor = size_log2 >= 3u && endian == 4u ? 1u : size_log2 == 4u && endian == 5u ? 3u : 0u;
+    uint word_endian = endian < 4u ? endian
+        : (size_log2 >= 3u && endian == 4u) || (size_log2 == 4u && endian == 5u) ? 2u : 0u;
+    for (uint word = 0u; word < (1u << (size_log2 - 2u)); ++word)
+      XeSharedMemoryStore(address + (word ^ word_xor), XeEndianSwap32(words[word], word_endian));
   }
+}
+void XeNativeResolveStoreMemory(uvec2 words) {
+  XeNativeResolveStoreMemory(uvec4(words, 0u, 0u));
 }
 bool XeNativeResolveWritesMemory() {
   return (xe_native_resolve_flags & 8u) != 0u;
@@ -8705,6 +8983,38 @@ bool XeNativeResolveWritesMemory() {
 ivec2 XeNativeResolveSourceCoord() {
   return ivec2(gl_FragCoord.xy) + xe_native_resolve_source_offset;
 }
+ivec2 XeNativeResolveSampleCoord(ivec2 texel, uint sample_index) {
+  ivec2 scale = ivec2(xe_native_resolve_scale & 255u,
+                       (xe_native_resolve_scale >> 8u) & 255u);
+  if ((xe_native_resolve_source_layout & 4u) != 0u) {
+    uint samples = xe_native_resolve_source_layout & 3u;
+    ivec2 grid = ivec2(samples == 2u ? 2 : 1, samples != 0u ? 2 : 1);
+    ivec2 offset = ivec2(samples == 2u ? int(sample_index >> 1u) : 0,
+                          samples != 0u ? int(sample_index & 1u) : 0);
+    texel = ((texel / scale) * grid + offset) * scale + texel % scale;
+  }
+  if ((xe_native_resolve_source_layout & 0x80000000u) != 0u) {
+    uint samples = (xe_native_resolve_source_layout >> 4u) & 3u;
+    uint source_pitch = (xe_native_resolve_source_layout >> 8u) & 65535u;
+    uint tile_width = 80u >> (((xe_native_resolve_source_layout >> 6u) & 1u) + uint(samples == 2u));
+    uint tile_height = 16u >> uint(samples != 0u);
+    uvec2 pixel = uvec2(texel / scale);
+    uint tile = ((pixel.y / tile_height) * source_pitch + pixel.x / tile_width) & 2047u;
+    texel = ivec2(uvec2(tile % source_pitch, tile / source_pitch) * uvec2(tile_width, tile_height)
+                    + pixel % uvec2(tile_width, tile_height)) * scale + texel % scale;
+  }
+  return texel;
+}
+#if XE_NATIVE_RESOLVE_MSAA
+  #define XE_NATIVE_TEXTURE texture2DMS
+  #define XE_NATIVE_UTEXTURE utexture2DMS
+  #define XE_NATIVE_FETCH(s,c,i) texelFetch(s, XeNativeResolveSampleCoord(c,i), \
+      int((xe_native_resolve_sample_map >> ((i) * 2u)) & 3u))
+#else
+  #define XE_NATIVE_TEXTURE texture2D
+  #define XE_NATIVE_UTEXTURE utexture2D
+  #define XE_NATIVE_FETCH(s,c,i) texelFetch(s, XeNativeResolveSampleCoord(c,i), 0)
+#endif
 // Red / blue swap requested by the resolve, 8_8_8_8 and 2_10_10_10 only.
 uint XeNativeResolveSwap(uint bits) {
   if ((xe_native_resolve_flags & 1u) == 0u) {
@@ -8713,14 +9023,147 @@ uint XeNativeResolveSwap(uint bits) {
   if (xe_native_resolve_packing == 0u) {
     return (bits & 0xFF00FF00u) | ((bits & 0xFFu) << 16u) | ((bits >> 16u) & 0xFFu);
   }
-  return (bits & 0xC00FFC00u) | ((bits & 0x3FFu) << 20u) | ((bits >> 20u) & 0x3FFu);
+  return xe_native_resolve_packing == 1u
+      ? (bits & 0xC00FFC00u) | ((bits & 0x3FFu) << 20u) | ((bits >> 20u) & 0x3FFu)
+      : bits;
+}
+)";
+
+constexpr char kNativeResolveColorConversionFunctions[] = R"(
+vec4 XeNativeResolveRead(ivec2 source_coord, uint sample_index);
+bool XeNativeResolveConvertsColor() {
+  return xe_native_resolve_packing >= 6u || xe_native_resolve_exp_bias != 1.0 || xe_native_resolve_sample_select >= 4u ||
+         (xe_native_resolve_flags & 16384u) != 0u;
+}
+uint XeNativeEncode7e3(float value) {
+  uint f = floatBitsToUint(clamp(value, 0.0, 31.875));
+  uint biased = f < 0x3E800000u ? ((f & 0x7FFFFFu) | 0x800000u) >> min(125u - (f >> 23u), 24u)
+                               : f + 0xC2000000u;
+  return ((biased + 0x7FFFu + ((biased >> 16u) & 1u)) >> 16u) & 1023u;
+}
+float XeNativeDecode7e3(uint value) {
+  uint mantissa = value & 127u, exponent = value >> 7u;
+  if (value == 0u) return 0.0;
+  if (exponent == 0u) {
+    uint msb = uint(findMSB(mantissa));
+    return uintBitsToFloat(((msb + 118u) << 23u) | ((mantissa << (23u - msb)) & 0x7FFFFFu));
+  }
+  return uintBitsToFloat(((exponent + 124u) << 23u) | (mantissa << 16u));
+}
+uint XeNativeGammaByte(float value) {
+  float scale = value >= 128.0/1023.0 ? (value >= 512.0/1023.0 ? 1023.0/8.0 : 1023.0/4.0)
+                                     : (value >= 64.0/1023.0 ? 1023.0/2.0 : 1023.0);
+  uint offset = value >= 128.0/1023.0 ? (value >= 512.0/1023.0 ? 128u : 64u)
+                                     : (value >= 64.0/1023.0 ? 32u : 0u);
+  return uint(value * scale) + offset;
+}
+uvec4 XeNativeResolveConvert(ivec2 source_coord) {
+  uint selection = xe_native_resolve_sample_select;
+  uint first_sample = selection < 4u ? selection : selection == 5u ? 2u : 0u;
+  precise vec4 color = XeNativeResolveRead(source_coord, first_sample);
+  precise float factor = xe_native_resolve_exp_bias;
+  if (selection >= 4u) {
+    color += XeNativeResolveRead(source_coord, first_sample + 1u);
+    factor *= 0.5;
+    if (selection == 6u) {
+      color += XeNativeResolveRead(source_coord, 2u);
+      color += XeNativeResolveRead(source_coord, 3u);
+      factor *= 0.5;
+    }
+  }
+  color *= factor;
+  uint format = xe_native_resolve_destination_packing;
+  if ((xe_native_resolve_flags & 1u) != 0u) {
+    if (format >= 10u && format <= 12u) {
+      bool wide = (xe_native_resolve_flags & 8192u) != 0u;
+      uint source = xe_native_resolve_packing;
+      if (wide && (source == 3u || source == 5u)) color.r = color.g;
+      else if (wide || (source != 2u && source != 3u && source != 4u && source != 5u && source != 8u))
+        color.r = color.b;
+    } else color = color.bgra;
+  }
+  if (format <= 1u) {
+    uvec4 c = uvec4(clamp(color, 0.0, 1.0) *
+        (format == 1u ? vec4(1023.0,1023.0,1023.0,3.0) : vec4(255.0)) + 0.5);
+    return format == 1u ? uvec4(c.r | (c.g << 10u) | (c.b << 20u) | (c.a << 30u), 0u, 0u, 0u)
+                        : uvec4(c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u), 0u, 0u, 0u);
+  }
+  if (format < 4u) return uvec4(packHalf2x16(color.rg), packHalf2x16(color.ba), 0u, 0u);
+  if (format < 6u) return uvec4(floatBitsToUint(color.rg), 0u, 0u);
+  if (format <= 7u) {
+    uvec4 c = uvec4(clamp(color, 0.0, 1.0) * (format == 6u ? vec4(2047,2047,1023,0) : vec4(1023,2047,2047,0)) + 0.5);
+    return uvec4(c.r | (c.g << (format == 6u ? 11u : 10u)) | (c.b << (format == 6u ? 22u : 21u)), 0u, 0u, 0u);
+  }
+  if (format == 19u) return uvec4(packHalf2x16(vec2(color.r, 0.0)) & 65535u, 0u, 0u, 0u);
+  if (format == 20u) return floatBitsToUint(color);
+  vec4 maximum = format <= 9u || format == 18u ? vec4(65535.0)
+      : format <= 13u ? vec4(255.0) : format == 14u ? vec4(31,31,31,1)
+      : format == 15u ? vec4(31,63,31,0) : format == 16u ? vec4(31,31,63,0) : vec4(15.0);
+  uvec4 c = uvec4(clamp(color, 0.0, 1.0) * maximum + 0.5);
+  if (format <= 9u) return uvec4(c.r | (c.g << 16u), c.b | (c.a << 16u), 0u, 0u);
+  if (format <= 12u) return uvec4(c.r, 0u, 0u, 0u);
+  if (format == 13u) return uvec4(c.r | (c.g << 8u), 0u, 0u, 0u);
+  if (format == 14u) return uvec4(c.r | (c.g << 5u) | (c.b << 10u) | (c.a << 15u), 0u, 0u, 0u);
+  if (format == 15u) return uvec4(c.r | (c.g << 5u) | (c.b << 11u), 0u, 0u, 0u);
+  if (format == 16u) return uvec4(c.r | (c.g << 5u) | (c.b << 10u), 0u, 0u, 0u);
+  if (format == 17u) return uvec4(c.r | (c.g << 4u) | (c.b << 8u) | (c.a << 12u), 0u, 0u, 0u);
+  return uvec4(c.r, 0u, 0u, 0u);
 }
 )";
 
 constexpr char kNativeResolveColorFloatBody[] = R"(
-layout(set = 0, binding = 0) uniform texture2D xe_native_resolve_source;
-uvec2 XeNativeResolvePack(ivec2 source_coord) {
-  vec4 color = texelFetch(xe_native_resolve_source, source_coord, 0);
+layout(set = 0, binding = 0) uniform XE_NATIVE_TEXTURE xe_native_resolve_source;
+vec4 XeNativeResolveRead(ivec2 source_coord, uint sample_index) {
+  vec4 color = XE_NATIVE_FETCH(xe_native_resolve_source, source_coord, sample_index);
+  if (xe_native_resolve_packing == 6u) {
+    precise vec4 decoded = vec4(uvec4(XeNativeGammaByte(color.r), XeNativeGammaByte(color.g),
+        XeNativeGammaByte(color.b), uint(color.a * 255.0 + 0.5))) * (1.0/255.0);
+    return decoded;
+  }
+  if (xe_native_resolve_packing == 7u)
+    return vec4(XeNativeDecode7e3(XeNativeEncode7e3(color.r)), XeNativeDecode7e3(XeNativeEncode7e3(color.g)),
+                XeNativeDecode7e3(XeNativeEncode7e3(color.b)), float(uint(clamp(color.a, 0.0, 1.0) * 3.0 + 0.5)) * (1.0/3.0));
+  if (xe_native_resolve_packing == 8u) {
+    precise vec4 quantized = roundEven(color * 32767.0);
+    precise vec4 scaled = quantized * (32.0/32767.0);
+    vec4 decoded = max(vec4(-1.0), scaled);
+    if ((xe_native_resolve_flags & 8192u) == 0u) decoded.zw = vec2(0.0);
+    return decoded;
+  }
+  if (xe_native_resolve_packing <= 1u) {
+    vec4 maximum = xe_native_resolve_packing == 1u ? vec4(1023.0,1023.0,1023.0,3.0) : vec4(255.0);
+    precise vec4 quantized = vec4(uvec4(color * maximum + 0.5));
+    precise vec4 decoded = quantized * (xe_native_resolve_packing == 1u
+        ? vec4(1.0/1023.0,1.0/1023.0,1.0/1023.0,1.0/3.0) : vec4(1.0/255.0));
+    return decoded;
+  }
+  if (xe_native_resolve_packing == 2u) {
+    color = vec4(unpackHalf2x16(packHalf2x16(color.rg)), unpackHalf2x16(packHalf2x16(color.ba)));
+  }
+  bool wide = (xe_native_resolve_flags & 8192u) != 0u;
+  if (xe_native_resolve_packing == 3u || !wide) color.zw = vec2(0.0);
+  if (xe_native_resolve_packing == 3u && !wide) color.y = 0.0;
+  return color;
+}
+uvec4 XeNativeResolvePack(ivec2 source_coord) {
+  if (XeNativeResolveConvertsColor()) return XeNativeResolveConvert(source_coord);
+  vec4 color = XE_NATIVE_FETCH(xe_native_resolve_source, source_coord, xe_native_resolve_sample_select);
+  bool biased = xe_native_resolve_exp_bias != 1.0;
+  if (biased) {
+    if (xe_native_resolve_packing == 0u) {
+      precise vec4 quantized = vec4(uvec4(color * 255.0 + 0.5));
+      color = quantized * (1.0 / 255.0);
+    } else if (xe_native_resolve_packing == 1u) {
+      precise vec4 quantized = vec4(uvec4(color * vec4(1023.0,1023.0,1023.0,3.0) + 0.5));
+      color = quantized * vec4(1.0/1023.0,1.0/1023.0,1.0/1023.0,1.0/3.0);
+    } else {
+      if (xe_native_resolve_packing == 3u || (xe_native_resolve_flags & 8192u) == 0u)
+        color.zw = vec2(0.0);
+      if ((xe_native_resolve_flags & 1u) != 0u) color = color.bgra;
+    }
+    color *= xe_native_resolve_exp_bias;
+    if (xe_native_resolve_packing <= 1u) color = clamp(color, 0.0, 1.0);
+  }
   uvec2 bits;
   if (xe_native_resolve_packing == 0u) {
     uvec4 c = uvec4(color * 255.0 + 0.5);
@@ -8734,13 +9177,16 @@ uvec2 XeNativeResolvePack(ivec2 source_coord) {
   } else {
     bits = floatBitsToUint(color.rg);
   }
+  if (!biased && xe_native_resolve_packing == 2u &&
+      (xe_native_resolve_flags & 8193u) == 8193u)
+    bits = (bits & 0xFFFF0000u) | (bits.yx & 0xFFFFu);
   bits.x = XeNativeResolveSwap(bits.x);
-  return bits;
+  return uvec4(bits, 0u, 0u);
 }
 void main() {
   ivec2 source_coord = XeNativeResolveSourceCoord();
-  uvec2 bits = XeNativeResolvePack(source_coord);
-  xe_native_resolve_output = uvec4(bits, 0u, 0u);
+  uvec4 bits = XeNativeResolvePack(source_coord);
+  xe_native_resolve_output = bits;
   if (XeNativeResolveWritesMemory()) {
     XeNativeResolveStoreMemory(bits);
   }
@@ -8752,7 +9198,7 @@ void main() {
 // view would get (the values are exact for the format, so conversion back to
 // it is lossless). The memory gets the same bits as kColorFloat writes.
 constexpr char kNativeResolveColorUnormBody[] = R"(
-layout(set = 0, binding = 0) uniform texture2D xe_native_resolve_source;
+layout(set = 0, binding = 0) uniform XE_NATIVE_TEXTURE xe_native_resolve_source;
 uvec2 XeNativeResolvePack(vec4 color) {
   uvec2 bits;
   if (xe_native_resolve_packing == 0u) {
@@ -8768,7 +9214,7 @@ uvec2 XeNativeResolvePack(vec4 color) {
 }
 void main() {
   ivec2 source_coord = XeNativeResolveSourceCoord();
-  vec4 color = texelFetch(xe_native_resolve_source, source_coord, 0);
+  vec4 color = XE_NATIVE_FETCH(xe_native_resolve_source, source_coord, xe_native_resolve_sample_select);
   // A preceding image copy may store the texture in the source's channel
   // order. Preserve that order for partial draws, independently of memory.
   bool texture_swap = ((xe_native_resolve_flags & 1u) != 0u) !=
@@ -8782,17 +9228,47 @@ void main() {
 
 // Ownership transfer views of float render targets are integer to keep NaNs.
 constexpr char kNativeResolveColorUintBody[] = R"(
-layout(set = 0, binding = 0) uniform utexture2D xe_native_resolve_source;
-uvec2 XeNativeResolvePack(ivec2 source_coord) {
-  uvec4 u = texelFetch(xe_native_resolve_source, source_coord, 0);
+layout(set = 0, binding = 0) uniform XE_NATIVE_UTEXTURE xe_native_resolve_source;
+vec4 XeNativeResolveRead(ivec2 source_coord, uint sample_index) {
+  uvec4 u = XE_NATIVE_FETCH(xe_native_resolve_source, source_coord, sample_index);
+  if (xe_native_resolve_packing == 8u) {
+    precise vec4 scaled = vec4(ivec4(u << 16u) >> 16) * (32.0/32767.0);
+    vec4 decoded = max(vec4(-1.0), scaled);
+    if ((xe_native_resolve_flags & 8192u) == 0u) decoded.zw = vec2(0.0);
+    return decoded;
+  }
+  vec4 color = xe_native_resolve_packing == 4u
+      ? vec4(unpackHalf2x16(u.x | (u.y << 16u)), unpackHalf2x16(u.z | (u.w << 16u)))
+      : uintBitsToFloat(u);
+  bool wide = (xe_native_resolve_flags & 8192u) != 0u;
+  if (xe_native_resolve_packing != 4u || !wide) color.zw = vec2(0.0);
+  if (xe_native_resolve_packing == 5u && !wide) color.y = 0.0;
+  return color;
+}
+uvec4 XeNativeResolvePack(ivec2 source_coord) {
+  if (XeNativeResolveConvertsColor()) return XeNativeResolveConvert(source_coord);
+  uvec4 u = XE_NATIVE_FETCH(xe_native_resolve_source, source_coord, xe_native_resolve_sample_select);
+  bool wide = (xe_native_resolve_flags & 8192u) != 0u;
+  if (xe_native_resolve_exp_bias != 1.0) {
+    vec4 color = xe_native_resolve_packing == 4u
+        ? vec4(unpackHalf2x16(u.x | (u.y << 16u)), unpackHalf2x16(u.z | (u.w << 16u)))
+        : uintBitsToFloat(u);
+    if (xe_native_resolve_packing != 4u || !wide) color.zw = vec2(0.0);
+    if (xe_native_resolve_packing == 5u && !wide) color.y = 0.0;
+    color *= xe_native_resolve_exp_bias;
+    if ((xe_native_resolve_flags & 1u) != 0u) color = color.bgra;
+    return xe_native_resolve_packing == 4u
+        ? uvec4(packHalf2x16(color.rg), packHalf2x16(color.ba), 0u, 0u) : uvec4(floatBitsToUint(color.rg), 0u, 0u);
+  }
+  if (xe_native_resolve_packing == 4u && wide && (xe_native_resolve_flags & 1u) != 0u)
+    u = u.bgra;
   return xe_native_resolve_packing == 4u
-             ? uvec2((u.x & 0xFFFFu) | (u.y << 16u), (u.z & 0xFFFFu) | (u.w << 16u))
-             : u.xy;
+      ? uvec4((u.x & 0xFFFFu) | (u.y << 16u), (u.z & 0xFFFFu) | (u.w << 16u), 0u, 0u) : uvec4(u.xy, 0u, 0u);
 }
 void main() {
   ivec2 source_coord = XeNativeResolveSourceCoord();
-  uvec2 bits = XeNativeResolvePack(source_coord);
-  xe_native_resolve_output = uvec4(bits, 0u, 0u);
+  uvec4 bits = XeNativeResolvePack(source_coord);
+  xe_native_resolve_output = bits;
   if (XeNativeResolveWritesMemory()) {
     XeNativeResolveStoreMemory(bits);
   }
@@ -8803,8 +9279,8 @@ void main() {
 // depth remapped from the guest [0, 2) to [0, 1), or unorm24), followed by
 // loading the resolved k_24_8_FLOAT or k_24_8 texture into R32_SFLOAT.
 constexpr char kNativeResolveDepthBody[] = R"(
-layout(set = 0, binding = 0) uniform texture2D xe_native_resolve_source;
-layout(set = 0, binding = 1) uniform utexture2D xe_native_resolve_stencil;
+layout(set = 0, binding = 0) uniform XE_NATIVE_TEXTURE xe_native_resolve_source;
+layout(set = 0, binding = 1) uniform XE_NATIVE_UTEXTURE xe_native_resolve_stencil;
 uint XeHostDepthTo20e4(uint f32, bool round_to_nearest_even) {
   uint denormal = ((f32 & 0x7FFFFFu) | 0x800000u) >> min(112u - (f32 >> 23u), 24u);
   uint biased = f32 < 0x38000000u ? denormal : f32 - (111u << 23u);
@@ -8827,14 +9303,14 @@ float XeFloat20e4To32(uint f24) {
   return uintBitsToFloat(((exponent + 112u) << 23u) | (mantissa << 3u));
 }
 uint XeNativeResolveDepth24(ivec2 source_coord) {
-  float depth = texelFetch(xe_native_resolve_source, source_coord, 0).r;
+  float depth = XE_NATIVE_FETCH(xe_native_resolve_source, source_coord, xe_native_resolve_sample_select).r;
   if ((xe_native_resolve_flags & 2u) != 0u) {
     return XeHostDepthTo20e4(floatBitsToUint(depth), (xe_native_resolve_flags & 4u) != 0u);
   }
   return uint(roundEven(depth * 16777215.0));
 }
 uvec2 XeNativeResolveMemoryWords(ivec2 source_coord, uint depth24) {
-  uint stencil = texelFetch(xe_native_resolve_stencil, source_coord, 0).r & 0xFFu;
+  uint stencil = XE_NATIVE_FETCH(xe_native_resolve_stencil, source_coord, xe_native_resolve_sample_select).r & 0xFFu;
   return uvec2((depth24 << 8u) | stencil, 0u);
 }
 #if XE_NATIVE_RESOLVE_STENCIL_CAPTURE
@@ -8844,7 +9320,7 @@ uvec2 XeNativeResolveMemoryWords(ivec2 source_coord, uint depth24) {
 // coordinates on the hardware (not required by Vulkan, so checked here, and
 // verified with native_resolve_debug_verify_stencil_capture).
 void XeNativeResolveCaptureStencil(ivec2 source_coord) {
-  uint stencil = texelFetch(xe_native_resolve_stencil, source_coord, 0).r & 0xFFu;
+  uint stencil = XE_NATIVE_FETCH(xe_native_resolve_stencil, source_coord, xe_native_resolve_sample_select).r & 0xFFu;
   uint quad_stencil = subgroupQuadBroadcast(stencil, 0u) |
                       (subgroupQuadBroadcast(stencil, 1u) << 8u) |
                       (subgroupQuadBroadcast(stencil, 2u) << 16u) |
@@ -9081,12 +9557,9 @@ bool VulkanRenderTargetCache::InitializeNativeResolve(uint32_t shared_memory_bin
   };
   native_resolve_vertex_shader_ =
       compile(VK_SHADER_STAGE_VERTEX_BIT, kNativeResolveVertexShaderSource);
-  const char* const fragment_bodies[size_t(NativeResolveShader::kCount)] = {
-      kNativeResolveColorFloatBody,
-      kNativeResolveColorUintBody,
-      kNativeResolveDepthBody,
-      kNativeResolveColorUnormBody,
-      kNativeResolveDepthBody,
+  const char* const fragment_bodies[size_t(NativeResolveShader::kColorFloatMS)] = {
+      kNativeResolveColorFloatBody, kNativeResolveColorUintBody, kNativeResolveDepthBody,
+      kNativeResolveColorUnormBody, kNativeResolveDepthBody,
   };
   uint32_t shared_memory_binding_count_log2 = 0;
   rex::bit_scan_forward(std::max(shared_memory_binding_count, uint32_t(1)),
@@ -9096,18 +9569,23 @@ bool VulkanRenderTargetCache::InitializeNativeResolve(uint32_t shared_memory_bin
                   shared_memory_binding_count_log2);
   bool shaders_created = native_resolve_vertex_shader_ != VK_NULL_HANDLE;
   for (size_t i = 0; i < size_t(NativeResolveShader::kCount); ++i) {
-    std::string fragment_source = std::string(kNativeResolveFragmentShaderHeader) +
-                                  kNativeResolveAddressingFunctions +
-                                  kNativeResolveFragmentShaderFunctions + fragment_bodies[i];
-    const char* float_output_define = (i == size_t(NativeResolveShader::kColorUnorm) ||
-                                       i == size_t(NativeResolveShader::kDepthFloat))
+    size_t base = size_t(GetSingleSampleNativeResolveShader(NativeResolveShader(i)));
+    std::string variant_prefix =
+        fragment_prefix + fmt::format("#define XE_NATIVE_RESOLVE_MSAA {}\n",
+                                      i >= size_t(NativeResolveShader::kColorFloatMS) ? 1 : 0);
+    std::string fragment_source =
+        std::string(kNativeResolveFragmentShaderHeader) + kNativeResolveAddressingFunctions +
+        kNativeResolveFragmentShaderFunctions +
+        (base <= 1 ? kNativeResolveColorConversionFunctions : "") + fragment_bodies[base];
+    const char* float_output_define = (base == size_t(NativeResolveShader::kColorUnorm) ||
+                                       base == size_t(NativeResolveShader::kDepthFloat))
                                           ? "#define XE_NATIVE_RESOLVE_FLOAT_OUTPUT 1\n"
                                           : "";
     if (IsNativeResolveDepthShader(NativeResolveShader(i)) &&
         native_resolve_quad_stencil_capture_) {
       native_resolve_fragment_shaders_[i] =
           compile(VK_SHADER_STAGE_FRAGMENT_BIT,
-                  fragment_prefix +
+                  variant_prefix +
                       "#extension GL_KHR_shader_subgroup_basic : require\n"
                       "#extension GL_KHR_shader_subgroup_quad : require\n"
                       "#define XE_NATIVE_RESOLVE_STENCIL_CAPTURE 1\n" +
@@ -9120,9 +9598,8 @@ bool VulkanRenderTargetCache::InitializeNativeResolve(uint32_t shared_memory_bin
       }
     }
     if (native_resolve_fragment_shaders_[i] == VK_NULL_HANDLE) {
-      native_resolve_fragment_shaders_[i] =
-          compile(VK_SHADER_STAGE_FRAGMENT_BIT, fragment_prefix + float_output_define +
-                                                    fragment_source);
+      native_resolve_fragment_shaders_[i] = compile(
+          VK_SHADER_STAGE_FRAGMENT_BIT, variant_prefix + float_output_define + fragment_source);
     }
     shaders_created &= native_resolve_fragment_shaders_[i] != VK_NULL_HANDLE;
   }
@@ -9691,10 +10168,31 @@ void VulkanRenderTargetCache::WriteBackPendingScaledResolveMemory(
     const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
     const VkDevice device = vulkan_device->device();
-    uint32_t bytes_per_block_log2 =
-        (pending.memory_flags & kNativeResolveFlagMemory64bpp) ? 3 : 2;
+    uint32_t bytes_per_block_log2 = GetNativeResolveMemorySizeLog2(pending.memory_flags);
     uint32_t dest_range_unscaled =
         pending.extent_start + pending.extent_length - pending.dest_base;
+    uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
+    VkDeviceSize compact_size = VkDeviceSize(dest_range_unscaled) * scale_area;
+    NativeResolveBuffer* compact = nullptr;
+    bool gpu_owned = pending.shared_memory != nullptr;
+    if (gpu_owned) {
+      uint32_t page_size = uint32_t(rex::memory::page_size());
+      uint32_t end = pending.extent_start + pending.extent_length;
+      for (uint32_t cursor = pending.extent_start; cursor < end;) {
+        uint32_t next = std::min(end, (cursor & ~(page_size - 1)) + page_size);
+        if (!pending.shared_memory->IsRangeGpuWritten(cursor, next - cursor)) {
+          gpu_owned = false;
+          break;
+        }
+        cursor = next;
+      }
+    }
+    if (REXCVAR_GET(native_resolve_buffers) && REXCVAR_GET(native_resolve_buffer_reads) &&
+        REXCVAR_GET(native_resolve_buffer_lazy_memory) && gpu_owned &&
+        (pending.padding_source || pending.padding_fresh) &&
+        compact_size <= vulkan_device->properties().maxStorageBufferRange) {
+      compact = AcquireNativeResolveBuffer(compact_size);
+    }
     uint64_t dest_base_scaled, dest_range_scaled, dest_use_start_scaled, dest_use_length_scaled;
     VkDescriptorSet memory_descriptor_set = VK_NULL_HANDLE;
     if (texture_cache.GetScaledResolveRange(pending.dest_base, dest_range_unscaled,
@@ -9703,8 +10201,8 @@ void VulkanRenderTargetCache::WriteBackPendingScaledResolveMemory(
         texture_cache.GetScaledResolveRange(pending.extent_start, pending.extent_length,
                                             bytes_per_block_log2, dest_use_start_scaled,
                                             dest_use_length_scaled) &&
-        texture_cache.CommitScaledResolveRange(pending.dest_base, dest_range_unscaled,
-                                               bytes_per_block_log2)) {
+        (compact || texture_cache.CommitScaledResolveRange(pending.dest_base, dest_range_unscaled,
+                                                           bytes_per_block_log2))) {
       memory_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
           VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
     }
@@ -9739,8 +10237,8 @@ void VulkanRenderTargetCache::WriteBackPendingScaledResolveMemory(
       source_image_info.imageView = source_view;
       source_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       VkDescriptorBufferInfo memory_buffer_info;
-      memory_buffer_info.buffer = texture_cache.scaled_resolve_buffer();
-      memory_buffer_info.offset = dest_base_scaled;
+      memory_buffer_info.buffer = compact ? compact->buffer : texture_cache.scaled_resolve_buffer();
+      memory_buffer_info.offset = compact ? 0 : dest_base_scaled;
       memory_buffer_info.range = dest_range_scaled;
       VkDescriptorBufferInfo stencil_buffer_info, stencil_verify_buffer_info;
       if (pending.is_depth) {
@@ -9781,7 +10279,34 @@ void VulkanRenderTargetCache::WriteBackPendingScaledResolveMemory(
       writes[3].pBufferInfo = &stencil_verify_buffer_info;
       dfn.vkUpdateDescriptorSets(device, pending.is_depth ? 4 : 2, writes, 0, nullptr);
 
-      texture_cache.UseScaledResolveBufferForWrite(dest_use_start_scaled, dest_use_length_scaled);
+      if (compact) {
+        VkDeviceSize offset = VkDeviceSize(pending.extent_start - pending.dest_base) * scale_area;
+        VkDeviceSize length = VkDeviceSize(pending.extent_length) * scale_area;
+        if (pending.padding_source) {
+          NativeResolveBuffer& padding = *pending.padding_source;
+          VkDeviceSize source_offset =
+              VkDeviceSize(pending.extent_start - padding.base) * scale_area;
+          padding.last_submission = command_processor_.GetCurrentSubmission();
+          command_processor_.PushBufferMemoryBarrier(
+              padding.buffer, source_offset, length, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+              VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+          command_processor_.SubmitBarriers(true);
+          VkBufferCopy region = {source_offset, offset, length};
+          command_processor_.deferred_command_buffer().CmdVkCopyBuffer(padding.buffer,
+                                                                       compact->buffer, 1, &region);
+        } else {
+          command_processor_.SubmitBarriers(true);
+          command_processor_.deferred_command_buffer().CmdVkFillBuffer(compact->buffer, offset,
+                                                                       length, 0);
+        }
+        command_processor_.PushBufferMemoryBarrier(
+            compact->buffer, offset, length, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+      } else {
+        texture_cache.UseScaledResolveBufferForWrite(dest_use_start_scaled, dest_use_length_scaled);
+      }
       command_processor_.EndRenderPass();
       command_processor_.SubmitBarriers(true);
       DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
@@ -9825,6 +10350,46 @@ void VulkanRenderTargetCache::WriteBackPendingScaledResolveMemory(
       command_buffer.CmdVkPushConstants(pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                         sizeof(constants), &constants);
       command_buffer.CmdVkDispatch((constants.size_x + 7) / 8, (constants.size_y + 7) / 8, 1);
+      if (compact) {
+        auto global_lock = native_resolve_buffers_critical_region_.Acquire();
+        compact->base = pending.dest_base;
+        compact->extent_start = pending.extent_start;
+        compact->extent_length = pending.extent_length;
+        compact->scaled = true;
+        compact->shared_memory = pending.shared_memory;
+        compact->texture_cache = &texture_cache;
+        compact->shared = multi_extent_resolve_bases_.count(pending.dest_base) != 0;
+        compact->padding_fresh = pending.padding_fresh && !compact->shared;
+        compact->resolve_base = pending.dest_base;
+        compact->resolve_pitch = pending.dest_pitch_texels;
+        compact->resolve_flags = pending.memory_flags;
+        compact->x0 = pending.x0;
+        compact->y0 = pending.y0;
+        compact->x1 = pending.x1;
+        compact->y1 = pending.y1;
+        compact->pending_memory = true;
+        // A CPU write can happen while the dispatch is being recorded. Such
+        // a mixed version is kept only for page-aware writeback, never exposed
+        // as a complete native texture source.
+        uint32_t page_size = uint32_t(rex::memory::page_size());
+        uint32_t end = pending.extent_start + pending.extent_length;
+        for (uint32_t cursor = pending.extent_start; cursor < end;) {
+          uint32_t next = std::min(end, (cursor & ~(page_size - 1)) + page_size);
+          if (!pending.shared_memory->IsRangeGpuWritten(cursor, next - cursor)) {
+            gpu_owned = false;
+            break;
+          }
+          cursor = next;
+        }
+        if (gpu_owned) {
+          WatchNativeResolveBuffer(*compact);
+        }
+        static uint64_t materialized = 0;
+        if (++materialized <= 8 || !(materialized & 255)) {
+          REXGPU_INFO("[native-resolve-materialized] {} bytes at {:08X} ({})", compact_size,
+                      pending.extent_start, materialized);
+        }
+      }
       written = true;
     } else if (source_descriptor_index != SIZE_MAX) {
       descriptor_set_pool_sampled_image_->Free(source_descriptor_index);
@@ -9839,8 +10404,9 @@ void VulkanRenderTargetCache::WriteBackPendingScaledResolveMemory(
   DropPendingScaledResolveMemory(pending);
 }
 
-void VulkanRenderTargetCache::PrepareScaledResolveMemoryForResolve(uint32_t start,
-                                                                   uint32_t length) {
+void VulkanRenderTargetCache::PrepareScaledResolveMemoryForResolve(
+    uint32_t start, uint32_t length, const NativeResolvePlan* new_plan,
+    std::shared_ptr<NativeResolveBuffer>& padding_source, bool& padding_fresh) {
   uint64_t end = uint64_t(start) + length;
   for (size_t i = 0; i < pending_scaled_resolve_memory_.size();) {
     PendingScaledResolveMemory& pending = pending_scaled_resolve_memory_[i];
@@ -9849,8 +10415,31 @@ void VulkanRenderTargetCache::PrepareScaledResolveMemoryForResolve(uint32_t star
       ++i;
       continue;
     }
-    if (start <= pending.extent_start && end >= pending_end) {
-      // Replaced entirely by the new resolve.
+    bool replaces_pixels = new_plan && new_plan->dest_base == pending.dest_base &&
+                           new_plan->dest_pitch_texels == pending.dest_pitch_texels &&
+                           new_plan->memory_flags == pending.memory_flags &&
+                           new_plan->x0 <= pending.x0 && new_plan->y0 <= pending.y0 &&
+                           new_plan->x1 >= pending.x1 && new_plan->y1 >= pending.y1;
+    if (replaces_pixels && pending.padding_source) {
+      // The pinned preimage is immutable, but a later CPU write may have
+      // replaced one of its pages. Do not turn that old padding back into a
+      // complete native source when marking the new resolve as GPU-written.
+      uint32_t page_size = uint32_t(rex::memory::page_size());
+      for (uint32_t cursor = pending.extent_start; cursor < pending_end;) {
+        uint32_t next =
+            uint32_t(std::min(pending_end, uint64_t(cursor & ~(page_size - 1)) + page_size));
+        if (!pending.shared_memory->IsRangeGpuWritten(cursor, next - cursor)) {
+          replaces_pixels = false;
+          break;
+        }
+        cursor = next;
+      }
+    }
+    if (start == pending.extent_start && end == pending_end && replaces_pixels) {
+      // The new image replaces the old pixels, but its padding still has the
+      // same preimage. Retain that version without packing either image.
+      padding_source = pending.padding_source;
+      padding_fresh = pending.padding_fresh;
       DropPendingScaledResolveMemory(pending);
     } else {
       WriteBackPendingScaledResolveMemory(pending);
@@ -9883,8 +10472,9 @@ void VulkanRenderTargetCache::FlushAllPendingScaledResolveMemory() {
 bool VulkanRenderTargetCache::CanResolveCopyFree(const NativeResolvePlan& plan,
                                                  VulkanTextureCache& texture_cache) const {
   if (!REXCVAR_GET(native_resolve_copy_free) || REXCVAR_GET(native_resolve_debug_reload) ||
-      plan.shader != NativeResolveShader::kColorUnorm || plan.target_count != 1 ||
-      !plan.targets[0].texture || plan.memory_only || !plan.source || plan.x0 || plan.y0) {
+      plan.shader != NativeResolveShader::kColorUnorm || (plan.source_layout & 0x80000003u) ||
+      plan.target_count != 1 || !plan.targets[0].texture || plan.memory_only || !plan.source ||
+      plan.x0 || plan.y0) {
     return false;
   }
   RenderTargetKey key = plan.source->key();
@@ -10030,7 +10620,18 @@ bool VulkanRenderTargetCache::TryCopyFreeResolveExchange(
       if (pending.texture == texture) {
         uint32_t start = pending.extent_start, length = pending.extent_length;
         FlushPendingScaledResolveMemory(start, length);
+        auto global_lock = native_resolve_buffers_critical_region_.Acquire();
+        NativeResolveBuffer* compact = FindNativeResolveBufferRange(start, length, true);
+        if (compact) {
+          // This invalidation requests a diagnostic texture reload, not a new
+          // memory write. Keep its identical compact version as the source.
+          compact->pending_memory = false;
+        }
         texture_cache.MarkRangeAsResolved(start, length);
+        if (compact) {
+          compact->pending_memory = true;
+          WatchNativeResolveBuffer(*compact);
+        }
         break;
       }
     }
@@ -10071,77 +10672,80 @@ void VulkanRenderTargetCache::RetireFramebuffersOfRenderTarget(RenderTargetKey k
   last_update_framebuffer_ = nullptr;
 }
 
-bool VulkanRenderTargetCache::PrepareNativeResolveAliasSurface(
-    const draw_util::ResolveInfo& resolve_info, uint32_t dump_base,
-    uint32_t dump_row_length_used, uint32_t dump_rows, uint32_t dump_pitch) {
-  if (!REXCVAR_GET(native_resolve_surface_aliases) || resolve_info.IsCopyingDepth() ||
-      native_resolve_rectangles_.size() != 1 || !dump_rows || !dump_pitch) {
-    return false;
-  }
-  const auto& rectangle = native_resolve_rectangles_.front();
-  auto* source = static_cast<VulkanRenderTarget*>(rectangle.render_target);
-  RenderTargetKey source_key = source->key();
-  const auto& edram_info = resolve_info.color_edram_info;
-  // This is a reinterpretation of the same 32-bit samples, not a depth
-  // resolve. Preserve both the depth bits and stencil byte through the native
-  // depth-to-color transfer shader before the ordinary color resolve.
-  if (!source_key.is_depth ||
-      source_key.GetDepthFormat() != xenos::DepthRenderTargetFormat::kD24S8 ||
-      source_key.original_resolution || source_key.msaa_samples != xenos::MsaaSamples::k1X ||
-      source_key.base_tiles != resolve_info.color_original_base ||
-      source_key.GetPitchTiles() != dump_pitch ||
-      rectangle.row_first || rectangle.rows != dump_rows || rectangle.row_first_start ||
-      rectangle.row_last_end != dump_row_length_used ||
-      edram_info.format != uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10) ||
-      resolve_info.copy_dest_info.copy_dest_exp_bias ||
-      !xenos::IsColorResolveFormatBitwiseEquivalent(
-          xenos::ColorRenderTargetFormat(edram_info.format),
-          xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format))) {
-    return false;
-  }
-  uint32_t start = (dump_base - uint32_t(source_key.base_tiles)) & (xenos::kEdramTileCount - 1);
-  uint64_t length = uint64_t(dump_rows - 1) * dump_pitch + dump_row_length_used;
-  if (length > xenos::kEdramTileCount || start + length > xenos::kEdramTileCount) {
-    return false;
-  }
-  RenderTargetKey dest_key = source_key;
-  dest_key.is_depth = 0;
-  dest_key.resource_format = uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10);
-  uint32_t needed_rows = uint32_t((start + length + dump_pitch - 1) / dump_pitch);
+RenderTargetCache::RenderTarget* VulkanRenderTargetCache::PrepareNativeResolveAliasSurface(
+    const draw_util::ResolveInfo& resolve_info, uint32_t dump_base, uint32_t dump_row_length_used,
+    uint32_t dump_rows, uint32_t dump_pitch) {
+  if (!REXCVAR_GET(native_resolve_surface_aliases))
+    return nullptr;
+  NativeResolveOwnershipPlan plan;
+  if (!PlanNativeResolveOwnership(resolve_info, dump_base, dump_row_length_used, dump_rows,
+                                  dump_pitch, plan, true))
+    return nullptr;
+  const auto dest_key = plan.destination;
+  const bool depth = dest_key.is_depth;
+  uint32_t needed_rows = (plan.start + plan.length + dump_pitch - 1) / dump_pitch;
   render_target_create_tile_rows_ = needed_rows;
   auto* dest = static_cast<VulkanRenderTarget*>(GetOrCreateRenderTarget(dest_key));
   render_target_create_tile_rows_ = 0;
-  if (!dest) {
-    return false;
-  }
+  if (!dest)
+    return nullptr;
   EnsureRenderTargetTileRows(dest_key, needed_rows);
-  if (dest->tile_rows() < needed_rows) {
-    return false;
-  }
-
+  if (dest->tile_rows() < needed_rows)
+    return nullptr;
   RenderPassKey pass_key;
-  pass_key.msaa_samples = xenos::MsaaSamples::k1X;
-  pass_key.depth_and_color_used = 0b10;
-  pass_key.color_0_view_format = dest_key.GetColorFormat();
-  pass_key.color_rts_use_transfer_formats = 1;
-  TransferShaderKey shader_key;
-  shader_key.dest_msaa_samples = xenos::MsaaSamples::k1X;
-  shader_key.dest_resource_format = dest_key.resource_format;
-  shader_key.source_msaa_samples = xenos::MsaaSamples::k1X;
-  shader_key.source_resource_format = source_key.resource_format;
-  shader_key.mode = TransferMode::kDepthToColor;
+  pass_key.msaa_samples = dest_key.msaa_samples;
+  if (depth) {
+    pass_key.depth_and_color_used = 0b1;
+    pass_key.depth_format = dest_key.GetDepthFormat();
+  } else {
+    pass_key.depth_and_color_used = 0b10;
+    pass_key.color_0_view_format = dest_key.GetColorFormat();
+    pass_key.color_rts_use_transfer_formats = 1;
+  }
   const RenderTarget* framebuffer_targets[1 + xenos::kMaxColorRenderTargets] = {};
-  framebuffer_targets[1] = dest;
-  // Validate every object before changing ownership. A failed transfer must
-  // leave the reference path able to read the original depth surface.
-  if (!GetTransferPipelines(TransferPipelineKey(pass_key, shader_key)) ||
-      !GetHostRenderTargetsFramebuffer(pass_key, dest_key.pitch_tiles_at_32bpp,
-                                       framebuffer_targets)) {
-    return false;
+  framebuffer_targets[depth ? 0 : 1] = dest;
+  if (!GetHostRenderTargetsFramebuffer(pass_key, dest_key.pitch_tiles_at_32bpp,
+                                       framebuffer_targets))
+    return nullptr;
+  for (const auto& transfer : plan.transfers) {
+    const auto source_key = transfer.source->key();
+    TransferShaderKey shader_key;
+    shader_key.dest_msaa_samples = dest_key.msaa_samples;
+    shader_key.dest_resource_format = dest_key.resource_format;
+    shader_key.source_msaa_samples = source_key.msaa_samples;
+    shader_key.source_resource_format = source_key.resource_format;
+    shader_key.dest_original_resolution = dest_key.original_resolution;
+    shader_key.source_original_resolution = source_key.original_resolution;
+    shader_key.host_depth_source_original_resolution =
+        transfer.host_depth_source ? transfer.host_depth_source->key().original_resolution : 0;
+    if (depth) {
+      shader_key.mode =
+          transfer.host_depth_source
+              ? (source_key.is_depth ? TransferMode::kDepthAndHostDepthToDepth
+                                     : TransferMode::kColorAndHostDepthToDepth)
+              : (source_key.is_depth ? TransferMode::kDepthToDepth : TransferMode::kColorToDepth);
+    } else {
+      shader_key.mode =
+          source_key.is_depth ? TransferMode::kDepthToColor : TransferMode::kColorToColor;
+    }
+    if (transfer.host_depth_source)
+      shader_key.host_depth_source_msaa_samples = transfer.host_depth_source->key().msaa_samples;
+    if (!GetTransferPipelines(TransferPipelineKey(pass_key, shader_key)))
+      return nullptr;
+    if (depth &&
+        !command_processor_.GetVulkanDevice()->extensions().ext_EXT_shader_stencil_export) {
+      shader_key.mode =
+          source_key.is_depth ? TransferMode::kDepthToStencilBit : TransferMode::kColorToStencilBit;
+      shader_key.host_depth_source_msaa_samples = xenos::MsaaSamples::k1X;
+      shader_key.host_depth_source_original_resolution = 0;
+      if (!GetTransferPipelines(TransferPipelineKey(pass_key, shader_key)))
+        return nullptr;
+    }
   }
   command_processor_.EndRenderPass();
-  std::vector<Transfer> transfers;
-  ChangeOwnership(dest_key, start, uint32_t(length), &transfers);
+  // Resolving is a read. Keep the original owners and host depth values;
+  // publishing this decoded view would accumulate format-rounding losses.
+  const auto& transfers = plan.transfers;
   RenderTarget* targets[] = {dest};
   PerformTransfersAndResolveClears(1, targets, &transfers, nullptr, nullptr);
   last_update_framebuffer_ = nullptr;
@@ -10149,9 +10753,10 @@ bool VulkanRenderTargetCache::PrepareNativeResolveAliasSurface(
                                  native_resolve_rectangles_);
   command_processor_.native_gpu_diagnostics().RecordOperation(
       NativeGpuDiagnostics::Operation::kAliasTransfer);
-  REXGPU_INFO("[native-resolve-alias] depth/stencil at {} reinterpreted as color without EDRAM",
-              uint32_t(source_key.base_tiles));
-  return true;
+  static uint64_t alias_count = 0;
+  if (++alias_count <= 8 || !(alias_count & 4095))
+    REXGPU_INFO("[native-resolve-alias] {} native surface reinterpretations", alias_count);
+  return dest;
 }
 
 bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo& resolve_info,
@@ -10160,8 +10765,7 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   plan.target_count = 0;
   plan.source = nullptr;
   plan.memory_only = false;
-  if (!native_resolve_enabled_ || !resolve_info.copy_dest_extent_length ||
-      resolve_info.copy_dest_info.copy_dest_array) {
+  if (!native_resolve_enabled_ || !resolve_info.copy_dest_extent_length) {
     return false;
   }
   if (int32_t ab_frames = REXCVAR_GET(native_resolve_ab_frames); ab_frames > 0) {
@@ -10194,11 +10798,13 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   }
   const draw_util::ResolveEdramInfo& edram_info =
       is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
-  if (edram_info.msaa_samples != xenos::MsaaSamples::k1X) {
+  if (!draw_util::NativeResolveSampleSelectValid(
+          edram_info.msaa_samples, resolve_info.copy_dest_coordinate_info.copy_sample_select,
+          is_depth)) {
     return false;
   }
   uint32_t dest_endian = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
-  if (dest_endian > uint32_t(xenos::Endian::k16in32)) {
+  if (dest_endian > uint32_t(xenos::Endian128::k8in128)) {
     return false;
   }
 
@@ -10208,8 +10814,8 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  native_resolve_rectangles_);
-  PrepareNativeResolveAliasSurface(resolve_info, dump_base, dump_row_length_used, dump_rows,
-                                   dump_pitch);
+  auto* alias_source = PrepareNativeResolveAliasSurface(
+      resolve_info, dump_base, dump_row_length_used, dump_rows, dump_pitch);
   // Diagnostics: why a resolve can't come from a single render target.
   auto log_unplanned = [&](const char* reason) {
     if (!SharedMemory::CensusEnabled()) {
@@ -10234,30 +10840,31 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
                 is_depth ? "depth" : "color", resolve_info.copy_dest_base, reason,
                 owners.empty() ? std::string(" none") : owners);
   };
-  if (native_resolve_rectangles_.size() != 1) {
-    log_unplanned("not exactly one source render target");
+  auto* source = static_cast<VulkanRenderTarget*>(
+      alias_source
+          ? alias_source
+          : FindNativeResolveSource(dump_base, dump_row_length_used, dump_rows, dump_pitch));
+  if (!source) {
+    log_unplanned("source tiles missing or have different owners");
     return false;
   }
-  const ResolveCopyDumpRectangle& rectangle = native_resolve_rectangles_.front();
-  if (rectangle.row_first || rectangle.rows != dump_rows || rectangle.row_first_start ||
-      rectangle.row_last_end != dump_row_length_used) {
-    log_unplanned("source render target covers only part of the rectangle");
-    return false;
-  }
-  auto* source = static_cast<VulkanRenderTarget*>(rectangle.render_target);
   RenderTargetKey source_key = source->key();
   uint32_t original_base =
       is_depth ? resolve_info.depth_original_base : resolve_info.color_original_base;
   if (bool(source_key.is_depth) != is_depth || source_key.base_tiles != original_base ||
-      source_key.msaa_samples != xenos::MsaaSamples::k1X ||
+      source_key.msaa_samples != GetKeyMsaaSamples(edram_info.msaa_samples) ||
       source_key.GetPitchTiles() != edram_info.pitch_tiles) {
     log_unplanned("source render target key differs");
     return false;
   }
 
   NativeResolveShader shader;
+  auto destination_packing = draw_util::GetNativeColorResolvePacking(
+      xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format));
   NativeResolvePacking packing = NativeResolvePacking::kUint32;
-  uint32_t flags = 0;
+  uint32_t flags = resolve_info.copy_dest_info.copy_dest_array ? kNativeResolveFlagMemoryArray : 0u;
+  if (resolve_info.copy_dest_info.copy_dest_exp_bias)
+    flags |= kNativeResolveFlagExpBias;
   if (is_depth) {
     shader = NativeResolveShader::kDepth;
     if (source_key.GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24FS8) {
@@ -10269,13 +10876,12 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   } else {
     auto guest_format = xenos::ColorRenderTargetFormat(edram_info.format);
     xenos::ColorRenderTargetFormat source_format = source_key.GetColorFormat();
-    if (resolve_info.copy_dest_info.copy_dest_exp_bias ||
-        guest_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA ||
-        source_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA ||
-        !xenos::IsColorResolveFormatBitwiseEquivalent(
-            guest_format, xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format))) {
+    if (destination_packing == draw_util::NativeColorResolveDestination::kUnsupported) {
       return false;
     }
+    if (!xenos::IsColorResolveFormatBitwiseEquivalent(
+            source_format, xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format)))
+      flags |= kNativeResolveFlagConvertColor;
     bool source_is_integer = false;
     GetColorOwnershipTransferVulkanFormat(source_format, source_key.msaa_samples,
                                           &source_is_integer);
@@ -10298,17 +10904,39 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
         packing = NativeResolvePacking::k2101010;
         swap_supported = true;
         break;
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+        shader = NativeResolveShader::kColorFloat;
+        packing = NativeResolvePacking::kGamma8888;
+        swap_supported = true;
+        break;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+        shader = NativeResolveShader::kColorFloat;
+        packing = NativeResolvePacking::kFloat7e3;
+        swap_supported = true;
+        break;
+      case xenos::ColorRenderTargetFormat::k_16_16:
+      case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+        shader =
+            source_is_integer ? NativeResolveShader::kColorUint : NativeResolveShader::kColorFloat;
+        packing = NativeResolvePacking::kSint16;
+        swap_supported = true;
+        break;
       case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
       case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
         shader =
             source_is_integer ? NativeResolveShader::kColorUint : NativeResolveShader::kColorFloat;
-        packing = source_is_integer ? NativeResolvePacking::kUint16 : NativeResolvePacking::kFloat16;
+        packing =
+            source_is_integer ? NativeResolvePacking::kUint16 : NativeResolvePacking::kFloat16;
+        swap_supported = true;
         break;
       case xenos::ColorRenderTargetFormat::k_32_FLOAT:
       case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
         shader =
             source_is_integer ? NativeResolveShader::kColorUint : NativeResolveShader::kColorFloat;
-        packing = source_is_integer ? NativeResolvePacking::kUint32 : NativeResolvePacking::kFloat32;
+        packing =
+            source_is_integer ? NativeResolvePacking::kUint32 : NativeResolvePacking::kFloat32;
+        swap_supported = true;
         break;
       default:
         return false;
@@ -10319,6 +10947,8 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
       }
       flags |= kNativeResolveFlagSwapRedBlue;
     }
+    if (xenos::IsColorRenderTargetFormat64bpp(source_format))
+      flags |= kNativeResolveFlagSource64bpp;
   }
 
   uint32_t x0 = resolve_info.rect_x0;
@@ -10326,15 +10956,34 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   uint32_t x1 = x0 + (uint32_t(resolve_info.coordinate_info.width_div_8)
                       << xenos::kResolveAlignmentPixelsLog2);
   uint32_t y1 = y0 + (resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2);
+  uint32_t source_scale_x = GetRenderTargetScaleX(source_key);
+  uint32_t source_scale_y = GetRenderTargetScaleY(source_key);
+  auto source_layout = draw_util::GetNativeResolveSourceLayout(
+      x0, y0, x1 - x0, y1 - y0, source_scale_x, source_scale_y,
+      source_key.GetWidth() * source_scale_x,
+      (source->tile_rows() * xenos::kEdramTileHeightSamples >>
+       uint32_t(source_key.msaa_samples != xenos::MsaaSamples::k1X)) *
+          source_scale_y,
+      edram_info.msaa_samples, source_key.msaa_samples, !is_depth && source_key.Is64bpp(),
+      edram_info.pitch_tiles);
+  if (!source_layout) {
+    log_unplanned("native source image does not cover the folded tile range");
+    return false;
+  }
   uint32_t dest_pitch = uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32)
                         << xenos::kTextureTileWidthHeightLog2;
   // Original resolution render targets resolve to unscaled textures and memory.
   bool scaled = IsDrawResolutionScaled() && !source_key.original_resolution;
   VulkanTextureCache::NativeResolveTarget found[VulkanTextureCache::kMaxNativeResolveTargets];
-  uint32_t found_count = texture_cache.FindNativeResolveTargets(
-      resolve_info.copy_dest_base_raw, dest_pitch,
-      xenos::TextureFormat(resolve_info.copy_dest_info.copy_dest_format),
-      xenos::Endian(dest_endian), scaled, found);
+  uint32_t memory_size_log2 =
+      is_depth ? 2u : draw_util::GetNativeColorResolveSizeLog2(destination_packing);
+  uint32_t found_count =
+      resolve_info.copy_dest_info.copy_dest_array || memory_size_log2 < 2u || memory_size_log2 > 3u
+          ? 0
+          : texture_cache.FindNativeResolveTargets(
+                resolve_info.copy_dest_base_raw, dest_pitch,
+                xenos::TextureFormat(resolve_info.copy_dest_info.copy_dest_format),
+                xenos::Endian(dest_endian), scaled, found);
   bool memory_only_all = memory_only || REXCVAR_GET(native_resolve_debug_memory_only_all);
   // Textures written through a unorm view of their own format
   // (native_resolve_unorm_views) are exact targets only for a float resolve of
@@ -10342,9 +10991,12 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   bool unorm_targets_allowed =
       shader == NativeResolveShader::kColorFloat &&
       (packing == NativeResolvePacking::k8888 || packing == NativeResolvePacking::k2101010) &&
-      !source_key.is_depth;
-  VkFormat source_vulkan_format =
-      unorm_targets_allowed ? GetColorVulkanFormat(source_key.GetColorFormat()) : VK_FORMAT_UNDEFINED;
+      !source_key.is_depth && !resolve_info.copy_dest_info.copy_dest_exp_bias &&
+      !(flags & kNativeResolveFlagConvertColor) &&
+      xenos::IsSingleCopySampleSelected(resolve_info.copy_dest_coordinate_info.copy_sample_select);
+  VkFormat source_vulkan_format = unorm_targets_allowed
+                                      ? GetColorVulkanFormat(source_key.GetColorFormat())
+                                      : VK_FORMAT_UNDEFINED;
   bool any_own_format_target = false;
   for (uint32_t i = 0; i < found_count && !memory_only_all; ++i) {
     if (found[i].width > x0 && found[i].height > y0) {
@@ -10383,7 +11035,10 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
     plan.memory_only = true;
   }
   plan.source = source;
-  plan.shader = shader;
+  plan.shader =
+      source_key.msaa_samples == xenos::MsaaSamples::k1X
+          ? shader
+          : NativeResolveShader(uint32_t(shader) + uint32_t(NativeResolveShader::kColorFloatMS));
   plan.packing = packing;
   plan.flags = flags;
   plan.x0 = x0;
@@ -10392,9 +11047,24 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   plan.y1 = y1;
   plan.dest_base = resolve_info.copy_dest_base_raw & 0x1FFFFFFF;
   plan.dest_pitch_texels = dest_pitch;
-  plan.memory_flags = kNativeResolveFlagWriteMemory |
-                      (dest_endian << kNativeResolveFlagMemoryEndianShift);
-  if (!is_depth && xenos::IsColorRenderTargetFormat64bpp(source_key.GetColorFormat())) {
+  plan.dest_height_texels = uint32_t(resolve_info.copy_dest_coordinate_info.height_aligned_div_32)
+                            << 5;
+  plan.dest_slice = uint32_t(resolve_info.copy_dest_info.copy_dest_slice);
+  plan.exp_bias = std::ldexp(1.0f, int32_t(resolve_info.copy_dest_info.copy_dest_exp_bias));
+  plan.sample_select = uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select);
+  plan.sample_map =
+      edram_info.msaa_samples == xenos::MsaaSamples::k4X
+          ? 0xD8u
+          : draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_attachments_supported_) |
+                (draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_attachments_supported_)
+                 << 2);
+  plan.source_layout = source_layout.packed;
+  plan.destination_packing = is_depth ? 0u : uint32_t(destination_packing);
+  plan.memory_flags =
+      kNativeResolveFlagWriteMemory | ((dest_endian & 3u) << kNativeResolveFlagMemoryEndianShift) |
+      (dest_endian >= 4u ? kNativeResolveFlagMemoryEndianHigh : 0u) |
+      kNativeResolveFlagMemorySizeValid | (memory_size_log2 << kNativeResolveFlagMemorySizeShift);
+  if (memory_size_log2 == 3u) {
     plan.memory_flags |= kNativeResolveFlagMemory64bpp;
   }
   // With draw resolution scaling, the resolved memory is the scaled resolve
@@ -10414,6 +11084,88 @@ bool VulkanRenderTargetCache::PrepareNativeResolve(const draw_util::ResolveInfo&
   return true;
 }
 
+void VulkanRenderTargetCache::CompactNativeResolveBuffers(uint64_t target_bytes) {
+  auto lock = native_resolve_buffers_critical_region_.Acquire();
+  const auto* device = command_processor_.GetVulkanDevice();
+  uint32_t page_size = uint32_t(rex::memory::page_size());
+  size_t count = native_resolve_buffers_.size();
+  for (size_t i = 0; i < count && native_resolve_buffer_bytes_ > target_bytes; ++i) {
+    if (native_resolve_buffers_[i].use_count() != 1)
+      continue;
+    auto old = native_resolve_buffers_[i];
+    if (!old->valid || old->valid_pages.empty())
+      continue;
+    uint32_t live = uint32_t(draw_util::CountPageFlagsSet(old->valid_pages));
+    if (!live || live >= old->valid_pages.size() / 2)
+      continue;
+    uint64_t scale_area =
+        old->scaled ? uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y() : 1;
+    std::vector<std::shared_ptr<NativeResolveBuffer>> parts;
+    uint64_t total_capacity = 0;
+    for (uint32_t page = 0; page < old->valid_pages.size();) {
+      if (!old->valid_pages[page]) {
+        ++page;
+        continue;
+      }
+      uint32_t first = page++;
+      while (page < old->valid_pages.size() && old->valid_pages[page])
+        ++page;
+      auto part = std::make_shared<NativeResolveBuffer>();
+      part->base = part->extent_start = old->extent_start + first * page_size;
+      part->extent_length = (page - first) * page_size;
+      part->capacity =
+          rex::align(VkDeviceSize(part->extent_length) * scale_area, VkDeviceSize(64) << 10);
+      total_capacity += part->capacity;
+      part->scaled = old->scaled;
+      part->shared = true;
+      part->shared_memory = old->shared_memory;
+      part->texture_cache = old->texture_cache;
+      part->pending_memory = old->pending_memory;
+      part->valid_pages.assign(page - first, 1);
+      parts.push_back(std::move(part));
+    }
+    if (total_capacity >= old->capacity / 2)
+      continue;
+    for (const auto& part : parts) {
+      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+              device, part->capacity,
+              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+              ui::vulkan::util::MemoryPurpose::kDeviceLocal, part->buffer, part->memory)) {
+        for (const auto& allocated : parts) {
+          if (allocated->buffer)
+            device->functions().vkDestroyBuffer(device->device(), allocated->buffer, nullptr);
+          if (allocated->memory)
+            device->functions().vkFreeMemory(device->device(), allocated->memory, nullptr);
+        }
+        return;  // The original native owner has not changed.
+      }
+    }
+    command_processor_.EndRenderPass();
+    command_processor_.PushBufferMemoryBarrier(
+        old->buffer, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+    command_processor_.SubmitBarriers(true);
+    old->last_submission = command_processor_.GetCurrentSubmission();
+    for (const auto& part : parts) {
+      VkBufferCopy region = {VkDeviceSize(part->extent_start - old->base) * scale_area, 0,
+                             VkDeviceSize(part->extent_length) * scale_area};
+      command_processor_.deferred_command_buffer().CmdVkCopyBuffer(old->buffer, part->buffer, 1,
+                                                                   &region);
+      part->last_submission = command_processor_.GetCurrentSubmission();
+      part->valid = true;
+      native_resolve_buffers_.push_back(part);
+      native_resolve_buffer_bytes_ += part->capacity;
+    }
+    old->valid = old->pending_memory = false;
+    std::fill(old->valid_pages.begin(), old->valid_pages.end(), 0);
+    if (++native_resolve_compactions_ <= 8 || !(native_resolve_compactions_ & 255))
+      REXGPU_INFO("[native-buffer-compact] {} bytes retain {} live bytes in {} native resources",
+                  old->capacity, uint64_t(live) * page_size * scale_area, parts.size());
+  }
+}
+
 VulkanRenderTargetCache::NativeResolveBuffer* VulkanRenderTargetCache::AcquireNativeResolveBuffer(
     VkDeviceSize size) {
   uint64_t completed = command_processor_.GetCompletedSubmission();
@@ -10423,8 +11175,8 @@ VulkanRenderTargetCache::NativeResolveBuffer* VulkanRenderTargetCache::AcquireNa
     // Buffers are immutable while a submission can still read or write them.
     // Reuse a completed buffer, preferring an invalid one and the closest size.
     for (const auto& candidate : native_resolve_buffers_) {
-      if (candidate->last_submission > completed || candidate->capacity < size ||
-          candidate->pending_memory) {
+      if (candidate.use_count() > 1 || candidate->last_submission > completed ||
+          candidate->capacity < size || IsNativeResolveBufferLive(*candidate)) {
         continue;
       }
       if (!result || (result->valid && !candidate->valid) ||
@@ -10439,6 +11191,8 @@ VulkanRenderTargetCache::NativeResolveBuffer* VulkanRenderTargetCache::AcquireNa
       }
       result->valid = false;
       result->shared = false;
+      result->padding_fresh = false;
+      result->valid_pages.clear();
       result->last_submission = command_processor_.GetCurrentSubmission();
     }
   }
@@ -10454,20 +11208,74 @@ VulkanRenderTargetCache::NativeResolveBuffer* VulkanRenderTargetCache::AcquireNa
   // set of targets has to fit at any resolution scale.
   uint64_t limit = (uint64_t(std::clamp(REXCVAR_GET(native_resolve_buffer_mb), 1, 512)) << 20) *
                    (uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y());
+  // Diagnostic: why buffers over the target are retained, once a second.
+  static const bool log_retained = std::getenv("REX_NATIVE_RESOLVE_BUFFER_LOG") != nullptr;
+  if (log_retained && native_resolve_buffer_bytes_ > limit) {
+    static uint64_t last_log = 0;
+    uint64_t now = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+    if (now - last_log > 1000000000ull) {
+      last_log = now;
+      auto lock = native_resolve_buffers_critical_region_.Acquire();
+      uint32_t counts[8] = {};
+      std::map<uint32_t, uint32_t> live_extents;
+      for (const auto& buffer : native_resolve_buffers_) {
+        ++counts[0];
+        counts[1] += buffer->valid;
+        counts[2] += buffer->pending_memory;
+        counts[3] += buffer->scaled;
+        counts[4] += buffer.use_count() > 1;
+        counts[5] += buffer->last_submission > completed;
+        bool live = IsNativeResolveBufferLive(*buffer);
+        counts[6] += live;
+        counts[7] += live && !buffer->valid;
+        if (live)
+          ++live_extents[buffer->extent_start];
+      }
+      REXGPU_INFO(
+          "[native-resolve-buffers] {} MiB over the {} MiB target in {} buffers: {} valid, {} "
+          "pending memory, {} scaled, {} referenced, {} in flight, {} live ({} of them invalid), "
+          "{} live extents",
+          native_resolve_buffer_bytes_ >> 20, limit >> 20, counts[0], counts[1], counts[2],
+          counts[3], counts[4], counts[5], counts[6], counts[7], live_extents.size());
+      size_t shown = 0;
+      for (const auto& [start, count] : live_extents) {
+        if (shown++ >= 6)
+          break;
+        REXGPU_INFO("[native-resolve-buffers]   {:08X}: {} live buffers", start, count);
+      }
+    }
+  }
   if (capacity > limit || native_resolve_buffer_bytes_ > limit - capacity ||
       native_resolve_buffers_.size() >= 512) {
-    static uint32_t logged = 0;
-    if (logged < 8) {
-      ++logged;
-      REXGPU_WARN(
-          "Native resolve buffers: {} MB in {} buffers, no room for {} MB more (limit {} MB) - "
-          "the resolve uses the guest memory mirror",
-          native_resolve_buffer_bytes_ >> 20, native_resolve_buffers_.size(), capacity >> 20,
-          limit >> 20);
+    CompactNativeResolveBuffers(capacity < limit ? limit - capacity : 0);
+    auto lock = native_resolve_buffers_critical_region_.Acquire();
+    const auto* device = command_processor_.GetVulkanDevice();
+    std::erase_if(native_resolve_buffers_, [&](const auto& old) {
+      if (old.use_count() != 1 || old->last_submission > completed ||
+          IsNativeResolveBufferLive(*old))
+        return false;
+      if (old->watch)
+        old->shared_memory->UnwatchMemoryRange(old->watch);
+      device->functions().vkDestroyBuffer(device->device(), old->buffer, nullptr);
+      device->functions().vkFreeMemory(device->device(), old->memory, nullptr);
+      native_resolve_buffer_bytes_ -= old->capacity;
+      return true;
+    });
+    // A cache target cannot discard the only copy of live GPU-written data.
+    // Retain it above the target until native page versions can be reclaimed.
+    // Up to twice the target, though: past that, refuse, and the caller takes
+    // the general path, rather than growing until GPU memory runs out.
+    if (native_resolve_buffer_bytes_ + capacity > limit * 2) {
+      static uint64_t refused = 0;
+      if (++refused <= 8 || !(refused & 1023)) {
+        REXGPU_WARN("[native-resolve-buffers] {} MiB live, over twice the {} MiB target: "
+                    "resolving through the general path ({})",
+                    native_resolve_buffer_bytes_ >> 20, limit >> 20, refused);
+      }
+      return nullptr;
     }
-    return nullptr;
   }
-  auto allocation = std::make_unique<NativeResolveBuffer>();
+  auto allocation = std::make_shared<NativeResolveBuffer>();
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
           command_processor_.GetVulkanDevice(), capacity,
           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -10483,13 +11291,33 @@ VulkanRenderTargetCache::NativeResolveBuffer* VulkanRenderTargetCache::AcquireNa
   return result;
 }
 
+bool VulkanRenderTargetCache::IsNativeResolveBufferLive(const NativeResolveBuffer& buffer) const {
+  // Also retain native owners whose bytes were materialized for a diagnostic
+  // read. Materializing a version does not retire its resource-local owner.
+  if (buffer.pending_memory)
+    return true;
+  if (!buffer.valid || !buffer.shared_memory)
+    return false;
+  if (buffer.scaled)
+    return true;
+  if (buffer.valid_pages.empty())
+    return buffer.shared_memory->IsRangeGpuWritten(buffer.extent_start, buffer.extent_length);
+  return buffer.shared_memory->IsAnyGpuWrittenPage(buffer.extent_start, buffer.valid_pages);
+}
+
 void VulkanRenderTargetCache::ClearNativeResolveBuffers() {
   // Shutdown and cache clear have already waited for all queue operations.
-  auto allocations = std::move(native_resolve_buffers_);
-  native_resolve_buffer_bytes_ = 0;
-  multi_extent_resolve_bases_.clear();
+  std::vector<std::shared_ptr<NativeResolveBuffer>> allocations;
   {
     auto global_lock = native_resolve_buffers_critical_region_.Acquire();
+    if (native_resolve_page_watch_) {
+      native_resolve_page_shared_memory_->UnregisterGlobalWatch(native_resolve_page_watch_);
+      native_resolve_page_watch_ = nullptr;
+      native_resolve_page_shared_memory_ = nullptr;
+    }
+    allocations = std::move(native_resolve_buffers_);
+    native_resolve_buffer_bytes_ = 0;
+    multi_extent_resolve_bases_.clear();
     for (const auto& allocation : allocations) {
       if (allocation->watch) {
         allocation->shared_memory->UnwatchMemoryRange(allocation->watch);
@@ -10504,6 +11332,20 @@ void VulkanRenderTargetCache::ClearNativeResolveBuffers() {
                                                nullptr);
     vulkan_device->functions().vkFreeMemory(vulkan_device->device(), allocation->memory, nullptr);
   }
+}
+
+bool VulkanRenderTargetCache::IsNativeResolveBufferRangeValid(const NativeResolveBuffer& buffer,
+                                                              uint32_t address,
+                                                              uint32_t length) const {
+  if (!buffer.valid)
+    return false;
+  if (buffer.valid_pages.empty())
+    return true;
+  uint32_t page_size = uint32_t(rex::memory::page_size());
+  uint32_t first = (address - buffer.extent_start) / page_size;
+  uint32_t last = (address + length - 1 - buffer.extent_start) / page_size;
+  return draw_util::AllPageFlagsSet(
+      std::span<const uint8_t>(buffer.valid_pages).subspan(first, last + 1 - first));
 }
 
 VulkanRenderTargetCache::NativeResolveBuffer* VulkanRenderTargetCache::FindNativeResolveBufferRange(
@@ -10521,6 +11363,8 @@ VulkanRenderTargetCache::NativeResolveBuffer* VulkanRenderTargetCache::FindNativ
         uint64_t(address) + length > uint64_t(allocation.extent_start) + allocation.extent_length) {
       continue;
     }
+    if (!IsNativeResolveBufferRangeValid(allocation, address, length))
+      continue;
     VkDeviceSize offset = VkDeviceSize(address - allocation.base) * scale_area;
     if (!(offset %
           command_processor_.GetVulkanDevice()->properties().minStorageBufferOffsetAlignment)) {
@@ -10540,20 +11384,45 @@ bool VulkanRenderTargetCache::GetComposedNativeResolveSources(
     return false;
   }
   uint64_t end = uint64_t(address) + length;
-  std::vector<NativeResolveBuffer*> buffers;
+  std::vector<ComposedSource> buffers;
   for (const auto& candidate : native_resolve_buffers_) {
     if (candidate->valid && candidate->scaled == scaled && candidate->extent_start < end &&
         address < uint64_t(candidate->extent_start) + candidate->extent_length) {
-      buffers.push_back(candidate.get());
+      if (candidate->valid_pages.empty()) {
+        buffers.push_back({candidate.get(), candidate->extent_start, candidate->extent_length});
+      } else {
+        uint32_t page_size = uint32_t(rex::memory::page_size());
+        // A small input may intersect a much larger retained allocation. Only
+        // inspect the pages it can actually use, including partial edge pages.
+        uint32_t page_first =
+            (std::max(address, candidate->extent_start) - candidate->extent_start) / page_size;
+        uint32_t page_end =
+            uint32_t((std::min(end, uint64_t(candidate->extent_start) + candidate->extent_length) -
+                      candidate->extent_start + page_size - 1) /
+                     page_size);
+        for (uint32_t page = page_first; page < page_end;) {
+          if (!candidate->valid_pages[page]) {
+            ++page;
+            continue;
+          }
+          uint32_t first = page++;
+          while (page < page_end && candidate->valid_pages[page])
+            ++page;
+          uint64_t first_byte =
+              std::max(uint64_t(address), uint64_t(candidate->extent_start) + first * page_size);
+          uint64_t end_byte = std::min(end, uint64_t(candidate->extent_start) + page * page_size);
+          if (first_byte < end_byte)
+            buffers.push_back(
+                {candidate.get(), uint32_t(first_byte), uint32_t(end_byte - first_byte)});
+        }
+      }
     }
   }
   if (buffers.empty()) {
     return false;
   }
   std::sort(buffers.begin(), buffers.end(),
-            [](const NativeResolveBuffer* a, const NativeResolveBuffer* b) {
-              return a->extent_start < b->extent_start;
-            });
+            [](const ComposedSource& a, const ComposedSource& b) { return a.address < b.address; });
   // Between the buffers, only pages without any GPU-written data: those
   // bytes are the guest memory's.
   auto add_gap = [&](uint64_t gap_start, uint64_t gap_end) {
@@ -10567,19 +11436,21 @@ bool VulkanRenderTargetCache::GetComposedNativeResolveSources(
     return true;
   };
   uint64_t cursor = address;
-  for (NativeResolveBuffer* buffer : buffers) {
-    uint64_t buffer_end = uint64_t(buffer->extent_start) + buffer->extent_length;
+  for (const auto& buffer : buffers) {
+    if (cursor >= end)
+      break;
+    uint64_t buffer_end = uint64_t(buffer.address) + buffer.length;
     if (buffer_end <= cursor) {
       continue;
     }
-    if (!add_gap(cursor, std::min(end, uint64_t(buffer->extent_start)))) {
+    if (!add_gap(cursor, std::min(end, uint64_t(buffer.address)))) {
       sources_out.clear();
       return false;
     }
-    uint64_t covered_start = std::max(cursor, uint64_t(buffer->extent_start));
+    uint64_t covered_start = std::max(cursor, uint64_t(buffer.address));
     uint64_t covered_end = std::min(end, buffer_end);
     sources_out.push_back(
-        {buffer, uint32_t(covered_start), uint32_t(covered_end - covered_start)});
+        {buffer.buffer, uint32_t(covered_start), uint32_t(covered_end - covered_start)});
     cursor = covered_end;
   }
   if (!add_gap(cursor, end)) {
@@ -10677,17 +11548,171 @@ bool VulkanRenderTargetCache::ComposeNativeResolveRange(uint32_t address, uint32
   return true;
 }
 
-std::string VulkanRenderTargetCache::DescribeNativeResolveBuffers(uint32_t address,
-                                                                 uint32_t length, bool scaled) {
+bool VulkanRenderTargetCache::SnapshotNativeVertexStreams(std::span<const NativeVertexRange> ranges,
+                                                          uint32_t size,
+                                                          SharedMemory& shared_memory,
+                                                          VkDescriptorBufferInfo& buffer_info,
+                                                          std::span<const uint8_t> index_snapshot) {
+  if (!size || size > command_processor_.GetVulkanDevice()->properties().maxStorageBufferRange ||
+      (size & 3))
+    return false;
+  if (!index_snapshot.empty() && (ranges.empty() || ranges.back().size != index_snapshot.size()))
+    return false;
+  auto global_lock = native_resolve_buffers_critical_region_.Acquire();
+  std::vector<std::vector<ComposedSource>> inputs;
+  inputs.reserve(ranges.size());
+  for (const auto& range : ranges) {
+    if (!range.size || ((range.address | range.size | range.offset) & 3) ||
+        range.address >= SharedMemory::kBufferSize ||
+        range.size > SharedMemory::kBufferSize - range.address || range.offset > size ||
+        range.size > size - range.offset)
+      return false;
+    auto& sources = inputs.emplace_back();
+    if (!index_snapshot.empty() && &range == &ranges.back())
+      continue;
+    if (!shared_memory.IsRangeGpuWritten(range.address, range.size)) {
+      sources.push_back({nullptr, range.address, range.size});
+    } else if (!GetComposedNativeResolveSources(range.address, range.size, false, shared_memory,
+                                                sources)) {
+      return false;
+    }
+    for (const auto& source : sources) {
+      if (source.buffer)
+        source.buffer->last_submission = command_processor_.GetCurrentSubmission();
+    }
+  }
+  auto* snapshot = AcquireNativeResolveBuffer(size);
+  if (!snapshot)
+    return false;
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    if (!index_snapshot.empty() && i + 1 == ranges.size()) {
+      if (!UploadGuestMemoryToBuffer(ranges[i].address, ranges[i].size, snapshot->buffer,
+                                     ranges[i].offset, index_snapshot.data()))
+        return false;
+      continue;
+    }
+    if (!RecordComposedNativeResolveRange(inputs[i], ranges[i].address, false, shared_memory,
+                                          snapshot->buffer, ranges[i].offset))
+      return false;
+  }
+  command_processor_.PushBufferMemoryBarrier(
+      snapshot->buffer, 0, size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+  buffer_info = {snapshot->buffer, 0, size};
+  return true;
+}
+
+bool VulkanRenderTargetCache::PrepareNativeMemExport(uint32_t address, uint32_t length,
+                                                     VulkanSharedMemory& shared_memory,
+                                                     VulkanTextureCache& texture_cache,
+                                                     VkDescriptorBufferInfo& buffer_info,
+                                                     uint32_t index_snapshot_address,
+                                                     std::span<const uint8_t> index_snapshot) {
+  uint32_t mask = uint32_t(rex::memory::page_size()) - 1;
+  if (!REXCVAR_GET(native_resolve_buffers) || !REXCVAR_GET(native_resolve_buffer_reads) ||
+      !REXCVAR_GET(native_resolve_buffer_lazy_memory) || !length ||
+      address >= SharedMemory::kBufferSize || length > SharedMemory::kBufferSize - address)
+    return false;
+  uint32_t first = address & ~mask;
+  uint32_t size = ((address + length + mask) & ~mask) - first;
+  if (size > (128u << 20))
+    return false;
+  if (!index_snapshot.empty() &&
+      (((index_snapshot_address | uint32_t(index_snapshot.size())) & 3u) ||
+       index_snapshot_address < first || index_snapshot_address - first >= size ||
+       index_snapshot.size() > size - (index_snapshot_address - first)))
+    return false;
+  auto global_lock = native_resolve_buffers_critical_region_.Acquire();
+  std::vector<ComposedSource> sources;
+  if (!shared_memory.IsRangeGpuWritten(first, size)) {
+    sources.push_back({nullptr, first, size});
+  } else if (!GetComposedNativeResolveSources(first, size, false, shared_memory, sources)) {
+    return false;
+  }
+  for (const auto& source : sources)
+    if (source.buffer)
+      source.buffer->last_submission = command_processor_.GetCurrentSubmission();
+  auto* output = AcquireNativeResolveBuffer(size);
+  if (!output ||
+      !RecordComposedNativeResolveRange(sources, first, false, shared_memory, output->buffer, 0))
+    return false;
+  if (!index_snapshot.empty()) {
+    // Bounds were proved from these frozen indices. Do not reload a newer CPU
+    // stream into the buffer the expanded vertex or compute shader will read.
+    command_processor_.PushBufferMemoryBarrier(
+        output->buffer, index_snapshot_address - first, index_snapshot.size(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, false);
+    command_processor_.SubmitBarriers(true);
+    if (!UploadGuestMemoryToBuffer(index_snapshot_address, uint32_t(index_snapshot.size()),
+                                   output->buffer, index_snapshot_address - first,
+                                   index_snapshot.data()))
+      return false;
+  }
+  output->base = output->extent_start = first;
+  output->extent_length = size;
+  output->scaled = false;
+  output->shared = true;
+  output->shared_memory = &shared_memory;
+  output->texture_cache = &texture_cache;
+  output->valid_pages.assign(size / uint32_t(rex::memory::page_size()), 0);
+  if (!EnsureNativeResolvePageWatch(shared_memory))
+    return false;
+  command_processor_.PushBufferMemoryBarrier(
+      output->buffer, 0, size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+  buffer_info = {output->buffer, 0, size};
+  return true;
+}
+
+bool VulkanRenderTargetCache::PublishNativeMemExport(
+    VkBuffer buffer, std::span<const draw_util::MemExportRange> ranges) {
+  auto global_lock = native_resolve_buffers_critical_region_.Acquire();
+  auto found = std::find_if(native_resolve_buffers_.begin(), native_resolve_buffers_.end(),
+                            [&](const auto& candidate) { return candidate->buffer == buffer; });
+  if (found == native_resolve_buffers_.end() || ranges.empty())
+    return false;
+  auto& output = **found;
+  for (const auto& range : ranges) {
+    uint64_t address = uint64_t(range.base_address_dwords) << 2;
+    if (!range.size_bytes || address < output.extent_start ||
+        address - output.extent_start >= output.extent_length ||
+        range.size_bytes > output.extent_length - (address - output.extent_start))
+      return false;
+  }
+  for (const auto& range : ranges)
+    if (!PrepareNativeResolveMemoryForWrite(range.base_address_dwords << 2, range.size_bytes,
+                                            &output, output.extent_start, output.extent_length))
+      return false;
+  // The new buffer already contains each overwritten page's preimage. Keep
+  // earlier per-page owners alive outside the write, and let the GPU write
+  // callback retire their replaced pages without materializing a mirror.
+  const auto* previous_publication = native_memexport_publishing_;
+  native_memexport_publishing_ = &output;
+  for (const auto& range : ranges)
+    output.shared_memory->RangeWrittenByGpu(range.base_address_dwords << 2, range.size_bytes);
+  native_memexport_publishing_ = previous_publication;
+  WatchNativeResolveBuffer(output);
+  output.pending_memory = output.valid;
+  return true;
+}
+
+std::string VulkanRenderTargetCache::DescribeNativeResolveBuffers(uint32_t address, uint32_t length,
+                                                                  bool scaled) {
   std::string description;
   auto global_lock = native_resolve_buffers_critical_region_.Acquire();
   for (const auto& candidate : native_resolve_buffers_) {
     if (candidate->scaled == scaled && candidate->extent_start < uint64_t(address) + length &&
         address < uint64_t(candidate->extent_start) + candidate->extent_length) {
-      description += fmt::format(" [{:08X}+{:X} base {:08X}{}{}]", candidate->extent_start,
-                                 candidate->extent_length, candidate->base,
-                                 candidate->valid ? " valid" : "",
-                                 candidate->pending_memory ? " pending" : "");
+      description +=
+          fmt::format(" [{:08X}+{:X} base {:08X}{}{}]", candidate->extent_start,
+                      candidate->extent_length, candidate->base, candidate->valid ? " valid" : "",
+                      candidate->pending_memory ? " pending" : "");
     }
   }
   return description.empty() ? std::string(" none") : description;
@@ -10762,7 +11787,134 @@ bool VulkanRenderTargetCache::UseNativeResolveBufferRange(uint32_t address, uint
   return true;
 }
 
+bool VulkanRenderTargetCache::EnsureNativeResolvePageWatch(VulkanSharedMemory& shared_memory) {
+  if (!native_resolve_page_watch_) {
+    native_resolve_page_shared_memory_ = &shared_memory;
+    native_resolve_page_watch_ = shared_memory.RegisterGlobalWatch(
+        [](const std::unique_lock<std::recursive_mutex>&, void* context, uint32_t first,
+           uint32_t last, bool invalidated_by_gpu) {
+          auto& cache = *static_cast<VulkanRenderTargetCache*>(context);
+          auto lock = cache.native_resolve_buffers_critical_region_.Acquire();
+          if (invalidated_by_gpu && cache.native_resolve_clearing_cache_)
+            return;
+          uint32_t page_size = uint32_t(rex::memory::page_size());
+          for (const auto& buffer : cache.native_resolve_buffers_) {
+            // Physical CPU writes do not change the separate higher-resolution
+            // resolve store. Preserve it like the existing scaled buffer; GPU
+            // writes still retire the superseded native scaled page versions.
+            if (!invalidated_by_gpu && buffer->scaled)
+              continue;
+            if (buffer->valid_pages.empty() || (!buffer->valid && !buffer->pending_memory) ||
+                last < buffer->extent_start ||
+                first >= uint64_t(buffer->extent_start) + buffer->extent_length)
+              continue;
+            uint32_t begin =
+                (std::max(first, buffer->extent_start) - buffer->extent_start) / page_size;
+            uint32_t end = uint32_t(std::min(uint64_t(last) + 1, uint64_t(buffer->extent_start) +
+                                                                     buffer->extent_length) -
+                                    1 - buffer->extent_start) /
+                               page_size +
+                           1;
+            std::fill(buffer->valid_pages.begin() + begin, buffer->valid_pages.begin() + end, 0);
+            buffer->valid = draw_util::AnyPageFlagSet(buffer->valid_pages);
+            if (buffer->pending_memory) {
+              buffer->pending_memory = buffer->shared_memory->IsAnyGpuWrittenPage(
+                  buffer->extent_start, buffer->valid_pages);
+            }
+          }
+        },
+        this);
+    if (!native_resolve_page_watch_)
+      return false;
+  }
+  return true;
+}
+
+void VulkanRenderTargetCache::RetireNativeResolveVersionsUnder(const NativeResolveBuffer& owner) {
+  // The caller holds the native resolve buffers' critical region. Like a GPU
+  // write over the owner's extent, without firing the shared memory's watches:
+  // the owner's initial copy took every older version's bytes there, so they
+  // are duplicates. Left valid, a scaled duplicate counted as live forever,
+  // and a game resolving a smaller image into the start of a larger one made
+  // a new full-size copy every frame until GPU memory ran out.
+  uint32_t page_size = uint32_t(rex::memory::page_size());
+  uint64_t owner_end = uint64_t(owner.extent_start) + owner.extent_length;
+  for (const auto& buffer : native_resolve_buffers_) {
+    if (buffer.get() == &owner || buffer->scaled != owner.scaled ||
+        buffer->valid_pages.empty() || (!buffer->valid && !buffer->pending_memory) ||
+        buffer->extent_start >= owner_end ||
+        owner.extent_start >= uint64_t(buffer->extent_start) + buffer->extent_length) {
+      continue;
+    }
+    uint64_t buffer_end = uint64_t(buffer->extent_start) + buffer->extent_length;
+    uint32_t begin =
+        (std::max(owner.extent_start, buffer->extent_start) - buffer->extent_start) / page_size;
+    uint32_t end = uint32_t((std::min(owner_end, buffer_end) - buffer->extent_start +
+                             page_size - 1) /
+                            page_size);
+    std::fill(buffer->valid_pages.begin() + begin, buffer->valid_pages.begin() + end, 0);
+    buffer->valid = draw_util::AnyPageFlagSet(buffer->valid_pages);
+    if (buffer->pending_memory) {
+      buffer->pending_memory =
+          buffer->shared_memory->IsAnyGpuWrittenPage(buffer->extent_start, buffer->valid_pages);
+    }
+  }
+}
+
+void VulkanRenderTargetCache::WatchNativeResolveBuffer(NativeResolveBuffer& allocation) {
+  // The caller holds the shared-memory critical region.
+  if (allocation.watch) {
+    allocation.shared_memory->UnwatchMemoryRange(allocation.watch);
+    allocation.watch = nullptr;
+  }
+  // Resource-local resolves own complete tracked pages. A CPU or GPU write
+  // retires only its pages, leaving every untouched native version readable.
+  uint32_t page_size = uint32_t(rex::memory::page_size());
+  if (allocation.valid_pages.empty() &&
+      !((allocation.extent_start | allocation.extent_length) & (page_size - 1)) &&
+      EnsureNativeResolvePageWatch(*allocation.shared_memory))
+    allocation.valid_pages.resize(allocation.extent_length / page_size);
+  if (!allocation.valid_pages.empty()) {
+    if (allocation.scaled) {
+      std::fill(allocation.valid_pages.begin(), allocation.valid_pages.end(), uint8_t(1));
+    } else {
+      [[maybe_unused]] const bool copied = allocation.shared_memory->GetGpuWrittenPages(
+          allocation.extent_start, allocation.valid_pages);
+      assert_true(copied);
+    }
+    allocation.valid = draw_util::AnyPageFlagSet(allocation.valid_pages);
+    return;
+  }
+  allocation.watch = allocation.shared_memory->WatchMemoryRange(
+      allocation.extent_start, allocation.extent_length,
+      [](const std::unique_lock<std::recursive_mutex>&, void* context, void* data, uint64_t,
+         bool invalidated_by_gpu) {
+        auto& buffer = *static_cast<NativeResolveBuffer*>(data);
+        auto& cache = *static_cast<VulkanRenderTargetCache*>(context);
+        if (invalidated_by_gpu && cache.native_resolve_clearing_cache_) {
+          buffer.watch = nullptr;
+          return;
+        }
+        if (SharedMemory::CensusEnabled() && RtDebugLogActive()) {
+          REXGPU_INFO("[rt-debug] native resolve buffer {:08X}+{:X} invalidated by the {}",
+                      buffer.extent_start, buffer.extent_length,
+                      invalidated_by_gpu ? "GPU" : "CPU");
+        }
+        buffer.valid = false;
+        // CPU writes leave other GPU-owned pages pending. GPU writes have
+        // already preserved partially overwritten versions before firing this
+        // watch, so the old pending version can be discarded.
+        if (invalidated_by_gpu) {
+          buffer.pending_memory = false;
+        }
+        buffer.watch = nullptr;
+      },
+      this, &allocation, 0);
+  allocation.valid = allocation.watch != nullptr;
+}
+
 bool VulkanRenderTargetCache::WriteBackNativeResolveBuffer(NativeResolveBuffer& allocation) {
+  auto retained_lock = native_resolve_buffers_critical_region_.Acquire();
   uint32_t address, length, base;
   {
     auto global_lock = native_resolve_buffers_critical_region_.Acquire();
@@ -10775,18 +11927,6 @@ bool VulkanRenderTargetCache::WriteBackNativeResolveBuffer(NativeResolveBuffer& 
   }
   uint64_t scale_area =
       allocation.scaled ? uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y() : 1;
-  VkBuffer mirror;
-  if (allocation.scaled) {
-    if (!allocation.texture_cache->CommitScaledResolveRange(address, length)) {
-      return false;
-    }
-    mirror = allocation.texture_cache->scaled_resolve_buffer();
-  } else {
-    if (!allocation.shared_memory->RequestRange(address, length)) {
-      return false;
-    }
-    mirror = allocation.shared_memory->buffer();
-  }
   std::vector<VkBufferCopy> regions;
   VkDeviceSize copy_bytes = 0;
   {
@@ -10794,19 +11934,21 @@ bool VulkanRenderTargetCache::WriteBackNativeResolveBuffer(NativeResolveBuffer& 
     if (!allocation.pending_memory) {
       return true;
     }
-    if (allocation.valid) {
+    if (allocation.valid && allocation.valid_pages.empty()) {
       regions.push_back({VkDeviceSize(address - base) * scale_area,
                          VkDeviceSize(address) * scale_area, VkDeviceSize(length) * scale_area});
     } else {
       // A CPU write invalidates the direct resource, not every GPU-written
-      // page in it. RequestRange above uploads the changed CPU pages. Preserve
+      // page in it. RequestRange below uploads the changed CPU pages. Preserve
       // only pages still owned by the GPU so the old resolve can't overwrite
       // those uploads, including partially covered first and last pages.
       uint32_t page_size = uint32_t(rex::memory::page_size());
       uint32_t end = address + length;
       for (uint32_t cursor = address; cursor < end;) {
         uint32_t next = std::min(end, (cursor & ~(page_size - 1)) + page_size);
-        if (allocation.shared_memory->IsRangeGpuWritten(cursor, next - cursor)) {
+        bool owned = allocation.valid_pages.empty() ||
+                     allocation.valid_pages[(cursor - allocation.extent_start) / page_size];
+        if (owned && allocation.shared_memory->IsRangeGpuWritten(cursor, next - cursor)) {
           VkDeviceSize destination = VkDeviceSize(cursor) * scale_area;
           VkDeviceSize size = VkDeviceSize(next - cursor) * scale_area;
           if (!regions.empty() && regions.back().dstOffset + regions.back().size == destination) {
@@ -10823,6 +11965,20 @@ bool VulkanRenderTargetCache::WriteBackNativeResolveBuffer(NativeResolveBuffer& 
       return true;
     }
     allocation.last_submission = command_processor_.GetCurrentSubmission();
+  }
+  VkBuffer mirror;
+  if (allocation.scaled) {
+    if (!allocation.texture_cache->CommitScaledResolveRange(address, length)) {
+      allocation.pending_memory = true;
+      return false;
+    }
+    mirror = allocation.texture_cache->scaled_resolve_buffer();
+  } else {
+    if (!allocation.shared_memory->RequestRange(address, length)) {
+      allocation.pending_memory = true;
+      return false;
+    }
+    mirror = allocation.shared_memory->buffer();
   }
   for (const auto& region : regions) {
     copy_bytes += region.size;
@@ -10866,6 +12022,11 @@ bool VulkanRenderTargetCache::FlushNativeResolveMemory(uint32_t address, uint32_
     return true;
   }
   uint64_t end = uint64_t(address) + std::min(length, SharedMemory::kBufferSize - address);
+  if (!scaled && native_memexport_publishing_ &&
+      address >= native_memexport_publishing_->extent_start &&
+      end <= uint64_t(native_memexport_publishing_->extent_start) +
+                 native_memexport_publishing_->extent_length)
+    return true;
   native_resolve_memory_flushing_ = true;
   bool result = true;
   for (const auto& allocation : native_resolve_buffers_) {
@@ -10886,7 +12047,8 @@ bool VulkanRenderTargetCache::FlushNativeResolveMemory(uint32_t address, uint32_
 }
 
 bool VulkanRenderTargetCache::PrepareNativeResolveMemoryForWrite(
-    uint32_t address, uint32_t length, const NativeResolveBuffer* writing_into) {
+    uint32_t address, uint32_t length, const NativeResolveBuffer* writing_into,
+    uint32_t preserved_address, uint32_t preserved_length) {
   if (!REXCVAR_GET(native_resolve_buffer_lazy_memory) || native_resolve_memory_flushing_) {
     return true;
   }
@@ -10894,6 +12056,7 @@ bool VulkanRenderTargetCache::PrepareNativeResolveMemoryForWrite(
   // Fully replaced versions need no mirror copy. Partial overlaps preserve
   // the old version outside this write before its watch is invalidated.
   uint64_t end = uint64_t(address) + length;
+  uint64_t preserved_end = uint64_t(preserved_address) + preserved_length;
   native_resolve_memory_flushing_ = true;
   bool result = true;
   for (const auto& allocation : native_resolve_buffers_) {
@@ -10910,9 +12073,17 @@ bool VulkanRenderTargetCache::PrepareNativeResolveMemoryForWrite(
       if (allocation->pending_memory &&
           address < uint64_t(allocation->extent_start) + allocation->extent_length &&
           allocation->extent_start < end) {
-        if (address <= allocation->extent_start &&
-            end >= uint64_t(allocation->extent_start) + allocation->extent_length) {
+        uint64_t allocation_end = uint64_t(allocation->extent_start) + allocation->extent_length;
+        if ((address <= allocation->extent_start && end >= allocation_end) ||
+            (allocation->valid && preserved_length &&
+             (!writing_into || allocation->scaled == writing_into->scaled) &&
+             preserved_address <= allocation->extent_start && preserved_end >= allocation_end)) {
           allocation->pending_memory = false;
+        } else if (!allocation->valid_pages.empty()) {
+          // Uncopied pages stay with their old owner. A fully preserved version
+          // above can retire even if this draw only rewrites a few of its pages.
+          // Keeping every duplicate pending would exhaust the native pool.
+          continue;
         } else {
           overlaps = true;
         }
@@ -10928,8 +12099,9 @@ bool VulkanRenderTargetCache::PrepareNativeResolveMemoryForWrite(
 }
 
 bool VulkanRenderTargetCache::UploadGuestMemoryToBuffer(uint32_t address, uint32_t length,
-                                                        VkBuffer buffer, VkDeviceSize offset) {
-  const uint8_t* source = memory_.TranslatePhysical<const uint8_t*>(address);
+                                                        VkBuffer buffer, VkDeviceSize offset,
+                                                        const uint8_t* snapshot) {
+  const uint8_t* source = snapshot ? snapshot : memory_.TranslatePhysical<const uint8_t*>(address);
   if (!source) {
     return false;
   }
@@ -10981,14 +12153,41 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
   bool scaled = (plan.memory_flags & kNativeResolveFlagMemoryScaled) != 0;
   uint64_t scale_area =
       scaled ? uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y() : 1;
-  VkDeviceSize buffer_size = (extent_end - plan.dest_base) * scale_area;
+  bool lazy_memory =
+      REXCVAR_GET(native_resolve_buffer_lazy_memory) && REXCVAR_GET(native_resolve_buffer_reads);
+  uint32_t buffer_base = extent_start;
+  if (lazy_memory && REXCVAR_GET(native_resolve_buffer_reuse)) {
+    auto global_lock = native_resolve_buffers_critical_region_.Acquire();
+    // A write may straddle earlier native allocations. Keep their untouched
+    // bytes in the replacement allocation before the write invalidates their
+    // watches, rather than copying them through the global memory mirror.
+    for (const auto& candidate : native_resolve_buffers_) {
+      if (candidate->valid && candidate->scaled == scaled &&
+          candidate->extent_start < uint64_t(resolve_info.copy_dest_extent_start) +
+                                        resolve_info.copy_dest_extent_length &&
+          resolve_info.copy_dest_extent_start <
+              uint64_t(candidate->extent_start) + candidate->extent_length) {
+        extent_start = std::min(extent_start, candidate->extent_start);
+        extent_end =
+            std::max(extent_end, uint64_t(candidate->extent_start) + candidate->extent_length);
+      }
+    }
+    extent_length = uint32_t(extent_end - extent_start);
+    buffer_base = extent_start;
+  }
+  if (lazy_memory) {
+    uint32_t page_mask = uint32_t(rex::memory::page_size()) - 1;
+    extent_start &= ~page_mask;
+    extent_end = (extent_end + page_mask) & ~uint64_t(page_mask);
+    extent_length = uint32_t(extent_end - extent_start);
+    buffer_base = extent_start;
+  }
+  VkDeviceSize buffer_size = (extent_end - buffer_base) * scale_area;
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   if (buffer_size > vulkan_device->properties().maxStorageBufferRange ||
       buffer_size > SharedMemory::kBufferSize / native_resolve_shared_memory_binding_count_) {
     return false;
   }
-  bool lazy_memory =
-      REXCVAR_GET(native_resolve_buffer_lazy_memory) && REXCVAR_GET(native_resolve_buffer_reads);
   VkDescriptorBufferInfo initial_native_info;
   bool native_initial = lazy_memory && UseNativeResolveBufferRange(extent_start, extent_length,
                                                                    initial_native_info, scaled);
@@ -11049,8 +12248,7 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
   VkBuffer mirror;
   if (scaled) {
     if (!native_initial && !fresh_initial && composed_initial.empty() &&
-        !texture_cache.CommitScaledResolveRange(plan.dest_base,
-                                                uint32_t(extent_end - plan.dest_base))) {
+        !texture_cache.CommitScaledResolveRange(buffer_base, uint32_t(extent_end - buffer_base))) {
       return false;
     }
     mirror = texture_cache.scaled_resolve_buffer();
@@ -11073,11 +12271,15 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
   if (lazy_memory && native_initial && REXCVAR_GET(native_resolve_buffer_reuse)) {
     auto global_lock = native_resolve_buffers_critical_region_.Acquire();
     for (const auto& candidate : native_resolve_buffers_) {
-      if (candidate->valid && candidate->buffer == initial_native_info.buffer &&
-          candidate->base == plan.dest_base && candidate->extent_start <= extent_start &&
+      if (candidate.use_count() == 1 && candidate->valid &&
+          (candidate->valid_pages.empty() || draw_util::AllPageFlagsSet(candidate->valid_pages)) &&
+          candidate->buffer == initial_native_info.buffer && candidate->base <= extent_start &&
+          candidate->extent_start <= extent_start &&
           extent_end <= uint64_t(candidate->extent_start) + candidate->extent_length &&
           candidate->scaled == scaled) {
         allocation = candidate.get();
+        buffer_base = candidate->base;
+        buffer_size = (extent_end - buffer_base) * scale_area;
         buffer_extent_start = candidate->extent_start;
         buffer_extent_length = candidate->extent_length;
         break;
@@ -11085,6 +12287,13 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
     }
   }
   bool reusing = allocation != nullptr;
+  bool padding_fresh = scaled && fresh_initial;
+  if (reusing && allocation->padding_fresh && allocation->resolve_base == plan.dest_base &&
+      allocation->resolve_pitch == plan.dest_pitch_texels &&
+      allocation->resolve_flags == plan.memory_flags && plan.x0 <= allocation->x0 &&
+      plan.y0 <= allocation->y0 && plan.x1 >= allocation->x1 && plan.y1 >= allocation->y1) {
+    padding_fresh = true;
+  }
   if (!allocation) {
     allocation = AcquireNativeResolveBuffer(buffer_size);
   }
@@ -11127,7 +12336,7 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
   VkBufferCopy copy_region = {};
   copy_region.srcOffset = VkDeviceSize(extent_start) * scale_area;
-  copy_region.dstOffset = VkDeviceSize(extent_start - plan.dest_base) * scale_area;
+  copy_region.dstOffset = VkDeviceSize(extent_start - buffer_base) * scale_area;
   copy_region.size = VkDeviceSize(extent_length) * scale_area;
   VkBuffer initial_buffer = mirror;
   if (reusing) {
@@ -11137,8 +12346,9 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
     command_processor_.PushBufferMemoryBarrier(
         allocation->buffer, 0, buffer_size, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, false);
   } else if (native_initial) {
     initial_buffer = initial_native_info.buffer;
     copy_region.srcOffset = initial_native_info.offset;
@@ -11188,10 +12398,12 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
     command_processor_.PushBufferMemoryBarrier(
         allocation->buffer, 0, buffer_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, false);
   }
-  if (!PrepareNativeResolveMemoryForWrite(extent_start, extent_length,
-                                          reusing ? allocation : nullptr)) {
+  if (!PrepareNativeResolveMemoryForWrite(
+          resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+          reusing ? allocation : nullptr, extent_start, extent_length)) {
     return false;
   }
   {
@@ -11199,43 +12411,51 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
     // snapshots. A CPU write between the resolve and a texture load must never
     // make that load reuse old GPU bytes.
     auto global_lock = native_resolve_buffers_critical_region_.Acquire();
-    texture_cache.MarkRangeAsResolved(extent_start, extent_length, source_original_resolution);
-    allocation->base = plan.dest_base;
-    allocation->shared = reusing && (allocation->shared || buffer_extent_start != extent_start ||
-                                     buffer_extent_length != extent_length);
+    texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                      resolve_info.copy_dest_extent_length,
+                                      source_original_resolution);
+    allocation->base = buffer_base;
+    // Composing a larger extent also preserves earlier resolves of other
+    // extents. Keep that ownership after the composition: a later resolve of
+    // this exact extent must not switch to texture-only storage and discard
+    // the smaller resolves' backing bytes.
+    bool composed_extents = std::any_of(
+        composed_initial.begin(), composed_initial.end(), [&](const ComposedSource& source) {
+          return source.buffer &&
+                 (source.buffer->shared || source.buffer->extent_start != extent_start ||
+                  source.buffer->extent_length != extent_length);
+        });
+    allocation->shared = composed_extents ||
+                         buffer_extent_start != resolve_info.copy_dest_extent_start ||
+                         buffer_extent_length != resolve_info.copy_dest_extent_length ||
+                         (reusing && (allocation->shared || buffer_extent_start != extent_start ||
+                                      buffer_extent_length != extent_length));
     if (allocation->shared) {
       multi_extent_resolve_bases_.insert(plan.dest_base);
     }
+    allocation->padding_fresh = padding_fresh && !allocation->shared;
+    allocation->resolve_base = plan.dest_base;
+    allocation->resolve_pitch = plan.dest_pitch_texels;
+    allocation->resolve_flags = plan.memory_flags;
+    allocation->x0 = plan.x0;
+    allocation->y0 = plan.y0;
+    allocation->x1 = plan.x1;
+    allocation->y1 = plan.y1;
     allocation->extent_start = buffer_extent_start;
     allocation->extent_length = buffer_extent_length;
     allocation->scaled = scaled;
     allocation->shared_memory = &shared_memory;
     allocation->texture_cache = &texture_cache;
-    allocation->watch = shared_memory.WatchMemoryRange(
-        buffer_extent_start, buffer_extent_length,
-        [](const std::unique_lock<std::recursive_mutex>&, void*, void* data, uint64_t,
-           bool invalidated_by_gpu) {
-          auto& buffer = *static_cast<NativeResolveBuffer*>(data);
-          if (SharedMemory::CensusEnabled() && RtDebugLogActive()) {
-            REXGPU_INFO("[rt-debug] native resolve buffer {:08X}+{:X} invalidated by the {}",
-                        buffer.extent_start, buffer.extent_length,
-                        invalidated_by_gpu ? "GPU" : "CPU");
-          }
-          buffer.valid = false;
-          // A CPU write invalidates direct reads of the whole resource, but
-          // other pages still contain GPU-written data. Keep the pending
-          // writeback so it can preserve those pages alongside new CPU data.
-          // GPU writes already preserve partial overlaps before invalidation.
-          if (invalidated_by_gpu) {
-            buffer.pending_memory = false;
-          }
-          buffer.watch = nullptr;
-        },
-        this, allocation, 0);
-    allocation->valid = allocation->watch != nullptr;
+    WatchNativeResolveBuffer(*allocation);
+    // Started from the newest bytes of its whole extent: earlier versions there
+    // are superseded, even the parts this resolve itself doesn't write.
+    if (!reusing && allocation->valid && !allocation->valid_pages.empty()) {
+      RetireNativeResolveVersionsUnder(*allocation);
+    }
   }
   PerformNativeResolve(texture_cache, plan, true, descriptor_set, VK_NULL_HANDLE,
-                       scaled ? 0 : plan.dest_base >> 2);
+                       scaled ? ((buffer_base >> 2) - (plan.dest_base >> 2)) * uint32_t(scale_area)
+                              : buffer_base >> 2);
 
   {
     auto global_lock = native_resolve_buffers_critical_region_.Acquire();
@@ -11266,8 +12486,7 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
       VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
   if (scaled) {
-    if (!texture_cache.CommitScaledResolveRange(plan.dest_base,
-                                                uint32_t(extent_end - plan.dest_base))) {
+    if (!texture_cache.CommitScaledResolveRange(buffer_base, uint32_t(extent_end - buffer_base))) {
       return false;
     }
     // Possibly only created now.
@@ -11280,7 +12499,7 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
     mirror = shared_memory.buffer();
   }
   command_processor_.SubmitBarriers(true);
-  copy_region.srcOffset = VkDeviceSize(extent_start - plan.dest_base) * scale_area;
+  copy_region.srcOffset = VkDeviceSize(extent_start - buffer_base) * scale_area;
   copy_region.dstOffset = VkDeviceSize(extent_start) * scale_area;
   command_buffer.CmdVkCopyBuffer(allocation->buffer, mirror, 1, &copy_region);
   static uint64_t resolve_buffers = 0;
@@ -11296,7 +12515,8 @@ bool VulkanRenderTargetCache::TryNativeResolveBuffer(const draw_util::ResolveInf
 bool VulkanRenderTargetCache::TryNativeResolveImageCopy(VulkanTextureCache& texture_cache,
                                                         const NativeResolvePlan& plan) {
   if (!REXCVAR_GET(native_resolve_image_copies) || plan.memory_only ||
-      plan.shader != NativeResolveShader::kColorUnorm || plan.x0 || plan.y0 ||
+      plan.shader != NativeResolveShader::kColorUnorm || (plan.source_layout & 0x80000003u) ||
+      plan.x0 >= plan.x1 || plan.y0 >= plan.y1 ||
       (plan.flags & ~kNativeResolveFlagSwapRedBlue)) {
     return false;
   }
@@ -11307,14 +12527,22 @@ bool VulkanRenderTargetCache::TryNativeResolveImageCopy(VulkanTextureCache& text
   }
   VkFormat format = GetColorVulkanFormat(key.GetColorFormat());
   uint32_t source_height = source.tile_rows() * xenos::kEdramTileHeightSamples;
-  // A view swizzle applies to the whole image, so every target must be fully
-  // replaced. Partial resolves keep the draw path and its existing order.
+  // Partial writes retain the untouched pixels. Their image-wide channel
+  // interpretation must already agree; only a full replacement can change it.
+  const bool swapped = (plan.flags & kNativeResolveFlagSwapRedBlue) != 0;
+  std::array<draw_util::NativeResolveImageCopyRegion, VulkanTextureCache::kMaxNativeResolveTargets>
+      regions;
   for (uint32_t i = 0; i < plan.target_count; ++i) {
     const auto& target = plan.targets[i];
-    if (!target.texture || target.format != format || !target.width || !target.height ||
-        target.width > plan.x1 || target.height > plan.y1 || target.width > key.GetWidth() ||
-        target.height > source_height ||
+    if (!target.texture || target.format != format ||
         texture_cache.GetTextureImage(target.texture) == source.image()) {
+      return false;
+    }
+    regions[i] = draw_util::GetNativeResolveImageCopyRegion(
+        plan.x0, plan.y0, plan.x1, plan.y1, target.width, target.height, key.GetWidth(),
+        source_height, GetRenderTargetScaleX(key), GetRenderTargetScaleY(key),
+        texture_cache.IsTextureContentRedBlueSwapped(target.texture), swapped);
+    if (!regions[i]) {
       return false;
     }
   }
@@ -11330,7 +12558,6 @@ bool VulkanRenderTargetCache::TryNativeResolveImageCopy(VulkanTextureCache& text
   }
   command_processor_.SubmitBarriers(true);
   auto& command_buffer = command_processor_.deferred_command_buffer();
-  bool swapped = (plan.flags & kNativeResolveFlagSwapRedBlue) != 0;
   bool debug_reload = REXCVAR_GET(native_resolve_debug_reload);
   for (uint32_t i = 0; i < plan.target_count; ++i) {
     const auto& target = plan.targets[i];
@@ -11338,8 +12565,11 @@ bool VulkanRenderTargetCache::TryNativeResolveImageCopy(VulkanTextureCache& text
     copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy.srcSubresource.layerCount = 1;
     copy.dstSubresource = copy.srcSubresource;
-    copy.extent = {target.width * GetRenderTargetScaleX(key),
-                   target.height * GetRenderTargetScaleY(key), 1};
+    const auto& region = regions[i];
+    copy.srcOffset = {int32_t(region.x), int32_t(region.y), 0};
+    copy.dstOffset = copy.srcOffset;
+    copy.extent = {region.width, region.height, 1};
+    CountNativeSnapshot(kImageCopiesResolve);
     command_buffer.CmdVkCopyImage(source.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                   texture_cache.GetTextureImage(target.texture),
                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
@@ -11430,6 +12660,13 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
   constants.dest_base_dwords = plan.dest_base >> 2;
   constants.dest_pitch_texels = plan.dest_pitch_texels;
   constants.memory_base_dwords = memory_base_dwords;
+  constants.dest_height_texels = plan.dest_height_texels;
+  constants.dest_slice = plan.dest_slice;
+  constants.exp_bias = plan.exp_bias;
+  constants.sample_select = plan.sample_select;
+  constants.sample_map = plan.sample_map;
+  constants.source_layout = plan.source_layout;
+  constants.destination_packing = plan.destination_packing;
   {
     uint32_t scale_x = GetRenderTargetScaleX(source.key());
     uint32_t scale_y = GetRenderTargetScaleY(source.key());
@@ -11487,8 +12724,8 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
                                            uint32_t(rex::countof(descriptor_sets)),
                                            descriptor_sets, 0, nullptr);
     constants.flags = plan.flags;
-    if (plan.shader == NativeResolveShader::kColorUnorm && target.texture &&
-        texture_cache.IsTextureContentRedBlueSwapped(target.texture)) {
+    if (GetSingleSampleNativeResolveShader(plan.shader) == NativeResolveShader::kColorUnorm &&
+        target.texture && texture_cache.IsTextureContentRedBlueSwapped(target.texture)) {
       constants.flags |= kNativeResolveFlagTextureSwapRedBlue;
     }
     if (write_memory && i == 0) {
@@ -11511,7 +12748,7 @@ void VulkanRenderTargetCache::PerformNativeResolve(VulkanTextureCache& texture_c
       if (!debug_reload) {
         texture_cache.EndNativeResolveWrite(plan.targets[i]);
       }
-      if (plan.shader != NativeResolveShader::kColorUnorm) {
+      if (GetSingleSampleNativeResolveShader(plan.shader) != NativeResolveShader::kColorUnorm) {
         texture_cache.ClearTextureContentRedBlueSwapped(plan.targets[i].texture);
       }
       ++written_count;

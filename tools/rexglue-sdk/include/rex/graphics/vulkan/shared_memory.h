@@ -66,6 +66,7 @@ class VulkanSharedMemory : public SharedMemory {
   void InitializeTraceCompleteDownloads();
 
  protected:
+  bool DownloadNativeGpuIndices(uint32_t start, std::span<uint8_t> bytes) override;
   bool FlushGpuWrittenRange(uint32_t start, uint32_t length, bool writing = false) override;
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                         uint32_t length_allocations) override;

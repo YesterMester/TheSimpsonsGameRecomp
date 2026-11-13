@@ -40,6 +40,7 @@ class D3D11RenderTargetCache final : public RenderTargetCache {
                uint32_t& written_length);
   bool ResolveClear(const draw_util::ResolveInfo& resolve);
   bool DumpRenderTargets(uint32_t base, uint32_t row_length, uint32_t rows, uint32_t pitch);
+  bool RestoreEdramSnapshot(const void* snapshot);
   RenderTargetEncoder& encoder() { return encoder_; }
   bool msaa_2x_supported() const { return msaa_2x_supported_; }
   bool gamma_as_unorm16() const { return options_.gamma_as_unorm16; }
@@ -69,12 +70,17 @@ class D3D11RenderTargetCache final : public RenderTargetCache {
   // directly (d3d11_native_resolve_textures).
   struct NativeResolveCopy {
     ID3D11Texture2D* source = nullptr;
+    const RenderTargetSurface* source_surface = nullptr;
     D3D11TextureCache::NativeResolveTarget targets[D3D11TextureCache::kMaxNativeResolveTargets];
     uint32_t target_count = 0;
     uint32_t scale_x = 1;
     uint32_t scale_y = 1;
     bool red_blue_swapped = false;
+    bool alias_transferred = false;
   };
+  RenderTarget* PrepareNativeResolveAlias(const draw_util::ResolveInfo& resolve, uint32_t base,
+                                          uint32_t row_length, uint32_t rows, uint32_t pitch,
+                                          std::vector<ResolveCopyDumpRectangle>& rectangles);
   void PlanNativeResolveCopy(const draw_util::ResolveInfo& resolve, D3D11TextureCache& textures,
                              NativeResolveCopy& copy);
   void PerformNativeResolveCopy(const NativeResolveCopy& copy, D3D11TextureCache& textures);

@@ -44,7 +44,7 @@ layout(set = 1, binding = 0, std140) uniform XeSystemConstants {
 #if XE_RESOLUTION_SCALE > 1
   // Bit per texture fetch constant: the texture is a resolution-scaled
   // resolve.
-  layout(offset = 172) uint xe_textures_resolution_scaled;
+  layout(offset = 28) uint xe_textures_resolution_scaled;
 #endif
   layout(offset = 176) uvec4 xe_texture_swizzled_signs[2];
   layout(offset = 288) vec4 xe_color_exp_bias;

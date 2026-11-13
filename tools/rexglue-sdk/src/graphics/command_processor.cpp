@@ -30,13 +30,26 @@
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/perf/event_trace.h>
+#include <rex/platform/performance_hint.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/native_gpu_coherency.h>
+#include <rex/graphics/native_gpu_sync.h>
+#include <rex/graphics/native_gpu_indirect.h>
+#include <rex/graphics/native_gpu_shader_reference.h>
+#include <rex/graphics/native_gpu_direct.h>
+#include <rex/graphics/native_gpu_presentation.h>
+#include <rex/graphics/native_gpu_program.h>
+#include <rex/graphics/native_gpu_predication.h>
+#include <rex/graphics/native_gpu_ports.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/native_records.h>
+#include <rex/graphics/native_gpu_constants.h>
+#include <rex/graphics/native_gpu_state.h>
 #include <rex/graphics/ring_progress.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
@@ -105,6 +118,8 @@ extern std::atomic<uint64_t> g_stencil_enabled_draws;
 extern std::atomic<uint64_t> g_stencil_write_draws;
 extern std::atomic<uint64_t> g_stencil_nonzero_clears;
 }  // namespace rex::graphics::vulkan
+// Native vertex and index snapshot work (NativeSnapshotStat).
+#include <rex/graphics/vulkan/command_processor.h>
 #endif  // REX_HAS_VULKAN
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
@@ -169,6 +184,9 @@ namespace rex::graphics {
 using namespace rex::graphics::xenos;
 
 namespace {
+// Epoch advances by type 3 opcode, for the gpu_wait_stats log.
+std::atomic<uint32_t> g_epoch_opcodes[256];
+
 // Ring progress written back to guest memory (read pointer and scratch
 // register writebacks), for guest code waiting for the ring to be consumed (see
 // ring_progress.h). The mutex and condition variable are only touched when
@@ -466,6 +484,49 @@ void LogGpuWaitStats(uint32_t interval) {
         double(vulkan::g_stencil_enabled_draws.exchange(0)) / frames,
         double(vulkan::g_stencil_write_draws.exchange(0)) / frames,
         double(vulkan::g_stencil_nonzero_clears.exchange(0)) / frames);
+    uint64_t snapshot[vulkan::kNativeSnapshotStatCount];
+    for (uint32_t i = 0; i < vulkan::kNativeSnapshotStatCount; ++i) {
+      snapshot[i] = vulkan::g_native_snapshot_stats[i].exchange(0);
+    }
+    REXGPU_INFO(
+        "[gpu-wait]   native vertex streams per frame: {:.1f} cache lookups ({:.1f} unchanged, "
+        "{:.1f} changed this frame already, {:.1f} changed, {:.1f} settled, {:.1f} new; {:.1f} "
+        "checked earlier in the epoch), {:.1f} uncached; {:.0f} KiB hashed, {:.0f} KiB copied, "
+        "{:.0f} KiB uploaded | indices: {:.1f} reused, {:.0f} KiB hashed",
+        double(snapshot[0]) / frames, double(snapshot[1]) / frames, double(snapshot[2]) / frames,
+        double(snapshot[3]) / frames, double(snapshot[11]) / frames, double(snapshot[4]) / frames,
+        double(snapshot[12]) / frames, double(snapshot[5]) / frames,
+        double(snapshot[6]) / 1024.0 / frames,
+        double(snapshot[7]) / 1024.0 / frames, double(snapshot[8]) / 1024.0 / frames,
+        double(snapshot[9]) / frames, double(snapshot[10]) / 1024.0 / frames);
+    REXGPU_INFO(
+        "[gpu-wait]   per frame: {:.0f} KiB hashed for streams compared earlier in the frame, "
+        "{:.0f} KiB found unchanged by write tracking ({:.0f} scans, {:.3f} ms); {:.1f} epochs "
+        "({:.1f} after primary packets); image copies: {:.1f} tile rows, {:.1f} surfaces, {:.1f} "
+        "depth snapshots, {:.1f} resolves",
+        double(snapshot[vulkan::kNativeSnapshotRepeatHashedBytes]) / 1024.0 / frames,
+        double(snapshot[vulkan::kNativeSnapshotUnwrittenBytes]) / 1024.0 / frames,
+        double(snapshot[vulkan::kWriteTrackingScans]) / frames,
+        double(snapshot[vulkan::kWriteTrackingScanNs]) / 1e6 / frames,
+        double(snapshot[vulkan::kNativeSnapshotEpochs]) / frames,
+        double(snapshot[vulkan::kNativeSnapshotPrimaryEpochs]) / frames,
+        double(snapshot[vulkan::kImageCopiesTileRows]) / frames,
+        double(snapshot[vulkan::kImageCopiesSurface]) / frames,
+        double(snapshot[vulkan::kImageCopiesDepthSnapshot]) / frames,
+        double(snapshot[vulkan::kImageCopiesResolve]) / frames);
+    std::vector<std::pair<uint32_t, uint32_t>> opcodes;
+    for (uint32_t i = 0; i < 256; ++i) {
+      if (uint32_t count = g_epoch_opcodes[i].exchange(0)) {
+        opcodes.emplace_back(count, i);
+      }
+    }
+    std::sort(opcodes.rbegin(), opcodes.rend());
+    std::string opcode_text;
+    for (size_t i = 0; i < std::min<size_t>(opcodes.size(), 8); ++i) {
+      opcode_text += fmt::format(" 0x{:02X}: {:.1f}", opcodes[i].second,
+                                 double(opcodes[i].first) / frames);
+    }
+    REXGPU_INFO("[gpu-wait]   epoch advances per frame by type 3 opcode:{}", opcode_text);
   }
 #endif  // REX_HAS_VULKAN
 #if REX_HAS_D3D11
@@ -641,11 +702,13 @@ bool CommandProcessor::Initialize() {
   // Direct3D hooks may replace packets with native records from now on.
   native_records::Clear();
   native_records::SetEnabled(true);
+  native_gpu_calls::SetEnabled(true);
 
   return true;
 }
 
 void CommandProcessor::Shutdown() {
+  native_gpu_calls::SetEnabled(false);
   native_records::SetEnabled(false);
   EndTracing();
 
@@ -737,7 +800,7 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
   }
 }
 
-void CommandProcessor::ClearCaches() {}
+void CommandProcessor::ClearCaches() { recent_shaders_ = {}; }
 
 void CommandProcessor::InvalidateGpuMemory() {}
 
@@ -780,6 +843,8 @@ void CommandProcessor::WorkerThreadMain() {
     rex::FatalError("Unable to setup command processor internal state");
     return;
   }
+  // Frames wait for the commands this thread processes.
+  rex::platform::AddPerformanceHintThread();
 
   while (worker_running_) {
     while (!pending_fns_.empty()) {
@@ -964,6 +1029,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      ++guest_progress_epoch_;
       // The Direct3D code's fences.
       NotifyRingProgress();
     }
@@ -1262,6 +1328,10 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
       assert_always();
       break;
     }
+    ++guest_progress_epoch_;
+#if REX_HAS_VULKAN
+    vulkan::CountNativeSnapshot(vulkan::kNativeSnapshotPrimaryEpochs);
+#endif  // REX_HAS_VULKAN
     // Report the progress through the ring after every packet, like the
     // hardware's periodic read pointer writeback, rather than only once the
     // whole batch is done: an indirect buffer's commands have all been parsed
@@ -1475,7 +1545,34 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
       uint32_t opcode = (packet >> 8) & 0x7F;
       ++g_pm4_census.type3_opcodes[opcode];
       g_pm4_census.type3_opcode_dwords[opcode] += packet_dwords;
-      if (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2) {
+      if (packet == native_gpu_sync::kCoherencyHeader || packet == native_gpu_sync::kEventHeader) {
+        const uint32_t writes = packet == native_gpu_sync::kCoherencyHeader ? 3 : 1;
+        g_pm4_census.register_writes += writes;
+        if (g_pm4_replay_depth)
+          g_pm4_census.replay_register_writes += writes;
+      }
+      if (packet == native_gpu_coherency::kHeader) {
+        g_pm4_census.register_writes += 4;
+        if (g_pm4_replay_depth)
+          g_pm4_census.replay_register_writes += 4;
+      }
+      if (native_gpu_state::IsOpcode(opcode)) {
+        native_gpu_state::StateRange range;
+        if (native_gpu_state::DecodeHeader(packet, packet_dwords - 1, range)) {
+          g_pm4_census.register_writes += range.register_count;
+          if (g_pm4_replay_depth)
+            g_pm4_census.replay_register_writes += range.register_count;
+          const uint32_t bucket = range.first_register < 0x4000 ? 1
+                                    : range.first_register < 0x4900 ? 4
+                                    : range.first_register < 0x4A00 ? 5 : 6;
+          g_pm4_census.register_range_writes[bucket] += range.register_count;
+        }
+      }
+      if (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2 ||
+          opcode == native_gpu_direct::kOpcode || opcode == native_gpu_calls::kOpcode ||
+          opcode == native_gpu_calls::kBareDrawOpcode ||
+          opcode == native_gpu_calls::kVerticesDrawOpcode ||
+          opcode == native_gpu_calls::kRangeDrawOpcode) {
         ++g_pm4_census.draws;
         if (g_pm4_replay_depth) {
           ++g_pm4_census.replay_draws;
@@ -1508,7 +1605,86 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   }
 }
 
+namespace {
+struct CommandRoute {
+  NativeGpuDiagnostics::RouteSystem system;
+  bool native;
+};
+
+CommandRoute ClassifyCommandRoute(uint32_t packet) {
+  using System = NativeGpuDiagnostics::RouteSystem;
+  const uint32_t opcode = (packet >> 8) & 0x7F;
+  if (native_gpu_state::IsOpcode(opcode) || opcode == native_gpu_constants::kOpcode ||
+      opcode == native_gpu_predication::kOpcode || opcode == native_gpu_ports::kOpcode)
+    return {System::kStateCommands, true};
+  switch (opcode) {
+    case native_gpu_calls::kOpcode:
+    case native_gpu_calls::kBareDrawOpcode:
+    case native_gpu_calls::kVerticesDrawOpcode:
+    case native_gpu_calls::kRangeDrawOpcode:
+    case native_gpu_direct::kOpcode:
+      return {System::kDrawDispatch, true};
+    case native_gpu_program::kOpcode:
+    case native_gpu_shader_reference::kOpcode:
+      return {System::kShaderCommands, true};
+    case native_gpu_coherency::kOpcode:
+    case native_gpu_sync::kOpcode:
+      return {System::kSynchronization, true};
+    case native_gpu_indirect::kOpcode:
+      return {packet == native_gpu_indirect::kBufferHeader ? System::kSubmission
+                                                           : System::kStateCommands,
+              true};
+    case PM4_DRAW_INDX:
+    case PM4_DRAW_INDX_2:
+      return {System::kDrawDispatch, false};
+    case PM4_IM_LOAD:
+    case PM4_IM_LOAD_IMMEDIATE:
+    case PM4_INVALIDATE_STATE:
+      return {System::kShaderCommands, false};
+    case PM4_WAIT_REG_MEM:
+    case PM4_WAIT_FOR_IDLE:
+    case PM4_REG_TO_MEM:
+    case PM4_MEM_WRITE:
+    case PM4_COND_WRITE:
+    case PM4_EVENT_WRITE:
+    case PM4_EVENT_WRITE_SHD:
+    case PM4_EVENT_WRITE_EXT:
+      return {System::kSynchronization, false};
+    case PM4_INDIRECT_BUFFER:
+    case PM4_INDIRECT_BUFFER_PFD:
+      return {System::kSubmission, false};
+    case PM4_XE_SWAP:
+      return {System::kPresentation, false};
+    case native_gpu_presentation::kOpcode:
+      return {System::kPresentation, true};
+    case PM4_VIZ_QUERY:
+    case PM4_EVENT_WRITE_ZPD:
+      return {System::kQueries, false};
+    case PM4_SET_CONSTANT:
+    case PM4_SET_CONSTANT2:
+    case PM4_LOAD_ALU_CONSTANT:
+    case PM4_SET_SHADER_CONSTANTS:
+    case PM4_REG_RMW:
+    case PM4_SET_BIN_MASK_LO:
+    case PM4_SET_BIN_MASK_HI:
+    case PM4_SET_BIN_SELECT_LO:
+    case PM4_SET_BIN_SELECT_HI:
+    case PM4_SET_BIN_MASK:
+    case PM4_SET_BIN_SELECT:
+    case PM4_CONTEXT_UPDATE:
+      return {System::kStateCommands, false};
+    default:
+      // Includes retained native-record markers: some replay their original
+      // packets. They are not evidence of complete native API conversion.
+      return {System::kOtherCommands, false};
+  }
+}
+}  // namespace
+
 bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
+  NativeGpuDiagnostics::RouteScope route(&native_gpu_diagnostics_,
+                                         NativeGpuDiagnostics::RouteSystem::kStateCommands, false);
+  route.Retained();
   // Type-0 packet.
   // Write count registers in sequence to the registers starting at
   // (base_index << 2).
@@ -1541,6 +1717,7 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
     // ordered writes below.
     WriteRegisterRangeFromRing(reader, base_index, count);
     trace_writer_.WritePacketEnd();
+    route.Finish(true);
     return true;
   }
   for (uint32_t m = 0; m < count; m++) {
@@ -1550,10 +1727,14 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   }
 
   trace_writer_.WritePacketEnd();
+  route.Finish(true);
   return true;
 }
 
 bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet) {
+  NativeGpuDiagnostics::RouteScope route(&native_gpu_diagnostics_,
+                                         NativeGpuDiagnostics::RouteSystem::kStateCommands, false);
+  route.Retained();
   // Type-1 packet.
   // Contains two registers of data. Type-0 should be more common.
   trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 3);
@@ -1564,10 +1745,14 @@ bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t p
   WriteRegister(reg_index_1, reg_data_1);
   WriteRegister(reg_index_2, reg_data_2);
   trace_writer_.WritePacketEnd();
+  route.Finish(true);
   return true;
 }
 
 bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet) {
+  NativeGpuDiagnostics::RouteScope route(&native_gpu_diagnostics_,
+                                         NativeGpuDiagnostics::RouteSystem::kOtherCommands, false);
+  route.Skip();
   // Type-2 packet.
   // No-op. Do nothing.
   trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1);
@@ -1576,6 +1761,15 @@ bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t p
 }
 
 bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet) {
+  const auto classification =
+      native_gpu_diagnostics_.enabled()
+          ? ClassifyCommandRoute(packet)
+          : CommandRoute{NativeGpuDiagnostics::RouteSystem::kOtherCommands, false};
+  NativeGpuDiagnostics::RouteScope route(&native_gpu_diagnostics_, classification.system, false);
+  if (classification.native)
+    route.Native();
+  else
+    route.Retained();
   // Type-3 packet.
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
@@ -1597,17 +1791,333 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   // & 1 == predicate - when set, we do bin check to see if we should execute
   // the packet. Only type 3 packets are affected.
   // We also skip predicated swaps, as they are never valid (probably?).
+  native_gpu_constants::ConstantRange native_constant_range{};
+  native_gpu_state::StateRange native_state_range{};
+  uint32_t native_port_register = 0;
+  if (opcode == native_gpu_presentation::kOpcode &&
+      !native_gpu_presentation::IsValidHeader(packet, count)) {
+    REXGPU_ERROR("Native presentation call has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (opcode == native_gpu_direct::kOpcode && !native_gpu_direct::IsValidHeader(packet, count)) {
+    REXGPU_ERROR("Native direct draw has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (opcode == native_gpu_shader_reference::kOpcode &&
+      !native_gpu_shader_reference::IsValidHeader(packet, count)) {
+    REXGPU_ERROR("Native shader reference has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (opcode == native_gpu_indirect::kOpcode &&
+      !native_gpu_indirect::IsValidHeader(packet, count)) {
+    REXGPU_ERROR("Native indirect call has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (opcode == native_gpu_sync::kOpcode && !native_gpu_sync::IsValidHeader(packet, count)) {
+    REXGPU_ERROR("Native synchronization call has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (opcode == native_gpu_ports::kOpcode &&
+      !native_gpu_ports::DecodeHeader(packet, count, native_port_register)) {
+    REXGPU_ERROR("Native initialization port has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (opcode == native_gpu_predication::kOpcode &&
+      !native_gpu_predication::IsValidHeader(packet, count)) {
+    REXGPU_ERROR("Native conditional state has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (opcode == native_gpu_program::kOpcode && !native_gpu_program::IsValidHeader(packet, count)) {
+    REXGPU_ERROR("Native program call has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (opcode == native_gpu_coherency::kOpcode && packet != native_gpu_coherency::kHeader) {
+    REXGPU_ERROR("Native coherency call has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  // The contained draw is predicated, but its preceding state is not.
+  // Reject a predicated transport rather than skipping that state as a unit.
+  if (opcode == native_gpu_calls::kVerticesDrawOpcode &&
+      ((count != 15 && count != 17) || (packet & 0x80FFu))) {
+    REXGPU_ERROR("Native vertices call has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (opcode == native_gpu_calls::kRangeDrawOpcode &&
+      ((count != 4 && count != 6) || (packet & 0x80FFu))) {
+    REXGPU_ERROR("Native range draw has an invalid header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (opcode == native_gpu_constants::kOpcode &&
+      !native_gpu_constants::DecodeHeader(packet, count, native_constant_range)) {
+    REXGPU_ERROR("Native shader constant call has an invalid range or header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
+  if (native_gpu_state::IsOpcode(opcode) &&
+      !native_gpu_state::DecodeHeader(packet, count, native_state_range)) {
+    REXGPU_ERROR("Native state call has an invalid range or header");
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    trace_writer_.WritePacketEnd();
+    return false;
+  }
   if (packet & 1) {
     bool any_pass = (bin_select_ & bin_mask_) != 0;
-    if (!any_pass || opcode == PM4_XE_SWAP) {
+    if (!any_pass || opcode == PM4_XE_SWAP || opcode == native_gpu_presentation::kOpcode) {
+      if (opcode == native_gpu_predication::kOpcode &&
+          native_gpu_predication::IsStateHeader(packet, count))
+        native_gpu_predication::RecordState(false);
+      if (opcode == native_gpu_shader_reference::kOpcode)
+        native_gpu_shader_reference::RecordSkip();
+      if (opcode == native_gpu_direct::kOpcode)
+        native_gpu_direct::RecordSkip();
       reader->AdvanceRead(count * sizeof(uint32_t));
       trace_writer_.WritePacketEnd();
+      route.Skip();
       return true;
     }
   }
 
   bool result = false;
   switch (opcode) {
+    case native_gpu_direct::kOpcode: {
+      std::array<uint32_t, 4> payload{};
+      for (uint32_t i = 0; i < count; ++i)
+        payload[i] = reader->ReadAndSwap<uint32_t>();
+      native_gpu_direct::Call call;
+      if (!native_gpu_direct::Decode(packet, {payload.data(), count}, call)) {
+        REXGPU_ERROR("Native direct draw has invalid arguments");
+        break;
+      }
+      result = SubmitNativeDrawArguments(call.control, call.index_base, call.index_size,
+                                         "NativeDirectDraw");
+      if (result)
+        native_gpu_direct::RecordCall();
+      break;
+    }
+    case native_gpu_shader_reference::kOpcode: {
+      const uint32_t address_type = reader->ReadAndSwap<uint32_t>();
+      const uint32_t words = reader->ReadAndSwap<uint32_t>();
+      const native_gpu_shader_reference::Call call{address_type, words};
+      if (!native_gpu_shader_reference::Validate(call)) {
+        REXGPU_ERROR("Native shader reference has invalid arguments");
+        break;
+      }
+      result = BindShaderFromMemory(static_cast<xenos::ShaderType>(address_type & 3),
+                                    address_type & ~3u, words);
+      if (result)
+        native_gpu_shader_reference::RecordCall();
+      break;
+    }
+    case native_gpu_ports::kOpcode:
+      // These are repeated port writes, not a sequential register range.
+      // Retain the same per-write callbacks as the original type-0 writer.
+      for (uint32_t i = 0; i < count; ++i)
+        WriteRegister(native_port_register, reader->ReadAndSwap<uint32_t>());
+      native_gpu_ports::RecordCall(count);
+      result = true;
+      break;
+    case native_gpu_predication::kOpcode: {
+      if (native_gpu_predication::IsStateHeader(packet, count)) {
+        const uint32_t operand = reader->ReadAndSwap<uint32_t>();
+        uint32_t first;
+        if (!native_gpu_predication::DecodeRegister(operand, first, count - 1)) {
+          REXGPU_ERROR("Native conditional state has an invalid register");
+          reader->AdvanceRead((count - 1) * sizeof(uint32_t));
+          break;
+        }
+        WriteRegisterRangeFromRing(reader, first, count - 1);
+        native_gpu_predication::RecordState(true);
+      } else {
+        const uint32_t value = reader->ReadAndSwap<uint32_t>();
+        if (packet == native_gpu_predication::kMaskLowHeader)
+          bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | value;
+        else
+          bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) | (uint64_t(value) << 32);
+        native_gpu_predication::RecordMask();
+      }
+      result = true;
+      break;
+    }
+    case native_gpu_program::kOpcode: {
+      if (packet == native_gpu_program::kInvalidateHeader) {
+        // Match INVALIDATE_STATE: backend state is already explicit, but
+        // retain the mask and the boundary in captured/copied command data.
+        /* uint32_t mask = */ reader->ReadAndSwap<uint32_t>();
+        native_gpu_program::RecordInvalidation();
+        result = true;
+        break;
+      }
+      const uint32_t stage = reader->ReadAndSwap<uint32_t>();
+      const uint32_t start_size = reader->ReadAndSwap<uint32_t>();
+      if (!native_gpu_program::ValidateShader(stage, start_size, count)) {
+        REXGPU_ERROR("Native program call has invalid shader arguments");
+        reader->AdvanceRead((count - 2) * sizeof(uint32_t));
+        break;
+      }
+      auto shader = LoadShader(static_cast<xenos::ShaderType>(stage), uint32_t(reader->read_ptr()),
+                               reinterpret_cast<uint32_t*>(reader->read_ptr()), start_size);
+      if (stage == uint32_t(xenos::ShaderType::kVertex))
+        active_vertex_shader_ = shader;
+      else
+        active_pixel_shader_ = shader;
+      reader->AdvanceRead(start_size * sizeof(uint32_t));
+      native_gpu_program::RecordShader();
+      result = true;
+      break;
+    }
+    case native_gpu_indirect::kOpcode: {
+      if (packet == native_gpu_indirect::kBufferHeader) {
+        const native_gpu_indirect::BufferCall call{reader->ReadAndSwap<uint32_t>(),
+                                                  reader->ReadAndSwap<uint32_t>()};
+        if (!native_gpu_indirect::ValidateBuffer(call)) {
+          REXGPU_ERROR("Native command buffer has invalid arguments");
+          break;
+        }
+        ExecuteIndirectBuffer(GpuToCpu(CpuToGpu(call.address)), call.count);
+        native_gpu_indirect::RecordBufferCall(call.count);
+        result = true;
+        break;
+      }
+      const uint32_t address = reader->ReadAndSwap<uint32_t>();
+      const uint32_t index = reader->ReadAndSwap<uint32_t>();
+      const uint32_t words = reader->ReadAndSwap<uint32_t>();
+      if (packet == native_gpu_indirect::kTypedHeader) {
+        native_gpu_indirect::TypedRange range;
+        if (!native_gpu_indirect::DecodeTyped({address, index, words}, range)) {
+          REXGPU_ERROR("Native typed constants have invalid arguments");
+          break;
+        }
+        trace_writer_.WriteMemoryRead(CpuToGpu(range.address), range.count * 4);
+        WriteRegistersFromMem(range.first_register,
+                              memory_->TranslatePhysical<uint32_t*>(range.address), range.count);
+        native_gpu_indirect::RecordTypedCall(range.count);
+        result = true;
+        break;
+      }
+      const native_gpu_indirect::Call call{address, index, words};
+      if (!native_gpu_indirect::Validate(call)) {
+        REXGPU_ERROR("Native indirect constants have invalid arguments");
+        break;
+      }
+      trace_writer_.WriteMemoryRead(CpuToGpu(address), words * 4);
+      WriteALURangeFromMem(index, memory_->TranslatePhysical<uint32_t*>(address), words);
+      native_gpu_indirect::RecordCall(words);
+      result = true;
+      break;
+    }
+    case native_gpu_sync::kOpcode: {
+      if (packet == native_gpu_sync::kEventHeader) {
+        const uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+        const uint32_t address = reader->ReadAndSwap<uint32_t>();
+        const uint32_t value = reader->ReadAndSwap<uint32_t>();
+        WriteShaderEvent(initiator, address, value);
+        // The completion value is observable by the guest; later queued
+        // resource reads must not reuse a pre-completion cache epoch.
+        ++guest_progress_epoch_;
+        g_epoch_opcodes[opcode].fetch_add(1, std::memory_order_relaxed);
+        native_gpu_sync::RecordEvent();
+        result = true;
+      } else {
+        std::array<uint32_t, 10> payload;
+        for (auto& word : payload)
+          word = reader->ReadAndSwap<uint32_t>();
+        native_gpu_sync::Coherency call;
+        if (!native_gpu_sync::Decode(payload, call)) {
+          REXGPU_ERROR("Native synchronization call has invalid arguments");
+          break;
+        }
+        WriteRegister(XE_GPU_REG_COHER_STATUS_HOST, call.status);
+        WriteRegister(XE_GPU_REG_COHER_SIZE_HOST, call.size);
+        WriteRegister(XE_GPU_REG_COHER_BASE_HOST, call.base);
+        result = WaitRegisterOrMemory(3, XE_GPU_REG_COHER_STATUS_HOST, 0, 0x80000000u, 8);
+        if (result)
+          native_gpu_sync::RecordCoherency();
+      }
+      break;
+    }
+    case native_gpu_coherency::kOpcode: {
+      std::array<uint32_t, 12> payload;
+      for (auto& word : payload)
+        word = reader->ReadAndSwap<uint32_t>();
+      native_gpu_coherency::Call call;
+      if (!native_gpu_coherency::Decode(payload, call)) {
+        REXGPU_ERROR("Native coherency call has invalid arguments");
+        break;
+      }
+      WriteRegister(XE_GPU_REG_COHER_DEST_BASE_1, call.destination_base);
+      WriteRegister(XE_GPU_REG_COHER_STATUS_HOST, call.status);
+      WriteRegister(XE_GPU_REG_COHER_SIZE_HOST, call.size);
+      WriteRegister(XE_GPU_REG_COHER_BASE_HOST, call.base);
+      result = WaitRegisterOrMemory(3, XE_GPU_REG_COHER_STATUS_HOST, 0, 0x80000000u, 8);
+      if (result)
+        native_gpu_coherency::RecordCall();
+      break;
+    }
+    case 0x72:
+    case 0x73:
+    case 0x74:
+    case 0x75:
+    case 0x76:
+    case 0x77:
+    case 0x78:
+      // State/fetch ranges use the backend's callback-preserving bulk writer.
+      // Flush registers keep the original sequential side-effect ordering.
+      if (native_state_range.first_register < 0x5000) {
+        WriteRegisterRangeFromRing(reader, native_state_range.first_register, count);
+      } else {
+        for (uint32_t i = 0; i < count; ++i)
+          WriteRegister(native_state_range.first_register + i, reader->ReadAndSwap<uint32_t>());
+      }
+      native_gpu_state::RecordCall(count);
+      result = true;
+      break;
+    case native_gpu_calls::kVerticesDrawOpcode: {
+      std::array<uint32_t, 17> payload;
+      for (uint32_t i = 0; i < count; ++i)
+        payload[i] = reader->ReadAndSwap<uint32_t>();
+      native_gpu_calls::VerticesDrawCall call;
+      if (!native_gpu_calls::DecodeVertices({payload.data(), count}, call)) {
+        REXGPU_ERROR("Native vertices call has invalid arguments");
+        result = false;
+      } else {
+        result = SubmitNativeVerticesDraw(call);
+      }
+      break;
+    }
+    case native_gpu_calls::kRangeDrawOpcode: {
+      std::array<uint32_t, 6> payload;
+      for (uint32_t i = 0; i < count; ++i)
+        payload[i] = reader->ReadAndSwap<uint32_t>();
+      native_gpu_calls::RangeDrawCall call;
+      result = native_gpu_calls::DecodeRange({payload.data(), count}, call) &&
+               SubmitNativeRangeDraw(call);
+      if (!result)
+        REXGPU_ERROR("Native range draw has invalid arguments");
+      break;
+    }
     case PM4_ME_INIT:
       result = ExecutePacketType3_ME_INIT(reader, packet, count);
       break;
@@ -1620,8 +2130,38 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     case PM4_XE_SWAP:
       result = ExecutePacketType3_XE_SWAP(reader, packet, count);
       break;
+    case native_gpu_presentation::kOpcode: {
+      std::array<uint32_t, 4> payload;
+      for (auto& word : payload)
+        word = reader->ReadAndSwap<uint32_t>();
+      native_gpu_presentation::Call call;
+      if (!native_gpu_presentation::Decode(payload, call)) {
+        REXGPU_ERROR("Native presentation call has invalid arguments");
+        break;
+      }
+      result = PresentGuestFrame(call.address, call.width, call.height);
+      break;
+    }
     case native_records::kMarkerOpcode:
       result = ExecutePacketType3_NATIVE_RECORD(reader, packet, count);
+      break;
+    case native_gpu_calls::kOpcode:
+      result = ExecuteNativeDrawCall(reader, count);
+      break;
+    case native_gpu_calls::kBareDrawOpcode:
+      if (count == 1) {
+        result = SubmitNativeBareDraw(reader->ReadAndSwap<uint32_t>());
+      } else {
+        REXGPU_ERROR("Native bare draw has an invalid argument size: {}", count);
+        reader->AdvanceRead(count * sizeof(uint32_t));
+      }
+      break;
+    case native_gpu_constants::kOpcode:
+      WriteRegisterRangeFromRing(reader, native_constant_range.first_register,
+                                 native_constant_range.register_count);
+      g_native_applied_registers += native_constant_range.register_count;
+      ++g_native_applied_records;
+      result = true;
       break;
     case PM4_INDIRECT_BUFFER:
     case PM4_INDIRECT_BUFFER_PFD:
@@ -1743,8 +2283,63 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
   }
 
+  switch (opcode) {
+    // Packets that only set state or draw - drawing to memory (resolves and
+    // memory export) advances the epoch where it's done.
+    // Waiting for a register or for a value the guest writes, and events
+    // without a memory write, show the guest nothing of what the GPU has done,
+    // so they don't let it change memory that queued commands read (this
+    // game waits on COHER_STATUS_HOST about 190 times a frame).
+    case PM4_WAIT_REG_MEM:
+    case PM4_EVENT_WRITE:
+    case PM4_NOP:
+    case PM4_INDIRECT_BUFFER:
+    case PM4_INDIRECT_BUFFER_PFD:
+    case PM4_DRAW_INDX:
+    case PM4_DRAW_INDX_2:
+    case PM4_SET_CONSTANT:
+    case PM4_SET_CONSTANT2:
+    case PM4_LOAD_ALU_CONSTANT:
+    case PM4_SET_SHADER_CONSTANTS:
+    case PM4_IM_LOAD:
+    case PM4_IM_LOAD_IMMEDIATE:
+    case PM4_INVALIDATE_STATE:
+    case PM4_SET_BIN_MASK_LO:
+    case PM4_SET_BIN_MASK_HI:
+    case PM4_SET_BIN_SELECT_LO:
+    case PM4_SET_BIN_SELECT_HI:
+    case PM4_SET_BIN_MASK:
+    case PM4_SET_BIN_SELECT:
+    case PM4_CONTEXT_UPDATE:
+    case native_records::kMarkerOpcode:
+    case native_gpu_calls::kOpcode:
+    case native_gpu_calls::kBareDrawOpcode:
+    case native_gpu_direct::kOpcode:
+    case native_gpu_constants::kOpcode:
+    case native_gpu_calls::kVerticesDrawOpcode:
+    case native_gpu_calls::kRangeDrawOpcode:
+    case native_gpu_coherency::kOpcode:
+    case native_gpu_program::kOpcode:
+    case native_gpu_predication::kOpcode:
+    case native_gpu_ports::kOpcode:
+    case native_gpu_sync::kOpcode:
+    case native_gpu_indirect::kOpcode:
+    case native_gpu_shader_reference::kOpcode:
+    case 0x72:
+    case 0x73:
+    case 0x74:
+    case 0x75:
+    case 0x76:
+    case 0x77:
+    case 0x78:
+      break;
+    default:
+      ++guest_progress_epoch_;
+      g_epoch_opcodes[opcode & 255].fetch_add(1, std::memory_order_relaxed);
+  }
+
   trace_writer_.WritePacketEnd();
-  if (opcode == PM4_XE_SWAP) {
+  if (opcode == PM4_XE_SWAP || opcode == native_gpu_presentation::kOpcode) {
     // End the trace writer frame.
     if (trace_writer_.is_open()) {
       trace_writer_.WriteEvent(EventCommand::Type::kSwap);
@@ -1765,6 +2360,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
 
   assert_true(reader->read_offset() ==
               (data_start_offset + (count * sizeof(uint32_t))) % reader->capacity());
+  route.Finish(result);
   return result;
 }
 
@@ -1806,6 +2402,28 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
+  if (count < 4) {
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    return false;
+  }
+  // Xenia-specific VdSwap hook.
+  // VdSwap will post this to tell us we need to swap the screen/fire an
+  // interrupt.
+  // 63 words here, but only the first has any data.
+  uint32_t magic = reader->ReadAndSwap<memory::fourcc_t>();
+  assert_true(magic == kSwapSignature);
+
+  // TODO(benvanik): only swap frontbuffer ptr.
+  uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
+  uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
+  uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+
+  return PresentGuestFrame(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+}
+
+bool CommandProcessor::PresentGuestFrame(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                         uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
@@ -1823,19 +2441,6 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 #endif
   rex::perf::Profiler::Flip();
   rex::perf::TraceEvent("cpswap");
-
-  // Xenia-specific VdSwap hook.
-  // VdSwap will post this to tell us we need to swap the screen/fire an
-  // interrupt.
-  // 63 words here, but only the first has any data.
-  uint32_t magic = reader->ReadAndSwap<memory::fourcc_t>();
-  assert_true(magic == kSwapSignature);
-
-  // TODO(benvanik): only swap frontbuffer ptr.
-  uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
-  uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
-  uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
-  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
   // Pick up changes of the legacy memexport readback cvar once per frame.
   legacy_readback_memexport_overridden_ = -1;
@@ -2026,6 +2631,99 @@ bool CommandProcessor::ExecutePacketType3_NATIVE_RECORD(memory::RingBuffer* read
   return true;
 }
 
+bool CommandProcessor::ExecuteNativeDrawCall(memory::RingBuffer* reader, uint32_t count) {
+  if (count != 23 && count != 26) {
+    REXGPU_ERROR("Native draw call has an invalid argument size: {}", count);
+    return false;
+  }
+  std::array<uint32_t, 26> payload;
+  for (uint32_t i = 0; i < count; ++i)
+    payload[i] = reader->ReadAndSwap<uint32_t>();
+  native_gpu_calls::DrawCall call;
+  if (!native_gpu_calls::DecodeDraw({payload.data(), count}, call)) {
+    REXGPU_ERROR("Native draw call has an invalid version, source or reserved arguments");
+    return false;
+  }
+  return SubmitNativeDraw(call);
+}
+
+bool CommandProcessor::SubmitNativeDraw(const native_gpu_calls::DrawCall& call) {
+  reg::VGT_DRAW_INITIATOR initiator;
+  initiator.value = call.initiator;
+  const bool indexed = initiator.source_select == xenos::SourceSelect::kDMA;
+  if (!indexed && initiator.source_select != xenos::SourceSelect::kAutoIndex)
+    return false;
+
+  // Preserve the state and coherency order of the command-builder's API call.
+  RestoreRegisters(0x48BA, call.fetch.data(), uint32_t(call.fetch.size()), true);
+  WriteRegister(XE_GPU_REG_COHER_STATUS_HOST, call.coherent_status);
+  WriteRegister(XE_GPU_REG_COHER_SIZE_HOST, call.coherent_size);
+  WriteRegister(XE_GPU_REG_COHER_BASE_HOST, call.coherent_base);
+  MakeCoherent();
+  RestoreRegisters(0x5000, call.constant_flush.data(), uint32_t(call.constant_flush.size()), true);
+  return SubmitNativeDrawArguments(call.initiator, call.index_base, call.index_size, "NativeDraw");
+}
+
+bool CommandProcessor::SubmitNativeDrawArguments(uint32_t control, uint32_t index_base,
+                                                  uint32_t index_size, const char* source) {
+  reg::VGT_DRAW_INITIATOR initiator;
+  initiator.value = control;
+  const bool indexed = initiator.source_select == xenos::SourceSelect::kDMA;
+  if (!indexed && initiator.source_select != xenos::SourceSelect::kAutoIndex)
+    return false;
+  WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, control);
+  IndexBufferInfo indices;
+  if (indexed) {
+    WriteRegister(XE_GPU_REG_VGT_DMA_BASE, index_base);
+    WriteRegister(XE_GPU_REG_VGT_DMA_SIZE, index_size);
+    reg::VGT_DMA_SIZE size;
+    size.value = index_size;
+    indices.endianness = size.swap_mode;
+    indices.format = initiator.index_size;
+    uint32_t stride = indices.format == xenos::IndexFormat::kInt16 ? sizeof(uint16_t)
+                                                                 : sizeof(uint32_t);
+    indices.guest_base = index_base & ~(stride - 1);
+    indices.length = size_t(size.num_words) * stride;
+    indices.count = initiator.num_indices;
+  }
+  native_gpu_diagnostics_.RecordOperation(NativeGpuDiagnostics::Operation::kNativeDrawCall);
+  return SubmitDrawToBackend(initiator, indexed ? &indices : nullptr, source);
+}
+
+bool CommandProcessor::SubmitNativeBareDraw(uint32_t control) {
+  reg::VGT_DRAW_INITIATOR initiator;
+  initiator.value = control;
+  if (initiator.source_select != xenos::SourceSelect::kAutoIndex) {
+    REXGPU_ERROR("Native bare draw requires auto indices");
+    return false;
+  }
+  return SubmitNativeDrawArguments(control, 0, 0, "NativeBareDraw");
+}
+
+bool CommandProcessor::SubmitNativeVerticesDraw(const native_gpu_calls::VerticesDrawCall& call) {
+  if (((call.initiator >> 6) & 3) != 0 && ((call.initiator >> 6) & 3) != 2)
+    return false;
+  WriteRegister(XE_GPU_REG_VGT_INDX_OFFSET, call.first_vertex);
+  RestoreRegisters(0x48BA, call.fetch.data(), uint32_t(call.fetch.size()), true);
+  RestoreRegisters(0x5000, call.constant_flush.data(), uint32_t(call.constant_flush.size()), true);
+  if (!(bin_select_ & bin_mask_)) {
+    native_gpu_diagnostics_.RecordOperation(NativeGpuDiagnostics::Operation::kNativeDrawCall);
+    return true;
+  }
+  return SubmitNativeDrawArguments(call.initiator, call.index_base, call.index_size, "NativeVertices");
+}
+
+bool CommandProcessor::SubmitNativeRangeDraw(const native_gpu_calls::RangeDrawCall& call) {
+  if (((call.initiator >> 6) & 3) != 0 && ((call.initiator >> 6) & 3) != 2)
+    return false;
+  WriteRegister(XE_GPU_REG_VGT_INDX_OFFSET, call.first_vertex);
+  if (!(bin_select_ & bin_mask_)) {
+    native_gpu_diagnostics_.RecordOperation(NativeGpuDiagnostics::Operation::kNativeDrawCall);
+    return true;
+  }
+  return SubmitNativeDrawArguments(call.initiator, call.index_base, call.index_size, "NativeRange");
+}
+
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
   // indirect buffer dispatch
@@ -2049,6 +2747,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t mask = reader->ReadAndSwap<uint32_t>();
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
+  return WaitRegisterOrMemory(wait_info, poll_reg_addr, ref, mask, wait);
+}
+
+bool CommandProcessor::WaitRegisterOrMemory(uint32_t wait_info, uint32_t poll_reg_addr,
+                                            uint32_t ref, uint32_t mask, uint32_t wait) {
   bool is_memory = (wait_info & 0x10) != 0;
 
   const bool wait_stats = REXCVAR_GET(gpu_wait_stats) > 0;
@@ -2312,6 +3015,11 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   uint32_t address = reader->ReadAndSwap<uint32_t>();
   uint32_t value = reader->ReadAndSwap<uint32_t>();
 
+  WriteShaderEvent(initiator, address, value);
+  return true;
+}
+
+void CommandProcessor::WriteShaderEvent(uint32_t initiator, uint32_t address, uint32_t value) {
   // Writeback initiator.
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
   uint32_t data_value;
@@ -2327,7 +3035,9 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   data_value = GpuSwap(data_value, endianness);
   memory::store(memory_->TranslatePhysical(address), data_value);
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
-  return true;
+  // Allocation/marker waits also sleep on this epoch. The fence is visible
+  // before waking them; a notification never substitutes for its predicate.
+  NotifyRingProgress();
 }
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* reader,
@@ -2481,45 +3191,57 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // we don't support yet.
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
-  if (draw_succeeded) {
-    auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
-      // TODO(Triang3l): Don't drop the draw call completely if the vertex
-      // shader has memexport.
-      // TODO(Triang3l || JoelLinn): Handle this properly in the render
-      // backends.
+  native_gpu_diagnostics_.RecordOperation(NativeGpuDiagnostics::Operation::kLegacyDrawPacket);
+  if (draw_succeeded)
+    return SubmitDrawToBackend(vgt_draw_initiator, is_indexed ? &index_buffer_info : nullptr,
+                               opcode_name);
+  return true;
+}
 
-      bool major_mode_explicit =
-          xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
-      uint64_t census_draw_start_tick =
-          g_pm4_replay_depth ? rex::chrono::Clock::QueryHostTickCount() : 0;
-      draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
-                                 is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
-      if (g_pm4_replay_depth) {
-        g_pm4_census.replay_draw_ticks +=
-            rex::chrono::Clock::QueryHostTickCount() - census_draw_start_tick;
-      }
-      if (!draw_succeeded) {
-        // HAND PATCH: rate-limit this log. This game rejects hundreds of draws
-        // per frame while streaming (invalid vertex fetch constants during
-        // entity load), producing tens of thousands of identical lines in
-        // seconds -- enough I/O to rotate away the useful log context.
-        static std::atomic<uint64_t> draw_failed_count{0};
-        uint64_t n = draw_failed_count.fetch_add(1, std::memory_order_relaxed);
-        if (n < 20 || (n & 1023) == 0) {
-          auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
-          auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
-          auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
-          REXGPU_ERROR(
-              "{}({}, {}, {}): Failed in backend "
-              "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={}) "
-              "[occurrence {}; rate-limited]",
-              opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
-              uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
-              uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
-              uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
-              uint32_t(rb_modecontrol.edram_mode), n + 1);
-        }
+bool CommandProcessor::SubmitDrawToBackend(reg::VGT_DRAW_INITIATOR vgt_draw_initiator,
+                                           IndexBufferInfo* indices, const char* source) {
+  bool draw_succeeded = true;
+  auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+  if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
+    // TODO(Triang3l): Don't drop the draw call completely if the vertex
+    // shader has memexport.
+    // TODO(Triang3l || JoelLinn): Handle this properly in the render
+    // backends.
+
+    bool major_mode_explicit =
+        xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+    uint64_t census_draw_start_tick =
+        g_pm4_replay_depth ? rex::chrono::Clock::QueryHostTickCount() : 0;
+    // Resolves write guest memory.
+    if (register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
+      ++guest_progress_epoch_;
+    }
+    draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                               indices, major_mode_explicit);
+    if (g_pm4_replay_depth) {
+      g_pm4_census.replay_draw_ticks +=
+          rex::chrono::Clock::QueryHostTickCount() - census_draw_start_tick;
+    }
+    if (!draw_succeeded) {
+      // HAND PATCH: rate-limit this log. This game rejects hundreds of draws
+      // per frame while streaming (invalid vertex fetch constants during
+      // entity load), producing tens of thousands of identical lines in
+      // seconds -- enough I/O to rotate away the useful log context.
+      static std::atomic<uint64_t> draw_failed_count{0};
+      uint64_t n = draw_failed_count.fetch_add(1, std::memory_order_relaxed);
+      if (n < 20 || (n & 1023) == 0) {
+        auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
+        auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
+        auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
+        REXGPU_ERROR(
+            "{}({}, {}, {}): Failed in backend "
+            "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={}) "
+            "[occurrence {}; rate-limited]",
+            source, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
+            uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
+            uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
+            uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
+            uint32_t(rb_modecontrol.edram_mode), n + 1);
       }
     }
   }
@@ -2646,8 +3368,6 @@ bool CommandProcessor::ExecutePacketType3_SET_SHADER_CONSTANTS(memory::RingBuffe
 
 bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
-  SCOPE_profile_cpu_f("gpu");
-
   // load sequencer instruction memory (pointer-based)
   uint32_t addr_type = reader->ReadAndSwap<uint32_t>();
   auto shader_type = static_cast<xenos::ShaderType>(addr_type & 0x3);
@@ -2657,9 +3377,24 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
 
+  return BindShaderFromMemory(shader_type, addr, size_dwords);
+}
+
+bool CommandProcessor::BindShaderFromMemory(xenos::ShaderType shader_type, uint32_t addr,
+                                            uint32_t size_dwords) {
+  SCOPE_profile_cpu_f("gpu");
   trace_writer_.WriteMemoryRead(CpuToGpu(addr), size_dwords * 4);
-  auto shader =
-      LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+  const auto* code = memory_->TranslatePhysical<uint32_t*>(addr);
+  RecentShader& recent = recent_shaders_[(addr >> 6) & (recent_shaders_.size() - 1)];
+  Shader* shader;
+  if (recent.epoch == guest_progress_epoch_ && recent.address == addr &&
+      recent.dword_count == size_dwords && recent.type == shader_type && recent.shader &&
+      recent.shader->ucode_data_hash() == XXH3_64bits(code, size_dwords * sizeof(uint32_t))) {
+    shader = recent.shader;
+  } else {
+    shader = LoadShader(shader_type, addr, code, size_dwords);
+    recent = {guest_progress_epoch_, addr, size_dwords, shader_type, shader};
+  }
   switch (shader_type) {
     case xenos::ShaderType::kVertex:
       active_vertex_shader_ = shader;

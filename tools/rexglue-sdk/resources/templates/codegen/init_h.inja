@@ -30,6 +30,7 @@
 //=============================================================================
 
 #include <rex/ppc.h>
+#include <rex/ppc/barriers.h>
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/chrono/clock.h>

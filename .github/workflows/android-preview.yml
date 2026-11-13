@@ -11,13 +11,15 @@ jobs:
     name: Signed ARM64 preview artifact
     runs-on: ubuntu-24.04
     env:
-      RECOMP_ANDROID_SIGNING_STORE_FILE: ${{ runner.temp }}/simpsons-release.keystore
       RECOMP_ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
       RECOMP_ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
       RECOMP_ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
       RECOMP_ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
     steps:
       - uses: actions/checkout@v4
+      # The runner context is not available in a job's env, only in its steps.
+      - name: Signing key location
+        run: echo "RECOMP_ANDROID_SIGNING_STORE_FILE=$RUNNER_TEMP/simpsons-release.keystore" >> "$GITHUB_ENV"
       - name: Prepare owner signing key
         env:
           SIGNING_STORE_BASE64: ${{ secrets.ANDROID_SIGNING_STORE_BASE64 }}

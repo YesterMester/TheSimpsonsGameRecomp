@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <d3dcompiler.h>
 #include <cstring>
 #include <iterator>
 #include <memory>
@@ -42,6 +41,9 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+
+// After the rex headers, so rex/platform.h has set NOMINMAX before <windows.h>.
+#include <d3dcompiler.h>
 #include <rex/string.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>

@@ -307,7 +307,13 @@ Json Runtime::Call(Mod& mod, std::string_view method, const Json& args) {
   if (mod.failed) throw Failure("disabled_mod", "This mod was disabled after an error");
   static const auto catalog = Catalog();
   const auto found = std::find_if(catalog.at("operations").begin(), catalog.at("operations").end(),
-                                 [&](const auto& op) { return op.at("name") == method; });
+                                 [&](const auto& op) {
+                                   // Compare as strings: json == string_view is ambiguous with MSVC's
+                                   // standard library once json converts implicitly.
+                                   const auto& name = op.at("name");
+                                   return name.is_string() &&
+                                          name.template get_ref<const std::string&>() == method;
+                                 });
   if (found == catalog.at("operations").end())
     throw Failure("unsupported", "Unknown game API: " + std::string(method));
   ValidateArguments(*found, args);

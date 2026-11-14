@@ -82,8 +82,11 @@ def build(output, compiler=None, windows=None):
         (shutil.which('cc') or shutil.which('clang') or 'cc')]
     resource = windows_resources(output, cc[0]) if windows else None
     if Path(cc[0]).name.lower() in ('cl', 'cl.exe', 'clang-cl', 'clang-cl.exe'):
-        args = cc + ['/nologo', '/O2', '/W4', str(source), str(resource), '/Fe:' + str(destination),
+        # The compiled resources go to the linker (after /link): clang-cl counts a .res
+        # beside the source as a second file to compile and then refuses /Fo.
+        args = cc + ['/nologo', '/O2', '/W4', str(source), '/Fe:' + str(destination),
                      '/Fo:' + str(output / 'modkit-entry.obj'), '/link', '/SUBSYSTEM:WINDOWS', 'user32.lib']
+        args += [str(resource)] if resource else []
     else:
         args = cc + ['-std=c11', '-O2', '-Wall', '-Wextra', str(source), '-o', str(destination)]
         if windows:

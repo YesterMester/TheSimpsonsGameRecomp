@@ -135,9 +135,10 @@ jobs:
       - name: Check native GPU hooks in the linked Windows executable
         shell: pwsh
         run: |
+          # A PE image has no symbol table for llvm-nm: read the linker's map.
           python tools/native-renderer/check_gpu_hook_linkage.py `
             --binary simpsons/out/build/win-amd64-relwithdebinfo/simpsons.exe `
-            --nm (Get-Command llvm-nm).Source
+            --map simpsons/out/build/win-amd64-relwithdebinfo/simpsons.map
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Stage verified upstream Windows extractor

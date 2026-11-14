@@ -20,7 +20,31 @@ def sha(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def check(root, binary, nm):
+def map_symbols(path, wanted):
+    """Public symbols from a link.exe-style map (lld-link or link.exe /map):
+    " 0001:00000060       sub_82000010               0000000140001060     hook.obj".
+    Only the "Publics by Value" table: a PE image has no symbol table for nm."""
+    symbols, publics = {}, False
+    line_re = re.compile(r"^\s*[0-9A-Fa-f]{4}:[0-9A-Fa-f]{8}\s+(\S+)\s+([0-9A-Fa-f]{8,16})\b")
+    for line in path.read_text(errors="replace").splitlines():
+        if "Publics by Value" in line:
+            publics = True
+            continue
+        if line.strip().startswith("Static symbols"):
+            break
+        match = publics and line_re.match(line)
+        if not match:
+            continue
+        name = match.group(1)
+        if name not in wanted and not re.match(r"\?sub_[0-9A-F]{8}@@", name):
+            continue
+        if name in symbols:
+            raise RuntimeError("Ambiguous linked symbol: " + name)
+        symbols[name] = dict(kind="T", address=int(match.group(2), 16))
+    return symbols
+
+
+def check(root, binary, nm, linker_map=None):
     files = sorted((root / "simpsons/src").glob("native_gpu_*.cpp"))
     sources = {str(p.relative_to(root)): sha(p) for p in files}
     hooks = {}
@@ -32,11 +56,14 @@ def check(root, binary, nm):
     if not hooks:
         raise RuntimeError("No handwritten native GPU hooks found")
     binary_hash = sha(binary)
-    result = subprocess.run([str(nm), "--defined-only", "--format=posix", str(binary)],
-                            capture_output=True, text=True, check=True)
-    symbols = {}
     wanted = set(hooks) | {"__imp__" + name for name in hooks}
-    for line in result.stdout.splitlines():
+    symbols = {}
+    if linker_map:
+        symbols = map_symbols(linker_map, wanted)
+    stdout = "" if linker_map else subprocess.run(
+        [str(nm), "--defined-only", "--format=posix", str(binary)],
+        capture_output=True, text=True, check=True).stdout
+    for line in stdout.splitlines():
         fields = line.split()
         if len(fields) >= 3:
             if fields[0] not in wanted and not re.match(r"_Z\d+sub_[0-9A-F]{8}R", fields[0]):
@@ -47,7 +74,8 @@ def check(root, binary, nm):
     rows = []
     for name, source in sorted(hooks.items()):
         public, original = symbols.get(name), symbols.get("__imp__" + name)
-        mangled = [s for s in symbols if re.match(r"_Z\d+" + name + r"R", s)]
+        mangled = [s for s in symbols if re.match(r"_Z\d+" + name + r"R", s) or
+                   re.match(r"\?" + name + r"@@", s)]
         passed = bool(public and original and public["kind"] == "T" and
                       public["address"] != original["address"] and not mangled)
         rows.append(dict(name=name, source=source, public=public, original=original,
@@ -65,9 +93,12 @@ def main():
     parser.add_argument("--binary", required=True, type=Path,
                         help="Unstripped or debug-stripped executable retaining its symbol table")
     parser.add_argument("--nm", type=Path, default=root / "tools/clang20/bin/llvm-nm")
+    parser.add_argument("--map", type=Path,
+                        help="Windows: the linker map (link /map) instead of the PE's missing symbol table")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    report = check(root, args.binary.resolve(), args.nm.resolve())
+    report = check(root, args.binary.resolve(), args.nm.resolve(),
+                   args.map.resolve() if args.map else None)
     if args.output:
         args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(dict(passed=report["passed"], hook_count=report["hook_count"],

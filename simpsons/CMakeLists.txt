@@ -263,6 +263,11 @@ endif()
 # (mprotect, neutered/no-op) and <unistd.h> (usleep). Scoped to this target.
 if(WIN32)
     target_include_directories(simpsons PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat_win)
+    # simpsons.map beside simpsons.exe: a PE image has no symbol table for
+    # llvm-nm, so tools/native-renderer/check_gpu_hook_linkage.py --map reads
+    # the linker's map to check that the native GPU hooks replaced their
+    # generated functions. The map is not packaged.
+    target_link_options(simpsons PRIVATE "-Wl,/map")
 endif()
 
 # The Android launcher's pictures (android_art.cpp, LauncherArt.java): frames

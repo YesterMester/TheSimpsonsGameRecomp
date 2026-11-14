@@ -220,6 +220,11 @@ drivers, Android devices and the remaining creator acceptance projects need sepa
    data.
 5. Press **Play**.
 
+**Android (preview):** on an ARM64 phone with Android 10 or newer and Vulkan 1.1, download
+`TheSimpsonsGame-Recompiled-Android-arm64.apk` from the release and open it, allowing installs
+from your browser or file manager when Android asks. The app installs the game from your ISO or
+an already extracted folder, and offers later releases itself.
+
 On Steam Deck, use **Add to Steam** in the launcher from Desktop Mode, then find
 **The Simpsons Game (Recompiled)** under Steam's **Non-Steam Games** to play from Game Mode.
 If this installation is already registered, the button shows its existing Steam name instead

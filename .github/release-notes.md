@@ -58,7 +58,7 @@ Spawning, Spooner, animations, the NPC costume preview and the ragdoll test need
 
 ### Android (development preview)
 
-- The Android preview is distributed separately from the Windows and Linux packages. The desktop release workflow does not attach an APK. A separate manual preview workflow prepares and verifies an APK artifact using the owner's signing key; key setup and further phone testing are still pending.
+- **To install:** download `TheSimpsonsGame-Recompiled-Android-arm64.apk` below on the phone and open it, allowing installs from your browser or file manager when Android asks. It is a development-signed preview build; later releases can update it from inside the app.
 - An ARM64 build for Android 10 and later with Vulkan 1.1. It uses the same launcher and installs the game on the phone from your ISO or an extracted folder, in the background with a progress notification.
 - A multitouch gamepad with an editor: move, resize, fade or hide each control, and set the stick deadzone and camera sensitivity. It hides while a menu is open so you can tap the menu.
 - Shaders and pipelines are prepared before the first frame and kept for later starts. Dialogue is mixed into stereo so it is audible on phone speakers.

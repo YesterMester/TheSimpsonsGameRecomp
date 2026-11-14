@@ -1,7 +1,34 @@
 # 0.0.7.0 release preparation
 
-Local preparation checked November 12–13, 2026 (UTC). The changes remain
-uncommitted. No release workflow, publication or issue closure was performed.
+Local preparation checked November 12–13, 2026 (UTC). The sections after
+[Publication](#publication) record that state, before anything was committed.
+No issue closure was performed.
+
+## Publication
+
+v0.0.7.0 was published on November 14, 2026 (UTC) from commit `e7c93150`.
+Later commits change only documentation.
+
+- The manual release workflow built the Linux x64, Linux NoAVX2, Windows x64
+  and Windows NoAVX2 packages. The first hosted Windows builds needed four
+  fixes, all in the tagged commit: the include order of the D3D12 render-target
+  cache, a JSON comparison in the Modkit runtime, the native GPU hook check (a
+  Windows executable has no symbol table, so the check reads the linker map)
+  and resource linking for the Modkit entry program.
+- On the Steam Deck, the workflow's Linux package loaded Bartman Begins, moved
+  the player and drew the debug menu. Its Windows package loaded a level and
+  moved the player under Proton.
+- Real updates from the published 0.0.6.5 Linux and Windows packages (Windows
+  under Proton) kept the player's settings and backups, and on Linux an
+  installed mod. Afterwards every file matched the 0.0.7.0 package except the
+  top-level `LICENSE`, which neither updater installs.
+- The Android APK attached to the release was built locally from the release
+  sources. It is the debug variant, signed with the development certificate
+  (`37f9620d…2351`) that earlier test builds and the in-app updater use, so it
+  is debuggable. `check_apk.py` passes: certificate, five native libraries
+  matching staging, 72 shaders and ELF/ZIP alignment. It was not run on a
+  phone in these checks. The owner release key and a hosted Android release
+  build remain open.
 
 ## Release material
 

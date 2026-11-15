@@ -23,7 +23,7 @@ struct PatchList {
 // throughout all lists, including duplicate instruction indices and lists shared
 // by multiple descriptors. No side queue or cached guest pointers survive a call.
 struct Plan {
-  std::array<PatchList, 31> lists{};
+  std::array<PatchList, 31> lists;  // only [0, list_count) is read; not cleared per call
   MemoryRange resource{}, stack{}, descriptor{}, secondary{}, result{};
   uint32_t resource_address = 0, vertex_exports = 0, list_count = 0;
   uint32_t result_address = 0, result_value = 0;

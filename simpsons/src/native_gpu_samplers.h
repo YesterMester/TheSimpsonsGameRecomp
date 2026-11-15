@@ -30,7 +30,12 @@ inline bool PlanSamplersAt(const PPCContext& ctx, const uint8_t* base, uint32_t 
   plan.coherency = rex::graphics::native_gpu_coherency::Encode(
       {LoadGuestU32(base, device + 10396), 0x10000, 0, 0x1000});
   auto& state = plan.state;
-  state = {device, initial + 52, initial + 52, 0, 0x2388, {}};
+  // As in PlanStateAt: runs past run_count are never read, so don't clear them.
+  state.device = device;
+  state.initial = initial + 52;
+  state.cursor = initial + 52;
+  state.run_count = 0;
+  state.register_end = 0x2388;
   const uint32_t limit = LoadGuestU32(base, device + 52);
   uint32_t bit = 0;
   uint64_t remaining = dirty;

@@ -39,7 +39,13 @@ inline bool PlanStateAt(const PPCContext& ctx, const uint8_t* base, bool fetch, 
   const uint32_t first_register = fetch ? 0x4800 : ctx.r5.u32;
   const uint64_t shadow = fetch ? uint64_t(device) + 1152 : ctx.r6.u32;
   const uint32_t per_bit = fetch ? 6 : 1;
-  plan = {device, initial, initial, 0, first_register, {}};
+  // Only runs[0, run_count) are ever read, and each is written before use.
+  // Assigning a whole StatePlan here cleared all 32 runs on every flush slot.
+  plan.device = device;
+  plan.initial = initial;
+  plan.cursor = initial;
+  plan.run_count = 0;
+  plan.register_end = first_register;
   uint32_t bit = 0;
   uint64_t remaining = dirty;
   while (remaining) {

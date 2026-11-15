@@ -536,7 +536,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      # Its default packages are "tools platform-tools", and current SDK
+      # repositories no longer have "tools": sdkmanager then fails before the build.
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: Install native build tools
         run: |
           sudo apt-get update

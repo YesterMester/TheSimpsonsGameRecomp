@@ -34,6 +34,24 @@ The build script uses `ANDROID_USER_HOME` for the development key, defaulting to
 
 Android Studio can build the project in this directory directly. Its CMake default is 3.31.6; use `-PcmakeVersion=<version>` to select another installed version. The wrapper uses Gradle 8.14.3.
 
+## Release signing
+
+Every released APK is signed with one key: the one the first released APK
+(0.0.7.0) used. Android only installs an update signed by the same key as the
+installed app, so keeping it lets installed copies update in place, including
+from the app's own updater. That key carries an Android development
+certificate's name, so `check_apk.py --release` accepts it only when its exact
+certificate is pinned (`ANDROID_SIGNING_CERT_SHA256` /
+`RECOMP_ANDROID_SIGNING_CERT_SHA256`); an unpinned development key is still
+refused. Losing the key would mean players have to uninstall to update, so the
+owner keeps backups of it.
+
+The **Release** workflow builds, signs and checks the APK with the repository
+secrets below, and attaches it to the release as
+`TheSimpsonsGame-Recompiled-Android-arm64.apk` next to the desktop packages. It
+also refuses to build when `versionName` in `app/build.gradle` differs from the
+release tag, so bump `versionName` and `versionCode` with the launcher version.
+
 ## Signed preview packaging
 
 For an owner-signed preview, set `RECOMP_ANDROID_SIGNING_STORE_FILE`,
@@ -47,8 +65,8 @@ passwords in command arguments. Android's [signing guide](https://developer.andr
 explains key ownership and update requirements.
 
 The manual **Android preview** workflow builds and checks an APK artifact; it
-does not publish a release or upload game data. Configure these repository
-secrets before running it:
+does not publish a release or upload game data. It and the Release workflow
+use these repository secrets:
 
 - `ANDROID_SIGNING_STORE_BASE64`: the owner's keystore encoded as one base64 line.
 - `ANDROID_SIGNING_STORE_PASSWORD`, `ANDROID_SIGNING_KEY_ALIAS` and
@@ -71,9 +89,9 @@ python3 tools/android/check_apk.py android/app/build/outputs/apk/release/app-rel
 ```
 
 A package check does not qualify phone rendering, sustained performance or
-suspend/resume. A release certificate also differs from the existing development
-certificate; Android requires the same signer for an in-place update. Preserve
-the installed app's saves before switching signing identities.
+suspend/resume. Should the project ever switch to a different signing key,
+Android would refuse to update installed copies in place: players would need to
+preserve the app's saves and reinstall.
 
 ## Use
 

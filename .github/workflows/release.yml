@@ -485,10 +485,92 @@ jobs:
           name: ${{ matrix.artifact }}
           path: TheSimpsonsGame-Recompiled-Linux-x64${{ matrix.suffix }}.tar.gz
 
+  # ---------------------------------------------------------------- Android
+
+  android:
+    name: Android ARM64 (release APK)
+    needs: checks
+    runs-on: ubuntu-24.04
+    env:
+      RECOMP_ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+      RECOMP_ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+      RECOMP_ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+      # The certificate every released APK has used (0.0.7.0 onward). Installed
+      # copies only update from an APK signed with it; check_apk.py pins it.
+      RECOMP_ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version matches the release tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          tag = os.environ['TAG'].removeprefix('v')
+          text = open('android/app/build.gradle', encoding='utf-8').read()
+          name = re.search(r"versionName '([^']+)'", text).group(1)
+          if name != tag:
+              raise SystemExit(f'android/app/build.gradle has versionName {name}, but the release tag is {tag}')
+          PY
+      # The runner context is not available in a job's env, only in its steps.
+      - name: Signing key location
+        run: echo "RECOMP_ANDROID_SIGNING_STORE_FILE=$RUNNER_TEMP/simpsons-release.keystore" >> "$GITHUB_ENV"
+      - name: Prepare the signing key
+        env:
+          SIGNING_STORE_BASE64: ${{ secrets.ANDROID_SIGNING_STORE_BASE64 }}
+        run: |
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          required = ['SIGNING_STORE_BASE64', 'RECOMP_ANDROID_SIGNING_STORE_PASSWORD',
+                      'RECOMP_ANDROID_SIGNING_KEY_ALIAS', 'RECOMP_ANDROID_SIGNING_KEY_PASSWORD',
+                      'RECOMP_ANDROID_SIGNING_CERT_SHA256']
+          if any(not os.environ.get(name) for name in required):
+              raise SystemExit('Configure all Android signing secrets listed in android/README.md.')
+          path = Path(os.environ['RECOMP_ANDROID_SIGNING_STORE_FILE'])
+          with path.open('xb') as stream:
+              os.chmod(path, 0o600)
+              stream.write(base64.b64decode(os.environ['SIGNING_STORE_BASE64'], validate=True))
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;29.0.14206865'
+      - name: Build and verify the release APK
+        env:
+          ANDROID_BUILD_JOBS: '4'
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+          tools/android/build.sh release
+          python3 tools/android/check_apk.py android/app/build/outputs/apk/release/app-release.apk \
+            --release --build-tools "$ANDROID_HOME/build-tools/36.0.0" \
+            --readelf "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            --native-manifest android/.cxx/native-arm64/jniLibs/native-libraries.json
+          cp android/app/build/outputs/apk/release/app-release.apk TheSimpsonsGame-Recompiled-Android-arm64.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64
+          path: TheSimpsonsGame-Recompiled-Android-arm64.apk
+          if-no-files-found: error
+      - name: Remove the temporary signing key
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          Path(os.environ['RECOMP_ANDROID_SIGNING_STORE_FILE']).unlink(missing_ok=True)
+          PY
+
   # ---------------------------------------------------------------- Release
   release:
     name: GitHub release (latest, non-prerelease)
-    needs: [windows, linux]
+    needs: [windows, linux, android]
     runs-on: ubuntu-latest
     steps:
       # Only the release notes are needed from the repository.
@@ -501,6 +583,11 @@ jobs:
         with:
           path: artifacts
           pattern: "*-x64*"
+      # The APK the Android app's own updater looks for (the first .apk asset).
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-arm64
+          path: artifacts/android-arm64
 
       # Always a full release marked "latest" on publish — never a prerelease.
       # The launcher's update checker uses /releases/latest, which ignores
@@ -530,3 +617,4 @@ jobs:
             windows-x64-noavx2
             linux-x64
             linux-x64-noavx2
+            android-arm64

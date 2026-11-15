@@ -39,8 +39,14 @@ def verify(apk, build_tools, readelf, release=False, expected_certificate=None, 
         expected = expected_certificate.replace(":", "").lower()
         if not re.fullmatch(r"[0-9a-f]{64}", expected) or certificate != expected:
             raise ValueError("APK signing certificate differs from the expected certificate")
-    if release and re.search(r"^Signer #\d+ certificate DN: .*CN=Android Debug(?:,|$)", signing, re.M):
-        raise ValueError("A release APK must use the owner's signing key")
+    # Releases are signed with the key the first released APK (0.0.7.0) used, so
+    # installed copies keep updating. It has an Android development certificate's
+    # name, so a release may carry one only when exactly that certificate is
+    # pinned (checked above); an unpinned development key is still refused.
+    if (release and not expected_certificate
+            and re.search(r"^Signer #\d+ certificate DN: .*CN=Android Debug(?:,|$)", signing, re.M)):
+        raise ValueError("A release APK must use the owner's signing key (pin its certificate with "
+                         "RECOMP_ANDROID_SIGNING_CERT_SHA256)")
     badging = run(build_tools / "aapt2", "dump", "badging", apk)
     if not re.search(r"^package: name='io.github.yestermester.simpsons' ", badging, re.M):
         raise ValueError("Unexpected APK application ID")

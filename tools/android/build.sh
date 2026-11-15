@@ -51,7 +51,15 @@ cmake -S "$repo_dir/simpsons" -B "$android_build_dir" -G Ninja \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
     -DANDROID_STL=c++_shared -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
     -DREXSDK_DIR="$repo_dir/tools/rexglue-sdk" \
+    -DREXGLUE_ENABLE_LTO="${RECOMP_ANDROID_LTO:-ON}" \
+    -DSIMPSONS_ELIDE_MSR_FENCES="${RECOMP_ANDROID_ELIDE_MSR_FENCES:-OFF}" \
     -DREXGLUE_ENABLE_TRACY=OFF -DCMAKE_BUILD_TYPE=Release
+# ThinLTO as in the desktop release builds (RECOMP_ANDROID_LTO=OFF to skip it).
+# Its link runs code generation for the whole game; cap its parallel jobs with
+# LDFLAGS=-Wl,--thinlto-jobs=N on a machine with little memory.
+# The fences around the game's interrupt switches stay on ARM until the desktop
+# change (simpsons/register_locals.py) has been played on phones:
+# RECOMP_ANDROID_ELIDE_MSR_FENCES=ON drops them as on Windows and Linux.
 cmake --build "$android_build_dir" --parallel "$android_jobs" --target simpsons simpsons_art
 python3 "$repo_dir/tools/android/stage_native.py" "$android_build_dir" \
     "$ANDROID_NDK_HOME" "$android_build_dir/jniLibs"

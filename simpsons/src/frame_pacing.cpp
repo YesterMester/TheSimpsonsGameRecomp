@@ -128,12 +128,30 @@ REX_EXTERN(__imp__sub_827C0F78);
 REX_EXTERN(sub_827C0F78);
 
 // From the runtime, referenced weakly so this still runs with runtimes that
-// don't have them.
+// don't have them. On Windows a weak reference never pulls a symbol from the
+// runtime DLL's import library: it stayed null, so the vblank lock and the
+// frame_start trace event were silently off there. Windows packages always ship
+// the game with its own runtime, which exports both (WINDOWS_EXPORT_ALL_SYMBOLS),
+// so on Windows these are ordinary references.
+#if defined(_WIN32)
+#define SIMPSONS_OPTIONAL_RUNTIME_SYMBOL
+#else
+#define SIMPSONS_OPTIONAL_RUNTIME_SYMBOL __attribute__((weak))
+#endif
 extern "C" bool rex_graphics_get_vblank_schedule(uint64_t* last_vblank_ticks,
-                                                 uint64_t* interval_ticks) __attribute__((weak));
+                                                 uint64_t* interval_ticks)
+    SIMPSONS_OPTIONAL_RUNTIME_SYMBOL;
 namespace rex::perf {
-void TraceEvent(const char* name, uint64_t arg) __attribute__((weak));
+void TraceEvent(const char* name, uint64_t arg) SIMPSONS_OPTIONAL_RUNTIME_SYMBOL;
 }  // namespace rex::perf
+
+// Whether an optional runtime function is present. Taking it as a parameter
+// keeps the check meaningful for weak references without the compiler calling
+// it always true where the reference is ordinary.
+template <typename Function>
+static bool RuntimeHas(Function* function) {
+  return function != nullptr;
+}
 
 namespace {
 
@@ -437,7 +455,7 @@ REX_FUNC(sub_82718710) {
   // nearest vblank (plus the offset), so frames start in step with the
   // vblanks that release their swaps.
   uint64_t last_vblank = 0, vblank_interval = 0;
-  if (REXCVAR_GET(frame_pacing_vblank_lock) && rex_graphics_get_vblank_schedule &&
+  if (REXCVAR_GET(frame_pacing_vblank_lock) && RuntimeHas(rex_graphics_get_vblank_schedule) &&
       rex_graphics_get_vblank_schedule(&last_vblank, &vblank_interval) && vblank_interval) {
     uint64_t now = rex::chrono::Clock::QueryGuestTickCount();
     int64_t offset_ticks = int64_t(REXCVAR_GET(frame_pacing_vblank_offset_us)) *
@@ -461,7 +479,7 @@ REX_FUNC(sub_82718788) {
   TickGameMenu(ctx, base);
   TickGameThread(ctx, base);
   __imp__sub_82718788(ctx, base);
-  if (rex::perf::TraceEvent) {
+  if (RuntimeHas(rex::perf::TraceEvent)) {
     rex::perf::TraceEvent("frame_start", 0);
   }
 }

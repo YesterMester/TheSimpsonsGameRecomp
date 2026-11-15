@@ -191,6 +191,15 @@ endif()
 # hold them in host registers (register_locals.py). The compiled units are
 # rewritten copies of the generated ones, which keep their hand patches.
 option(SIMPSONS_REGISTER_LOCALS "Keep guest condition registers, CTR and XER in function locals" ON)
+# mfmsr/mtmsrd only read or set the interrupt-enable bit and are not memory
+# barriers on the console; the global lock mtmsrd takes already orders its
+# section. The copies drop the full fence emitted before each (see
+# register_locals.py). Needs SIMPSONS_REGISTER_LOCALS, which makes the copies.
+option(SIMPSONS_ELIDE_MSR_FENCES "Drop the full memory fence before guest mfmsr/mtmsrd" ON)
+set(register_locals_flags)
+if(SIMPSONS_ELIDE_MSR_FENCES)
+    list(APPEND register_locals_flags --elide-msr-fences)
+endif()
 find_package(Python3 COMPONENTS Interpreter QUIET)
 set(recomp_units)
 foreach(source ${REXGLUE_ENTRYPOINT_GENERATED_SOURCES})
@@ -212,7 +221,7 @@ if(SIMPSONS_REGISTER_LOCALS AND Python3_Interpreter_FOUND)
         OUTPUT "${locals_dir}/stamp"
         BYPRODUCTS ${recomp_compiled_units}
         COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/register_locals.py"
-            --out "${locals_dir}" --stamp "${locals_dir}/stamp" ${recomp_units}
+            --out "${locals_dir}" --stamp "${locals_dir}/stamp" ${register_locals_flags} ${recomp_units}
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/register_locals.py" ${recomp_units}
         COMMENT "Moving guest condition registers, CTR and XER into function locals"
         VERBATIM)

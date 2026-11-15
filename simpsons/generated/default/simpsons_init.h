@@ -311,20 +311,31 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
   return count;
 }
 
-#define REX_CHECK_GLOBAL_LOCK()                                        \
-  ([&]() -> u64 {                                                      \
-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
-  }())
+// HAND PATCH (2026-11-14): mfmsr's EE bit only has to say whether this thread
+// holds the global lock - the old check took the recursive mutex to read the
+// global count, which gave exactly that answer (another holder blocked it until
+// release, when the count was back to zero). Every mtmsrd restore LEAVEs and
+// every mtmsrd r13 ENTERs regardless of this value, so it never decides the
+// locking. Track this thread's depth instead: no lock/unlock per mfmsr and no
+// waiting on other threads' sections, which the console never did. ENTER and
+// LEAVE keep the mutex and the global count unchanged.
+inline i32& ppc_global_lock_depth_() {
+  static thread_local i32 depth = 0;
+  return depth;
+}
+
+#define REX_CHECK_GLOBAL_LOCK() (ppc_global_lock_depth_() ? u64(0) : u64(0x8000))
 
 #define REX_ENTER_GLOBAL_LOCK()                          \
   do {                                                   \
     rex::thread::global_critical_region::mutex().lock(); \
     ppc_global_lock_count_().fetch_add(1);               \
+    ++ppc_global_lock_depth_();                          \
   } while (0)
 
 #define REX_LEAVE_GLOBAL_LOCK()                                                           \
   do {                                                                                    \
+    --ppc_global_lock_depth_();                                                           \
     auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
     assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
     rex::thread::global_critical_region::mutex().unlock();                                \

@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.0.7.0)"
+        description: "Release tag (e.g. v0.0.7.1)"
         required: true
-        default: "v0.0.7.0"
+        default: "v0.0.7.1"
       draft:
         description: "Create the GitHub release as a draft"
         type: boolean

@@ -65,7 +65,7 @@ else:
 # at build time, so packaged builds always know exactly which release they
 # are (otherwise every launcher shipped inside vX.Y.Z.W would compare itself
 # against its own release and nag "update available" forever).
-VERSION = "0.0.7.0"
+VERSION = "0.0.7.1"
 MODKIT_APP = "--modkit" in sys.argv
 
 FROZEN = getattr(sys, "frozen", False)

@@ -71,6 +71,8 @@ scratch_project/
 scratch_codegen_manifest.toml
 generated_BACKUP_*/
 *.png
+# The Android splash-screen icon: launcher.write_donut_icon draws it (no game data).
+!android/app/src/main/res/drawable-nodpi/ic_donut.png
 *.data
 perf_hang.data
 missing_*.txt

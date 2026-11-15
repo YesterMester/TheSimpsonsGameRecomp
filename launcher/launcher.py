@@ -610,7 +610,7 @@ def write_settings(new_values):
         if shaders.is_dir():
             defaults["aot_shader_path"] = str(shaders)
         missing = [f"{k} = {_fmt(v, 'bool' if isinstance(v, bool) else 'str' if isinstance(v, str) else 'int')}"
-                   for k, v in defaults.items() if k not in present]
+                   for k, v in defaults.items() if k not in present and k not in SETTINGS_SCHEMA and k not in DERIVED_KEYS]
         if missing:
             lines.extend(["", f"# {PLAT} runtime defaults", *missing])
     block = [SETTINGS_BEGIN]

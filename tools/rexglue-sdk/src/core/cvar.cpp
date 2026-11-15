@@ -6,6 +6,11 @@
  * @license     BSD 3-Clause License
  */
 
+// First: defines REX_PLATFORM_WIN32 (tested below to pick the Windows
+// write-through settings save) and NOMINMAX before anything can include
+// <windows.h>. Without it the Windows build silently used the POSIX rename.
+#include <rex/platform.h>
+
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -184,6 +189,86 @@ bool ValidateConstraints(const FlagEntry& entry, std::string_view value) {
   }
 
   return true;
+}
+
+std::string_view TrimSpaces(std::string_view text) {
+  while (!text.empty() && (text.front() == ' ' || text.front() == '\t' || text.front() == '\r'))
+    text.remove_prefix(1);
+  while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r'))
+    text.remove_suffix(1);
+  return text;
+}
+
+// The key of a top-level `key = value` line, or empty.
+std::string_view TopLevelKey(std::string_view line) {
+  line = TrimSpaces(line);
+  if (line.empty() || line.front() == '#')
+    return {};
+  const size_t equals = line.find('=');
+  if (equals == std::string_view::npos)
+    return {};
+  const std::string_view key = TrimSpaces(line.substr(0, equals));
+  if (key.empty())
+    return {};
+  for (char c : key) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-')
+      return {};
+  }
+  return key;
+}
+
+// TOML rejects a repeated key, and then none of the file applies. The 0.0.7.0
+// launcher wrote native_gpu_calls twice into simpsons.toml (#61: windowed, the
+// default language, in-game changes not saved). Keep only the last copy of
+// each repeated top-level key - the launcher's managed block comes last and
+// wins, as it does in the launcher - and list the dropped keys. Only used after
+// a parse has failed, so a valid file is never changed.
+std::string DropRepeatedTopLevelKeys(const std::string& text, std::vector<std::string>& dropped) {
+  std::vector<std::string_view> lines;
+  for (size_t start = 0;;) {
+    const size_t end = text.find('\n', start);
+    lines.push_back(std::string_view(text).substr(start, end == std::string::npos ? std::string::npos
+                                                                                  : end - start));
+    if (end == std::string::npos)
+      break;
+    start = end + 1;
+  }
+  size_t tables = lines.size();  // keys after the first [table] header are not top-level
+  std::unordered_map<std::string_view, size_t> last;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const std::string_view trimmed = TrimSpaces(lines[i]);
+    if (!trimmed.empty() && trimmed.front() == '[') {
+      tables = i;
+      break;
+    }
+    if (const std::string_view key = TopLevelKey(lines[i]); !key.empty())
+      last[key] = i;
+  }
+  std::string kept;
+  kept.reserve(text.size());
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (i < tables) {
+      const std::string_view key = TopLevelKey(lines[i]);
+      if (!key.empty() && last[key] != i) {
+        dropped.emplace_back(key);
+        continue;
+      }
+    }
+    kept.append(lines[i]);
+    if (i + 1 < lines.size())
+      kept.push_back('\n');
+  }
+  return kept;
+}
+
+// The last LoadConfig result, repeated in the log once logging has started.
+ConfigLoadReport g_config_load_report;
+
+std::string JoinNames(const std::vector<std::string>& names) {
+  std::string joined;
+  for (const auto& name : names)
+    joined += (joined.empty() ? "" : ", ") + name;
+  return joined;
 }
 
 }  // namespace
@@ -532,13 +617,42 @@ void LoadConfig(const std::filesystem::path& config_path) {
     return;
   }
 
-  try {
-    auto config = toml::parse_file(config_path.string());
-    ApplyTomlTable(config, "");
-    REXLOG_INFO("Loaded config from {}", config_path.string());
-  } catch (const toml::parse_error& err) {
-    REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+  const std::string name = config_path.filename().string();
+  std::string text;
+  {
+    std::ifstream file(config_path, std::ios::binary);
+    text.assign(std::istreambuf_iterator<char>(file), {});
   }
+  toml::table config;
+  try {
+    config = toml::parse(text, config_path.string());
+    g_config_load_report = {ConfigLoadSeverity::kInfo, "Loaded config: " + name};
+  } catch (const toml::parse_error& err) {
+    std::vector<std::string> dropped;
+    std::string repaired = DropRepeatedTopLevelKeys(text, dropped);
+    try {
+      if (dropped.empty())
+        throw;
+      config = toml::parse(repaired, config_path.string());
+    } catch (const toml::parse_error&) {
+      REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+      g_config_load_report = {ConfigLoadSeverity::kError,
+                              "Config " + name + " could not be read, so none of its settings " +
+                                  "apply: " + std::string(err.what())};
+      return;
+    }
+    REXLOG_WARN("Config {} repeats {}; using the last value of each", config_path.string(),
+                JoinNames(dropped));
+    g_config_load_report = {ConfigLoadSeverity::kWarning,
+                            "Loaded config: " + name + " (it repeats " + JoinNames(dropped) +
+                                "; the last value of each applies)"};
+  }
+  ApplyTomlTable(config, "");
+  REXLOG_INFO("Loaded config from {}", config_path.string());
+}
+
+ConfigLoadReport LastConfigLoadReport() {
+  return g_config_load_report;
 }
 
 void ApplyEnvironment() {
@@ -603,7 +717,20 @@ bool SaveConfigPatch(const std::filesystem::path& config_path,
     if (std::filesystem::exists(config_path)) {
       std::ifstream file(config_path, std::ios::binary);
       original.assign(std::istreambuf_iterator<char>(file), {});
-      config = toml::parse(original);
+      try {
+        config = toml::parse(original);
+      } catch (const toml::parse_error&) {
+        // A repeated key (#61): save the file with one copy of each, so the
+        // save also repairs it. Anything else still fails below.
+        std::vector<std::string> dropped;
+        std::string repaired = DropRepeatedTopLevelKeys(original, dropped);
+        if (dropped.empty())
+          throw;
+        config = toml::parse(repaired);
+        original = std::move(repaired);
+        REXLOG_WARN("Settings file {} repeated {}; saving the last value of each",
+                    config_path.string(), JoinNames(dropped));
+      }
     }
     struct Replacement {
       size_t last_line;

@@ -106,6 +106,17 @@ namespace rex::cvar {
 
 std::vector<std::string> Init(int argc, char** argv);
 void LoadConfig(const std::filesystem::path& config_path);
+
+// What the last LoadConfig did. The config is read before logging is set up,
+// so the app repeats this in the log once it has started. Empty message if no
+// config was read.
+enum class ConfigLoadSeverity { kInfo, kWarning, kError };
+struct ConfigLoadReport {
+  ConfigLoadSeverity severity = ConfigLoadSeverity::kInfo;
+  std::string message;
+};
+ConfigLoadReport LastConfigLoadReport();
+
 void ApplyEnvironment();
 void FinalizeInit();
 bool IsFinalized();

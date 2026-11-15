@@ -443,7 +443,9 @@ SETTINGS_SCHEMA = {
 RUNTIME_DEFAULTS = {
     "gpu_allow_invalid_fetch_constants": False,
     "gpu_shader_max_cf_iterations": 0,
-    "native_gpu_calls": True,
+    # native_gpu_calls is a launcher setting (SETTINGS_SCHEMA) since 0.0.7.0,
+    # written in the managed block. Listed here as well, it was written twice
+    # and the game rejected the whole file (#61).
     "native_index_buffers": True,
     "native_vertex_buffers": True,
     "native_texture_uploads": True,
@@ -609,8 +611,12 @@ def write_settings(new_values):
         shaders = LAUNCHER_DIR / "ui" / "native_shaders"
         if shaders.is_dir():
             defaults["aot_shader_path"] = str(shaders)
+        # The managed block below writes these itself. A second copy outside
+        # it makes simpsons.toml invalid TOML, and the game then ignores every
+        # setting in it (#61: windowed, default language, nothing saved).
+        block_keys = set(SETTINGS_SCHEMA) | set(DERIVED_KEYS) | set(capture_keys())
         missing = [f"{k} = {_fmt(v, 'bool' if isinstance(v, bool) else 'str' if isinstance(v, str) else 'int')}"
-                   for k, v in defaults.items() if k not in present]
+                   for k, v in defaults.items() if k not in present and k not in block_keys]
         if missing:
             lines.extend(["", f"# {PLAT} runtime defaults", *missing])
     block = [SETTINGS_BEGIN]
@@ -625,8 +631,40 @@ def write_settings(new_values):
         block.append(f"{k} = {v}")
     block.append(f"{SETTINGS_VERSION_MARKER} {SETTINGS_VERSION}")
     block.append(SETTINGS_END)
-    GAME_TOML.write_text("\n".join(lines + ["", *block]) + "\n", encoding="utf-8")
+    lines, dropped = _drop_duplicate_keys(lines + ["", *block])
+    if dropped:
+        startup_log(f"simpsons.toml: dropped earlier copies of {', '.join(sorted(set(dropped)))} "
+                    "(a key may appear once; the managed block's value is kept)")
+    GAME_TOML.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return values
+
+
+def _drop_duplicate_keys(lines):
+    """Keep only the last `key = value` line for each top-level key.
+
+    TOML rejects a repeated key, and the game then applies none of the file.
+    The last copy wins, as in read_settings: the managed block comes last.
+    Returns the kept lines and the keys whose earlier copies were dropped.
+    """
+    last = {}
+    for index, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("["):  # a table: its keys are not top-level ones
+            break
+        if "=" in s and not s.startswith("#"):
+            last[s.partition("=")[0].strip()] = index
+    kept, dropped = [], []
+    in_tables = False
+    for index, line in enumerate(lines):
+        s = line.strip()
+        in_tables = in_tables or s.startswith("[")
+        if not in_tables and "=" in s and not s.startswith("#"):
+            key = s.partition("=")[0].strip()
+            if last.get(key) != index:
+                dropped.append(key)
+                continue
+        kept.append(line)
+    return kept, dropped
 
 
 # ------------------------------------------------------------------ patches

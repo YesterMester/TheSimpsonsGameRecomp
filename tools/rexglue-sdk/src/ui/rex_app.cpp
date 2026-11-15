@@ -221,8 +221,17 @@ bool ReXApp::SetupEnvironment() {
 
   OnPostInitLogging();
 
-  if (std::filesystem::exists(config_path_))
-    REXLOG_INFO("Loaded config: {}", config_path_.filename().string());
+  // The config was read before logging started: repeat what actually happened
+  // (this used to say "Loaded config" even when the file could not be parsed
+  // and none of its settings applied, #61).
+  if (const auto report = rex::cvar::LastConfigLoadReport(); !report.message.empty()) {
+    if (report.severity == rex::cvar::ConfigLoadSeverity::kError)
+      REXLOG_ERROR("{}", report.message);
+    else if (report.severity == rex::cvar::ConfigLoadSeverity::kWarning)
+      REXLOG_WARN("{}", report.message);
+    else
+      REXLOG_INFO("{}", report.message);
+  }
 
   REXLOG_INFO("{} starting", GetName());
   if (!game_data_root_.empty()) {

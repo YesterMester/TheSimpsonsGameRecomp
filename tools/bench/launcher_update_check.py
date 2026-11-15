@@ -241,5 +241,71 @@ class BundledMods(unittest.TestCase):
         self.assertEqual(self.seed(), [identifier])
 
 
+class SettingsFile(unittest.TestCase):
+    """simpsons.toml must stay valid TOML whatever the launcher writes: a
+    repeated key makes the game ignore every setting in the file (#61, where
+    the 0.0.7.0 launcher wrote native_gpu_calls twice on Linux and Windows)."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="simpsons-settings-check-")
+        self.addCleanup(self.temporary.cleanup)
+        folder = Path(self.temporary.name)
+        self.path = list(sys.path)
+        self.addCleanup(lambda: sys.path.__setitem__(slice(None), self.path))
+        sys.path.insert(0, str(ROOT / "launcher"))
+        self.app = load(ROOT / "launcher/launcher.py", "settings_launcher")
+        self.app.GAME_TOML = folder / "simpsons.toml"
+        self.app.LOG_FILE = folder / "launcher.log"
+
+    def packaged(self, plat):
+        """What tools/native-renderer/write_runtime_defaults.py puts in a package."""
+        app = self.app
+        defaults = app.LINUX_RUNTIME_DEFAULTS if plat == "Linux" else app.RUNTIME_DEFAULTS
+        lines = ["# The Simpsons Game - runtime configuration"]
+        for key, value in defaults.items():
+            kind = "bool" if isinstance(value, bool) else "str" if isinstance(value, str) else "int"
+            lines.append(f"{key} = {app._fmt(value, kind)}")
+        app.GAME_TOML.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def parse(self):
+        import tomllib
+        text = self.app.GAME_TOML.read_text(encoding="utf-8")
+        keys = [line.partition("=")[0].strip() for line in text.splitlines()
+                if "=" in line and not line.lstrip().startswith("#")]
+        repeated = sorted({key for key in keys if keys.count(key) > 1})
+        self.assertEqual(repeated, [], "simpsons.toml repeats keys")
+        return tomllib.loads(text)
+
+    def test_saved_settings_stay_valid_toml(self):
+        for plat in ("Linux", "Windows"):
+            with self.subTest(platform=plat):
+                self.app.PLAT = plat
+                self.packaged(plat)
+                self.app.write_settings({"fullscreen": True, "user_language": 3})
+                self.app.write_settings({})  # every launcher start re-syncs the block
+                values = self.parse()
+                self.assertIs(values["fullscreen"], True)
+                self.assertEqual(values["user_language"], 3)
+                self.assertIs(values["native_gpu_calls"], True)
+
+    def test_repairs_the_0070_repeated_key(self):
+        for plat in ("Linux", "Windows"):
+            with self.subTest(platform=plat):
+                self.app.PLAT = plat
+                self.packaged(plat)
+                self.app.write_settings({"fullscreen": True, "user_language": 3})
+                # The 0.0.7.0 launcher also listed the setting among the runtime
+                # defaults, outside the managed block.
+                text = self.app.GAME_TOML.read_text(encoding="utf-8")
+                begin = text.index(self.app.SETTINGS_BEGIN)
+                broken = (text[:begin] + f"# {plat} runtime defaults\nnative_gpu_calls = true\n\n"
+                          + text[begin:])
+                self.app.GAME_TOML.write_text(broken, encoding="utf-8")
+                self.app.write_settings({})  # the next launcher start repairs it
+                values = self.parse()
+                self.assertIs(values["fullscreen"], True)
+                self.assertEqual(values["user_language"], 3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
